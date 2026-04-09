@@ -92,9 +92,28 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 		// For legacy mode, don't connect here - let startOplogReplicationLegacy handle it
 		collections := pair.Target.Collections
 		if len(collections) == 0 {
-			// Auto-detect not supported in legacy mode without connection
-			m.log.Warn("Legacy mode requires explicit collection configuration")
-			return fmt.Errorf("legacy mode requires collections to be specified in configuration")
+			// Auto-detect collections using legacy mgo driver
+			m.log.Info("No collections specified for oplog-legacy mode. Auto-detecting all collections...")
+			legacyDB, err := db.NewMongoDBLegacy(pair.Source.ConnectionString, pair.Source.Database)
+			if err != nil {
+				return fmt.Errorf("failed to connect to source MongoDB (legacy) for collection detection: %w", err)
+			}
+			sourceCollections, err := legacyDB.ListCollections()
+			legacyDB.Close()
+			if err != nil {
+				return fmt.Errorf("failed to list collections from source: %w", err)
+			}
+			m.log.Infof("Auto-detected %d collections in source database: %v", len(sourceCollections), sourceCollections)
+			for _, collName := range sourceCollections {
+				collections = append(collections, config.CollectionConfig{
+					SourceCollection: collName,
+					TargetCollection: collName,
+				})
+			}
+			if len(collections) == 0 {
+				m.log.Warn("No collections found in source database")
+				return nil
+			}
 		}
 		return m.startOplogReplicationLegacy(ctx, pair.Source.Database, pair.Target.Database, collections, pair)
 	}

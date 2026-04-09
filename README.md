@@ -293,6 +293,30 @@ For very old MongoDB versions (3.0, 3.2) that use wire protocol version 3, use t
 }
 ```
 
+When no `collections` are specified (as above), the tool will automatically detect all collections in the source database using the legacy mgo driver and migrate them to the target database with the same collection names. You can also specify explicit collection mappings if you want to rename collections during migration:
+
+```json
+{
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://oldserver:27017/?replicaSet=rs0",
+        "database": "legacy_db",
+        "replicationMethod": "oplog-legacy"
+      },
+      "target": {
+        "connectionString": "mongodb://newserver:27018",
+        "database": "modern_db",
+        "collections": [
+          { "sourceCollection": "users", "targetCollection": "app_users" },
+          { "sourceCollection": "orders", "targetCollection": "orders" }
+        ]
+      }
+    }
+  ]
+}
+```
+
 **Legacy Mode Implementation:**
 - Uses **mgo driver** for source MongoDB (supports wire version 3)
 - Uses **modern mongo-driver** for target MongoDB (supports wire version 12+)

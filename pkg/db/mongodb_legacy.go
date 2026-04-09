@@ -100,6 +100,27 @@ func (m *MongoDBLegacy) Close() {
 	}
 }
 
+// ListCollections lists all collection names in the database
+func (m *MongoDBLegacy) ListCollections() ([]string, error) {
+	session := m.session.Copy()
+	defer session.Close()
+
+	names, err := session.DB(m.database).CollectionNames()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list collections: %w", err)
+	}
+
+	// Filter out system collections
+	var collections []string
+	for _, name := range names {
+		if name != "system.indexes" && name != "system.users" && name != "system.profile" && name != "system.namespaces" {
+			collections = append(collections, name)
+		}
+	}
+
+	return collections, nil
+}
+
 // Ping tests the connection to MongoDB
 func (m *MongoDBLegacy) Ping() error {
 	return m.session.Ping()
