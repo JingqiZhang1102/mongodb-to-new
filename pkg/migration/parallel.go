@@ -506,7 +506,7 @@ func (w *Worker) processGroup(group OperationGroup) {
 		w.id, group.Namespace, group.OpType, len(group.Operations))
 
 	// Get target collection
-	parts := strings.Split(group.Namespace, ".")
+	parts := strings.SplitN(group.Namespace, ".", 2)
 	if len(parts) != 2 {
 		w.log.Errorf("Invalid namespace format: %s", group.Namespace)
 		return
