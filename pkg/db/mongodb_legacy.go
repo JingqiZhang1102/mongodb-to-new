@@ -121,6 +121,20 @@ func (m *MongoDBLegacy) ListCollections() ([]string, error) {
 	return collections, nil
 }
 
+// ListIndexes returns all indexes for a collection using the mgo driver
+func (m *MongoDBLegacy) ListIndexes(collectionName string) ([]mgo.Index, error) {
+	session := m.session.Copy()
+	defer session.Close()
+
+	col := session.DB(m.database).C(collectionName)
+	indexes, err := col.Indexes()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list indexes for collection %s: %w", collectionName, err)
+	}
+
+	return indexes, nil
+}
+
 // Ping tests the connection to MongoDB
 func (m *MongoDBLegacy) Ping() error {
 	return m.session.Ping()

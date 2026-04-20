@@ -159,11 +159,9 @@ func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pai
 	r.log.Info("Performing initial migration for all collections")
 
 	// Sync indexes before migrating data if configured
-	if len(pair.Target.Indexes) > 0 {
-		r.log.Info("Syncing indexes before initial migration")
-		// We'll need to convert this to use modern driver for target
-		// For now, skip index sync in legacy mode or implement separately
-		r.log.Warn("Index sync not yet implemented for legacy mode")
+	if pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0 {
+		r.log.Info("Syncing indexes before initial migration (legacy mode)")
+		r.syncIndexesLegacy(ctx, pair)
 	}
 
 	semaphore := make(chan struct{}, r.config.InitialMigrationWorkers)
@@ -702,6 +700,150 @@ func (r *OplogReplicatorLegacy) distributeOplogEvent(ctx context.Context, op *gt
 
 	// Send event to appropriate worker
 	workers[workerIndex].ProcessEvent(changeEvent)
+}
+
+// syncIndexesLegacy syncs indexes from the legacy mgo source to the modern driver target.
+// This uses the mgo driver's Indexes() method to list source indexes and converts them
+// to the format expected by the modern driver's CreateIndexFromDefinition.
+func (r *OplogReplicatorLegacy) syncIndexesLegacy(ctx context.Context, pair config.DatabasePair) {
+	if pair.Target.SyncAllIndexes {
+		r.log.Info("SyncAllIndexes enabled: syncing all indexes (excluding _id_) for all collections")
+
+		for _, colls := range r.collectionMap {
+			for srcColl, tgtColl := range colls {
+				r.log.Infof("Syncing all indexes for collection: %s -> %s", srcColl, tgtColl)
+
+				mgoIndexes, err := r.sourceDB.ListIndexes(srcColl)
+				if err != nil {
+					r.log.Warnf("Failed to list indexes for %s: %v (continuing anyway)", srcColl, err)
+					continue
+				}
+
+				for _, idx := range mgoIndexes {
+					if idx.Name == "_id_" {
+						continue
+					}
+
+					indexDef := convertMgoIndexToModernBsonM(idx)
+
+					r.log.Infof("Creating index '%s' on target collection '%s'", idx.Name, tgtColl)
+					if err := r.targetDB.CreateIndexFromDefinition(ctx, tgtColl, indexDef); err != nil {
+						r.log.Warnf("Failed to create index '%s': %v (continuing anyway)", idx.Name, err)
+					} else {
+						r.log.Infof("Successfully created index '%s'", idx.Name)
+					}
+				}
+			}
+		}
+	}
+
+	// Also process explicit index configs if provided
+	for _, indexConfig := range pair.Target.Indexes {
+		r.log.Infof("Syncing indexes for collection: %s", indexConfig.SourceCollection)
+
+		mgoIndexes, err := r.sourceDB.ListIndexes(indexConfig.SourceCollection)
+		if err != nil {
+			r.log.Warnf("Failed to list indexes for %s: %v (continuing anyway)", indexConfig.SourceCollection, err)
+			continue
+		}
+
+		// Look up target collection name from collectionMap
+		tgtColl := indexConfig.SourceCollection // default same name
+		for _, colls := range r.collectionMap {
+			if mapped, ok := colls[indexConfig.SourceCollection]; ok {
+				tgtColl = mapped
+				break
+			}
+		}
+
+		for _, idx := range mgoIndexes {
+			if idx.Name == "_id_" {
+				continue
+			}
+
+			found := false
+			for _, requestedName := range indexConfig.IndexNames {
+				if idx.Name == requestedName {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+
+			indexDef := convertMgoIndexToModernBsonM(idx)
+
+			r.log.Infof("Creating index '%s' on target collection '%s'", idx.Name, tgtColl)
+			if err := r.targetDB.CreateIndexFromDefinition(ctx, tgtColl, indexDef); err != nil {
+				r.log.Warnf("Failed to create index '%s': %v (continuing anyway)", idx.Name, err)
+			} else {
+				r.log.Infof("Successfully created index '%s'", idx.Name)
+			}
+		}
+	}
+
+	r.log.Info("Index synchronization (legacy mode) completed")
+}
+
+// convertMgoIndexToModernBsonM converts an mgo.Index to a modern driver bson.M
+// definition compatible with MongoDB.CreateIndexFromDefinition.
+// mgo Key format: ["field1", "-field2"] where "-" prefix means descending.
+// Special prefixes: "$text:", "$2d:", "$2dsphere:", "$geoHaystack:", "$hashed:"
+func convertMgoIndexToModernBsonM(idx mgo.Index) modernbson.M {
+	// Convert key fields to bson.D (ordered)
+	var keys modernbson.D
+	for _, k := range idx.Key {
+		switch {
+		case strings.HasPrefix(k, "-"):
+			keys = append(keys, modernbson.E{Key: k[1:], Value: int32(-1)})
+		case strings.HasPrefix(k, "$text:"):
+			keys = append(keys, modernbson.E{Key: k[6:], Value: "text"})
+		case strings.HasPrefix(k, "$2dsphere:"):
+			keys = append(keys, modernbson.E{Key: k[10:], Value: "2dsphere"})
+		case strings.HasPrefix(k, "$2d:"):
+			keys = append(keys, modernbson.E{Key: k[4:], Value: "2d"})
+		case strings.HasPrefix(k, "$geoHaystack:"):
+			keys = append(keys, modernbson.E{Key: k[13:], Value: "geoHaystack"})
+		case strings.HasPrefix(k, "$hashed:"):
+			keys = append(keys, modernbson.E{Key: k[8:], Value: "hashed"})
+		default:
+			keys = append(keys, modernbson.E{Key: k, Value: int32(1)})
+		}
+	}
+
+	indexDef := modernbson.M{
+		"name": idx.Name,
+		"key":  keys,
+	}
+
+	if idx.Unique {
+		indexDef["unique"] = true
+	}
+	if idx.Background {
+		indexDef["background"] = true
+	}
+	if idx.Sparse {
+		indexDef["sparse"] = true
+	}
+	if idx.ExpireAfter > 0 {
+		indexDef["expireAfterSeconds"] = int32(idx.ExpireAfter.Seconds())
+	}
+	if idx.DefaultLanguage != "" {
+		indexDef["default_language"] = idx.DefaultLanguage
+	}
+	if idx.LanguageOverride != "" {
+		indexDef["language_override"] = idx.LanguageOverride
+	}
+	if len(idx.Weights) > 0 {
+		weights := modernbson.M{}
+		for field, weight := range idx.Weights {
+			weights[field] = weight
+		}
+		indexDef["weights"] = weights
+	}
+
+	return indexDef
 }
 
 // convertMgoBSONToInterface converts mgo bson.M to interface{} for modern driver

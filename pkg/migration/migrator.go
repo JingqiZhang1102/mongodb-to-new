@@ -161,8 +161,9 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 	}
 
 	// Sync indexes before data migration (if configured)
-	if len(pair.Target.Indexes) > 0 {
-		if err := m.syncIndexes(ctx, sourceDB, targetDB, pair); err != nil {
+	// For live mode, each replicator handles index sync during its own initial migration
+	if mode == "migrate" && (pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0) {
+		if err := m.syncIndexes(ctx, sourceDB, targetDB, pair, collections); err != nil {
 			m.log.Warnf("Index sync encountered issues: %v (continuing with migration)", err)
 			// Continue with migration even if index sync has issues
 		}
@@ -999,15 +1000,52 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 // 	return b
 // }
 
-// syncIndexes synchronizes indexes from source to target collections
-func (m *Migrator) syncIndexes(ctx context.Context, sourceDB, targetDB *db.MongoDB, pair config.DatabasePair) error {
-	if len(pair.Target.Indexes) == 0 {
-		m.log.Debug("No indexes configured for sync")
-		return nil
-	}
-
+// syncIndexes synchronizes indexes from source to target collections.
+// When pair.Target.SyncAllIndexes is true, it syncs ALL indexes (except _id_) for every
+// collection in the collections list. Otherwise it uses the explicit pair.Target.Indexes config.
+func (m *Migrator) syncIndexes(ctx context.Context, sourceDB, targetDB *db.MongoDB, pair config.DatabasePair, collections []config.CollectionConfig) error {
 	m.log.Info("Starting index synchronization...")
 
+	if pair.Target.SyncAllIndexes {
+		// Auto-sync all indexes for every migrated collection
+		m.log.Info("SyncAllIndexes enabled: syncing all indexes (excluding _id_) for all collections")
+
+		for _, collConfig := range collections {
+			m.log.Infof("Syncing all indexes for collection: %s", collConfig.SourceCollection)
+
+			// Get all indexes from source collection
+			sourceIndexes, err := sourceDB.ListIndexes(ctx, collConfig.SourceCollection)
+			if err != nil {
+				m.log.Warnf("Failed to list indexes for %s: %v (continuing anyway)", collConfig.SourceCollection, err)
+				continue
+			}
+
+			targetCollName := collConfig.TargetCollection
+
+			for _, indexDef := range sourceIndexes {
+				indexName, ok := indexDef["name"].(string)
+				if !ok {
+					m.log.Warnf("Index definition missing name field: %v", indexDef)
+					continue
+				}
+
+				// Skip _id_ index (MongoDB creates this automatically)
+				if indexName == "_id_" {
+					continue
+				}
+
+				// Create index on target
+				m.log.Infof("Creating index '%s' on target collection '%s'", indexName, targetCollName)
+				if err := targetDB.CreateIndexFromDefinition(ctx, targetCollName, indexDef); err != nil {
+					m.log.Warnf("Failed to create index '%s': %v (continuing anyway)", indexName, err)
+				} else {
+					m.log.Infof("Successfully created index '%s'", indexName)
+				}
+			}
+		}
+	}
+
+	// Also process explicit index configs if provided
 	for _, indexConfig := range pair.Target.Indexes {
 		m.log.Infof("Syncing indexes for collection: %s", indexConfig.SourceCollection)
 
@@ -1050,7 +1088,6 @@ func (m *Migrator) syncIndexes(ctx context.Context, sourceDB, targetDB *db.Mongo
 			// Create index on target
 			m.log.Infof("Creating index '%s' on target collection '%s'", indexName, targetCollName)
 			if err := targetDB.CreateIndexFromDefinition(ctx, targetCollName, indexDef); err != nil {
-				// Log warning but continue - index creation failures are non-blocking
 				m.log.Warnf("Failed to create index '%s': %v (continuing anyway)", indexName, err)
 			} else {
 				m.log.Infof("Successfully created index '%s'", indexName)

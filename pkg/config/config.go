@@ -68,6 +68,7 @@ type TargetConfig struct {
 	ConnectionString string             `json:"connectionString"`
 	Database         string             `json:"database"`
 	Collections      []CollectionConfig `json:"collections,omitempty"`
+	SyncAllIndexes   bool               `json:"syncAllIndexes,omitempty"` // Sync all indexes (excluding _id_) from source
 	Indexes          []IndexSyncConfig  `json:"indexes,omitempty"`
 }
 

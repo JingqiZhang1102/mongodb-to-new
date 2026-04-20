@@ -8,13 +8,20 @@
       },
       "target": {
         "connectionString": "mongodb://127.0.0.1:27017/?replicaSet=rs0",
-        "database": "mydb",
-        "collections": [
-          {
-            "sourceCollection": "customers",
-            "targetCollection": "customers7"
-          }
-        ]
+        "database": "test",
+        "syncAllIndexes": true
+      }
+    },
+    {
+      "source": {
+        "connectionString": "mongodb://127.0.0.1:27019/?replicaSet=rs30",
+        "database": "test1",
+        "replicationMethod": "oplog-legacy"
+      },
+      "target": {
+        "connectionString": "mongodb://127.0.0.1:27017/?replicaSet=rs0",
+        "database": "test1",
+        "syncAllIndexes": true
       }
     }
   ],

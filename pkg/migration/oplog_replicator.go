@@ -152,9 +152,19 @@ func (r *OplogReplicator) performInitialMigration(ctx context.Context, pair conf
 	r.log.Info("Performing initial migration for all collections")
 
 	// Sync indexes before migrating data if configured
-	if len(pair.Target.Indexes) > 0 {
+	if pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0 {
 		r.log.Info("Syncing indexes before initial migration")
-		if err := migrator.syncIndexes(ctx, r.sourceDB, r.targetDB, pair); err != nil {
+		// Build collections list from collectionMap
+		var collections []config.CollectionConfig
+		for _, colls := range r.collectionMap {
+			for src, tgt := range colls {
+				collections = append(collections, config.CollectionConfig{
+					SourceCollection: src,
+					TargetCollection: tgt,
+				})
+			}
+		}
+		if err := migrator.syncIndexes(ctx, r.sourceDB, r.targetDB, pair, collections); err != nil {
 			r.log.Warnf("Index sync encountered issues: %v (continuing with migration)", err)
 		}
 	}
