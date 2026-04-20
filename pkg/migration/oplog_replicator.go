@@ -266,6 +266,9 @@ func (r *OplogReplicator) migrateCollection(ctx context.Context, sourceCol, targ
 // insertBatchWithRetry inserts a batch of documents with sophisticated error handling
 // Returns the count of successfully inserted documents
 func (r *OplogReplicator) insertBatchWithRetry(ctx context.Context, targetCol *mongo.Collection, batch []interface{}, sourceDB, sourceCollection string) int64 {
+	// Transform __*__ field names to _*_ for Firestore compatibility
+	batch = TransformBatch(batch, r.log, sourceDB, sourceCollection)
+
 	var successCount int64
 
 	if _, err := targetCol.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false)); err != nil {
@@ -273,9 +276,9 @@ func (r *OplogReplicator) insertBatchWithRetry(ctx context.Context, targetCol *m
 		if ok {
 			// Calculate successful inserts
 			successCount = int64(len(batch) - len(bulkWriteException.WriteErrors))
-			
+
 			if len(bulkWriteException.WriteErrors) > 0 {
-				r.log.Debugf("Bulk insert partially failed for %s.%s: %d succeeded, %d failed", 
+				r.log.Debugf("Bulk insert partially failed for %s.%s: %d succeeded, %d failed",
 					sourceDB, sourceCollection, successCount, len(bulkWriteException.WriteErrors))
 			}
 
@@ -286,7 +289,7 @@ func (r *OplogReplicator) insertBatchWithRetry(ctx context.Context, targetCol *m
 					// Use upsert for duplicate key errors
 					if writeErr.Index < len(batch) {
 						doc := batch[writeErr.Index]
-						
+
 						// Extract document ID for filter
 						var docID interface{}
 						switch d := doc.(type) {
@@ -300,14 +303,14 @@ func (r *OplogReplicator) insertBatchWithRetry(ctx context.Context, targetCol *m
 						case bson.M:
 							docID = d["_id"]
 						}
-						
+
 						if docID != nil {
 							filter := bson.M{"_id": docID}
 							if _, err := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); err != nil {
-								r.log.Debugf("Upsert fallback failed for document %v in %s.%s: %v", 
+								r.log.Debugf("Upsert fallback failed for document %v in %s.%s: %v",
 									docID, sourceDB, sourceCollection, err)
 							} else {
-								r.log.Debugf("Successfully upserted document %v in %s.%s after duplicate key error", 
+								r.log.Debugf("Successfully upserted document %v in %s.%s after duplicate key error",
 									docID, sourceDB, sourceCollection)
 								successCount++
 							}
@@ -315,12 +318,12 @@ func (r *OplogReplicator) insertBatchWithRetry(ctx context.Context, targetCol *m
 					}
 				} else {
 					// For non-duplicate key errors, log and retry with individual insert
-					r.log.Debugf("Insert error at index %d in %s.%s: %v", 
+					r.log.Debugf("Insert error at index %d in %s.%s: %v",
 						writeErr.Index, sourceDB, sourceCollection, writeErr.Message)
-					
+
 					if writeErr.Index < len(batch) {
 						if _, err := targetCol.InsertOne(ctx, batch[writeErr.Index]); err != nil {
-							r.log.Errorf("Retry insert failed for document in %s.%s: %v", 
+							r.log.Errorf("Retry insert failed for document in %s.%s: %v",
 								sourceDB, sourceCollection, err)
 						} else {
 							successCount++
@@ -353,19 +356,19 @@ func (r *OplogReplicator) insertBatchWithRetry(ctx context.Context, targetCol *m
 					case bson.M:
 						docID = d["_id"]
 					}
-					
+
 					if docID != nil {
 						filter := bson.M{"_id": docID}
 						if _, err := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); err != nil {
 							if err == context.Canceled {
-								r.log.Debugf("Upserting document %v in %s.%s canceled due to context cancellation", 
+								r.log.Debugf("Upserting document %v in %s.%s canceled due to context cancellation",
 									docID, sourceDB, sourceCollection)
 							} else {
-								r.log.Errorf("Error upserting document %v in %s.%s: %v", 
+								r.log.Errorf("Error upserting document %v in %s.%s: %v",
 									docID, sourceDB, sourceCollection, err)
 							}
 						} else {
-							r.log.Debugf("Successfully upserted document %v in %s.%s after insert failed", 
+							r.log.Debugf("Successfully upserted document %v in %s.%s after insert failed",
 								docID, sourceDB, sourceCollection)
 							successCount++
 						}
@@ -470,7 +473,7 @@ func (r *OplogReplicator) tailOplog(ctx context.Context, afterTimestamp primitiv
 	var eventsSinceLastStats int
 	var lastStatsTime time.Time = time.Now()
 	statsInterval := time.Duration(r.config.StatsIntervalMinutes) * time.Minute
-	
+
 	// Track latest oplog timestamp for checkpoint saving
 	var latestOplogTimestamp primitive.Timestamp
 
@@ -512,7 +515,7 @@ func (r *OplogReplicator) tailOplog(ctx context.Context, afterTimestamp primitiv
 			if op == nil {
 				continue
 			}
-			
+
 			// Update latest oplog timestamp
 			latestOplogTimestamp = op.Timestamp
 
@@ -537,7 +540,7 @@ func (r *OplogReplicator) tailOplog(ctx context.Context, afterTimestamp primitiv
 				if err := SaveOplogTimestamp(timestampPath, timestamp); err != nil {
 					r.log.Errorf("Failed to save oplog timestamp: %v", err)
 				} else {
-					r.log.Infof("Checkpoint saved (%d operations processed, timestamp T=%d I=%d)", 
+					r.log.Infof("Checkpoint saved (%d operations processed, timestamp T=%d I=%d)",
 						currentProcessedCount, latestOplogTimestamp.T, latestOplogTimestamp.I)
 				}
 				r.mu.Lock()
@@ -554,12 +557,12 @@ func (r *OplogReplicator) tailOplog(ctx context.Context, afterTimestamp primitiv
 
 		case <-ctx.Done():
 			r.log.Info("Oplog replication stopped due to context cancellation")
-			
+
 			// Wait for all workers to finish processing
 			for _, worker := range workers {
 				worker.WaitForCompletion()
 			}
-			
+
 			// Save final oplog timestamp before exiting
 			if latestOplogTimestamp.T > 0 || latestOplogTimestamp.I > 0 {
 				finalTimestamp := OplogTimestamp{
@@ -568,11 +571,11 @@ func (r *OplogReplicator) tailOplog(ctx context.Context, afterTimestamp primitiv
 				if err := SaveOplogTimestamp(timestampPath, finalTimestamp); err != nil {
 					r.log.Errorf("Failed to save final oplog timestamp on shutdown: %v", err)
 				} else {
-					r.log.Infof("Saved final oplog timestamp on shutdown: T=%d, I=%d", 
+					r.log.Infof("Saved final oplog timestamp on shutdown: T=%d, I=%d",
 						latestOplogTimestamp.T, latestOplogTimestamp.I)
 				}
 			}
-			
+
 			return nil
 		}
 	}
@@ -592,7 +595,7 @@ func (r *OplogReplicator) distributeOplogEvent(ctx context.Context, op *gtm.Op, 
 
 	// Convert GTM operation to change event format expected by workers
 	var changeEvent bson.M
-	
+
 	switch op.Operation {
 	case "i": // insert
 		changeEvent = bson.M{
@@ -606,7 +609,7 @@ func (r *OplogReplicator) distributeOplogEvent(ctx context.Context, op *gtm.Op, 
 			},
 			"fullDocument": op.Data,
 		}
-		
+
 	case "u": // update
 		// Check if this is a modifier update or full document replacement
 		var hasModifiers bool
@@ -616,7 +619,7 @@ func (r *OplogReplicator) distributeOplogEvent(ctx context.Context, op *gtm.Op, 
 				break
 			}
 		}
-		
+
 		if hasModifiers {
 			// Modifier update - convert to update event with updateDescription
 			changeEvent = bson.M{
@@ -644,7 +647,7 @@ func (r *OplogReplicator) distributeOplogEvent(ctx context.Context, op *gtm.Op, 
 				"fullDocument": op.Data,
 			}
 		}
-		
+
 	case "d": // delete
 		changeEvent = bson.M{
 			"operationType": "delete",
@@ -656,7 +659,7 @@ func (r *OplogReplicator) distributeOplogEvent(ctx context.Context, op *gtm.Op, 
 				"_id": op.Id,
 			},
 		}
-		
+
 	default:
 		r.log.Warnf("Unknown operation type: %s", op.Operation)
 		return
@@ -667,7 +670,7 @@ func (r *OplogReplicator) distributeOplogEvent(ctx context.Context, op *gtm.Op, 
 	if workerIndex < 0 {
 		workerIndex = -workerIndex
 	}
-	
+
 	// Send event to appropriate worker
 	workers[workerIndex].ProcessEvent(changeEvent)
 }

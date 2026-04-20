@@ -193,6 +193,9 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 							defer workerWg.Done()
 
 							for batch := range batchChan {
+								// Transform __*__ field names to _*_ for Firestore compatibility
+								batch = TransformBatch(batch, r.log, sourceDB, sourceCollection)
+
 								// Process batch
 								if _, err := targetDBCollection.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false)); err != nil {
 									// Handle bulk write errors

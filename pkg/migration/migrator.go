@@ -450,7 +450,7 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 			for batch := range batchChan {
 				// Use RetryManager to handle retries with batch splitting
 				err := retryManager.RetryWithSplit(ctx, batch, collConfig.SourceCollection, func(b []interface{}) error {
-					return processBatch(ctx, targetCollection, b, collConfig.UpsertMode)
+					return processBatch(ctx, targetCollection, b, collConfig.UpsertMode, m.log, sourceDB.GetDatabaseName(), collConfig.SourceCollection)
 				})
 				if err != nil {
 					select {
@@ -595,10 +595,13 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 }
 
 // processBatch processes a batch of documents
-func processBatch(ctx context.Context, collection *mongo.Collection, batch []interface{}, useUpsert bool) error {
+func processBatch(ctx context.Context, collection *mongo.Collection, batch []interface{}, useUpsert bool, log *logger.Logger, dbName, collName string) error {
 	if len(batch) == 0 {
 		return nil
 	}
+
+	// Transform __*__ field names to _*_ for Firestore compatibility
+	batch = TransformBatch(batch, log, dbName, collName)
 
 	// If upsert mode is enabled, use upsert operations directly
 	if useUpsert {
@@ -832,7 +835,7 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 					for batch := range partitionBatchChan {
 						// Use RetryManager to handle retries with batch splitting
 						err := retryManager.RetryWithSplit(ctx, batch, collConfig.SourceCollection, func(b []interface{}) error {
-							return processBatch(ctx, targetCollection, b, collConfig.UpsertMode)
+							return processBatch(ctx, targetCollection, b, collConfig.UpsertMode, m.log, sourceDB.GetDatabaseName(), collConfig.SourceCollection)
 						})
 
 						if err != nil {

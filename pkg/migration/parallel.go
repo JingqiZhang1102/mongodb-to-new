@@ -405,16 +405,16 @@ func (w *Worker) ProcessEvent(event bson.M) {
 
 	documentKey, _ := event["documentKey"].(bson.M)
 	docID := documentKey["_id"]
-	
+
 	// Get fullDocument as interface{} to support both bson.M and map[string]interface{}
 	// This is needed because legacy oplog replicator returns map[string]interface{}
 	fullDocument := event["fullDocument"]
-	
+
 	// Get updateDescription for modifier updates ($set, $inc, etc.)
 	updateDescription := event["updateDescription"]
-	
+
 	// Debug log for worker events
-	w.log.Debugf("Worker %d received event: type=%s, namespace=%s, docID=%v, hasFullDoc=%v, hasUpdateDesc=%v", 
+	w.log.Debugf("Worker %d received event: type=%s, namespace=%s, docID=%v, hasFullDoc=%v, hasUpdateDesc=%v",
 		w.id, opType, namespace, docID, fullDocument != nil, updateDescription != nil)
 
 	// Create write operation
@@ -525,7 +525,8 @@ func (w *Worker) processGroup(group OperationGroup) {
 	case "insert":
 		var docs []interface{}
 		for _, op := range group.Operations {
-			docs = append(docs, op.Document)
+			// Transform __*__ field names to _*_ for Firestore compatibility
+			docs = append(docs, TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID))
 		}
 
 		if _, err := targetCollection.InsertMany(w.ctx, docs, options.InsertMany().SetOrdered(useOrdered)); err != nil {
@@ -594,16 +595,18 @@ func (w *Worker) processGroup(group OperationGroup) {
 			// Check if this is a modifier update (has updateDescription) or full replacement (has fullDocument)
 			if op.UpdateDescription != nil {
 				// Modifier update - use UpdateOne with update operators ($set, $inc, etc.)
+				// Transform __*__ field names in update description for Firestore compatibility
 				model := mongo.NewUpdateOneModel().
 					SetFilter(bson.M{"_id": op.DocumentID}).
-					SetUpdate(op.UpdateDescription).
+					SetUpdate(TransformFieldNames(op.UpdateDescription, w.log, dbName, collName, op.DocumentID)).
 					SetUpsert(true)
 				models = append(models, model)
 			} else if op.Document != nil {
 				// Full document replacement - use ReplaceOne
+				// Transform __*__ field names to _*_ for Firestore compatibility
 				model := mongo.NewReplaceOneModel().
 					SetFilter(bson.M{"_id": op.DocumentID}).
-					SetReplacement(op.Document).
+					SetReplacement(TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)).
 					SetUpsert(true)
 				models = append(models, model)
 			} else {
@@ -625,7 +628,7 @@ func (w *Worker) processGroup(group OperationGroup) {
 					if writeErr.Index < len(group.Operations) {
 						op := group.Operations[writeErr.Index]
 						filter := bson.M{"_id": op.DocumentID}
-						
+
 						// Retry with the appropriate method based on operation type
 						if op.UpdateDescription != nil {
 							if _, err := targetCollection.UpdateOne(w.ctx, filter, op.UpdateDescription, options.Update().SetUpsert(true)); err != nil {
@@ -649,7 +652,7 @@ func (w *Worker) processGroup(group OperationGroup) {
 				// Fall back to individual updates
 				for _, op := range group.Operations {
 					filter := bson.M{"_id": op.DocumentID}
-					
+
 					// Use the appropriate method based on operation type
 					if op.UpdateDescription != nil {
 						if _, err := targetCollection.UpdateOne(w.ctx, filter, op.UpdateDescription, options.Update().SetUpsert(true)); err != nil {
@@ -727,9 +730,10 @@ func (w *Worker) processGroup(group OperationGroup) {
 	case "replace":
 		var models []mongo.WriteModel
 		for _, op := range group.Operations {
+			// Transform __*__ field names to _*_ for Firestore compatibility
 			model := mongo.NewReplaceOneModel().
 				SetFilter(bson.M{"_id": op.DocumentID}).
-				SetReplacement(op.Document).
+				SetReplacement(TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)).
 				SetUpsert(true)
 			models = append(models, model)
 		}
