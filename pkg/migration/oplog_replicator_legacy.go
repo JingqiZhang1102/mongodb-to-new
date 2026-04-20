@@ -249,7 +249,7 @@ func (r *OplogReplicatorLegacy) migrateCollection(ctx context.Context, sourceCol
 	}
 
 	if err := iter.Err(); err != nil {
-		r.log.Errorf("Error iterating documents: %v", err)
+		r.log.Errorf("[%s.%s] Error iterating documents: %v", sourceDB, sourceCollection, err)
 	}
 
 	// Insert remaining documents
@@ -312,9 +312,15 @@ func (r *OplogReplicatorLegacy) insertBatchWithRetry(ctx context.Context, target
 						writeErr.Index, sourceDB, sourceCollection, writeErr.Message)
 
 					if writeErr.Index < len(batch) {
+						// Extract document ID for logging
+						var retryDocID interface{}
+						if docMap, ok := batch[writeErr.Index].(map[string]interface{}); ok {
+							retryDocID = docMap["_id"]
+						}
+
 						if _, err := targetCol.InsertOne(ctx, batch[writeErr.Index]); err != nil {
-							r.log.Errorf("Retry insert failed for document in %s.%s: %v",
-								sourceDB, sourceCollection, err)
+							r.log.Errorf("[%s.%s] Retry insert failed for document _id=%v: %v",
+								sourceDB, sourceCollection, retryDocID, err)
 						} else {
 							successCount++
 						}

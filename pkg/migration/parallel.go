@@ -532,11 +532,15 @@ func (w *Worker) processGroup(group OperationGroup) {
 		if _, err := targetCollection.InsertMany(w.ctx, docs, options.InsertMany().SetOrdered(useOrdered)); err != nil {
 			bulkWriteException, ok := err.(mongo.BulkWriteException)
 			if ok {
-				w.log.Debugf("Bulk insert partially failed: %d failed", len(bulkWriteException.WriteErrors))
+				w.log.Debugf("[%s.%s] Bulk insert partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
 
 				// Process individual errors
 				for _, writeErr := range bulkWriteException.WriteErrors {
-					w.log.Debugf("Insert error at index %d: %v", writeErr.Index, writeErr.Message)
+					var failedDocID interface{}
+					if writeErr.Index < len(group.Operations) {
+						failedDocID = group.Operations[writeErr.Index].DocumentID
+					}
+					w.log.Debugf("[%s.%s] Insert error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
 
 					// Check if it's a duplicate key error (code 11000)
 					if writeErr.Code == 11000 {
@@ -545,16 +549,16 @@ func (w *Worker) processGroup(group OperationGroup) {
 							op := group.Operations[writeErr.Index]
 							filter := bson.M{"_id": op.DocumentID}
 							if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
-								w.log.Debugf("Upsert fallback failed for document %v: %v", op.DocumentID, err)
+								w.log.Debugf("[%s.%s] Upsert fallback failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
 							} else {
-								w.log.Debugf("Successfully upserted document %v after duplicate key error", op.DocumentID)
+								w.log.Debugf("[%s.%s] Successfully upserted document _id=%v after duplicate key error", dbName, collName, op.DocumentID)
 							}
 						}
 					} else {
 						// For non-duplicate key errors, retry with regular insert
 						if writeErr.Index < len(docs) {
 							if _, err := targetCollection.InsertOne(w.ctx, docs[writeErr.Index]); err != nil {
-								w.log.Errorf("Retry insert failed: %v", err)
+								w.log.Errorf("[%s.%s] Retry insert failed for document _id=%v: %v", dbName, collName, failedDocID, err)
 							}
 						}
 					}
@@ -562,9 +566,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 			} else {
 				// Handle non-bulk write errors
 				if err == context.Canceled {
-					w.log.Debugf("Bulk insert canceled due to context cancellation")
+					w.log.Debugf("[%s.%s] Bulk insert canceled due to context cancellation", dbName, collName)
 				} else {
-					w.log.Errorf("Error performing bulk insert: %v", err)
+					w.log.Errorf("[%s.%s] Error performing bulk insert: %v", dbName, collName, err)
 				}
 
 				// Fall back to individual operations with upsert for all documents
@@ -575,18 +579,18 @@ func (w *Worker) processGroup(group OperationGroup) {
 						filter := bson.M{"_id": op.DocumentID}
 						if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
 							if err == context.Canceled {
-								w.log.Debugf("Upserting document %v canceled due to context cancellation", op.DocumentID)
+								w.log.Debugf("[%s.%s] Upserting document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
 							} else {
-								w.log.Errorf("Error upserting document %v: %v", op.DocumentID, err)
+								w.log.Errorf("[%s.%s] Error upserting document _id=%v: %v", dbName, collName, op.DocumentID, err)
 							}
 						} else {
-							w.log.Debugf("Successfully upserted document %v after insert failed", op.DocumentID)
+							w.log.Debugf("[%s.%s] Successfully upserted document _id=%v after insert failed", dbName, collName, op.DocumentID)
 						}
 					}
 				}
 			}
 		} else {
-			w.log.Debugf("Bulk inserted %d documents", len(docs))
+			w.log.Debugf("[%s.%s] Bulk inserted %d documents", dbName, collName, len(docs))
 		}
 
 	case "update":
@@ -610,7 +614,7 @@ func (w *Worker) processGroup(group OperationGroup) {
 					SetUpsert(true)
 				models = append(models, model)
 			} else {
-				w.log.Errorf("Update operation has neither updateDescription nor fullDocument for doc %v", op.DocumentID)
+				w.log.Errorf("[%s.%s] Update operation has neither updateDescription nor fullDocument for document _id=%v", dbName, collName, op.DocumentID)
 				continue
 			}
 		}
@@ -618,11 +622,15 @@ func (w *Worker) processGroup(group OperationGroup) {
 		if _, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered)); err != nil {
 			bulkWriteException, ok := err.(mongo.BulkWriteException)
 			if ok {
-				w.log.Errorf("Bulk update partially failed: %d failed", len(bulkWriteException.WriteErrors))
+				w.log.Errorf("[%s.%s] Bulk update partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
 
 				// Process individual errors
 				for _, writeErr := range bulkWriteException.WriteErrors {
-					w.log.Errorf("Update error at index %d: %v", writeErr.Index, writeErr.Message)
+					var failedDocID interface{}
+					if writeErr.Index < len(group.Operations) {
+						failedDocID = group.Operations[writeErr.Index].DocumentID
+					}
+					w.log.Errorf("[%s.%s] Update error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
 
 					// Retry the failed operation
 					if writeErr.Index < len(group.Operations) {
@@ -632,11 +640,11 @@ func (w *Worker) processGroup(group OperationGroup) {
 						// Retry with the appropriate method based on operation type
 						if op.UpdateDescription != nil {
 							if _, err := targetCollection.UpdateOne(w.ctx, filter, op.UpdateDescription, options.Update().SetUpsert(true)); err != nil {
-								w.log.Errorf("Retry modifier update failed: %v", err)
+								w.log.Errorf("[%s.%s] Retry modifier update failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
 							}
 						} else if op.Document != nil {
 							if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
-								w.log.Errorf("Retry replace update failed: %v", err)
+								w.log.Errorf("[%s.%s] Retry replace update failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
 							}
 						}
 					}
@@ -644,9 +652,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 			} else {
 				// Handle non-bulk write errors
 				if err == context.Canceled {
-					w.log.Debugf("Bulk update canceled due to context cancellation")
+					w.log.Debugf("[%s.%s] Bulk update canceled due to context cancellation", dbName, collName)
 				} else {
-					w.log.Errorf("Error performing bulk update: %v", err)
+					w.log.Errorf("[%s.%s] Error performing bulk update: %v", dbName, collName, err)
 				}
 
 				// Fall back to individual updates
@@ -657,24 +665,24 @@ func (w *Worker) processGroup(group OperationGroup) {
 					if op.UpdateDescription != nil {
 						if _, err := targetCollection.UpdateOne(w.ctx, filter, op.UpdateDescription, options.Update().SetUpsert(true)); err != nil {
 							if err == context.Canceled {
-								w.log.Debugf("Updating document %v (modifier) canceled due to context cancellation", op.DocumentID)
+								w.log.Debugf("[%s.%s] Updating document _id=%v (modifier) canceled due to context cancellation", dbName, collName, op.DocumentID)
 							} else {
-								w.log.Errorf("Error updating document %v (modifier): %v", op.DocumentID, err)
+								w.log.Errorf("[%s.%s] Error updating document _id=%v (modifier): %v", dbName, collName, op.DocumentID, err)
 							}
 						}
 					} else if op.Document != nil {
 						if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
 							if err == context.Canceled {
-								w.log.Debugf("Replacing document %v canceled due to context cancellation", op.DocumentID)
+								w.log.Debugf("[%s.%s] Replacing document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
 							} else {
-								w.log.Errorf("Error replacing document %v: %v", op.DocumentID, err)
+								w.log.Errorf("[%s.%s] Error replacing document _id=%v: %v", dbName, collName, op.DocumentID, err)
 							}
 						}
 					}
 				}
 			}
 		} else {
-			w.log.Debugf("Bulk updated %d documents", len(models))
+			w.log.Debugf("[%s.%s] Bulk updated %d documents", dbName, collName, len(models))
 		}
 
 	case "delete":
@@ -688,27 +696,31 @@ func (w *Worker) processGroup(group OperationGroup) {
 		if _, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered)); err != nil {
 			bulkWriteException, ok := err.(mongo.BulkWriteException)
 			if ok {
-				w.log.Errorf("Bulk delete partially failed: %d failed", len(bulkWriteException.WriteErrors))
+				w.log.Errorf("[%s.%s] Bulk delete partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
 
 				// Process individual errors
 				for _, writeErr := range bulkWriteException.WriteErrors {
-					w.log.Errorf("Delete error at index %d: %v", writeErr.Index, writeErr.Message)
+					var failedDocID interface{}
+					if writeErr.Index < len(group.Operations) {
+						failedDocID = group.Operations[writeErr.Index].DocumentID
+					}
+					w.log.Errorf("[%s.%s] Delete error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
 
 					// Retry the failed operation
 					if writeErr.Index < len(group.Operations) {
 						op := group.Operations[writeErr.Index]
 						filter := bson.M{"_id": op.DocumentID}
 						if _, err := targetCollection.DeleteOne(w.ctx, filter); err != nil {
-							w.log.Errorf("Retry delete failed: %v", err)
+							w.log.Errorf("[%s.%s] Retry delete failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
 						}
 					}
 				}
 			} else {
 				// Handle non-bulk write errors
 				if err == context.Canceled {
-					w.log.Debugf("Bulk delete canceled due to context cancellation")
+					w.log.Debugf("[%s.%s] Bulk delete canceled due to context cancellation", dbName, collName)
 				} else {
-					w.log.Errorf("Error performing bulk delete: %v", err)
+					w.log.Errorf("[%s.%s] Error performing bulk delete: %v", dbName, collName, err)
 				}
 
 				// Fall back to individual deletes
@@ -716,15 +728,15 @@ func (w *Worker) processGroup(group OperationGroup) {
 					filter := bson.M{"_id": op.DocumentID}
 					if _, err := targetCollection.DeleteOne(w.ctx, filter); err != nil {
 						if err == context.Canceled {
-							w.log.Debugf("Deleting document %v canceled due to context cancellation", op.DocumentID)
+							w.log.Debugf("[%s.%s] Deleting document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
 						} else {
-							w.log.Errorf("Error deleting document %v: %v", op.DocumentID, err)
+							w.log.Errorf("[%s.%s] Error deleting document _id=%v: %v", dbName, collName, op.DocumentID, err)
 						}
 					}
 				}
 			}
 		} else {
-			w.log.Debugf("Bulk deleted %d documents", len(models))
+			w.log.Debugf("[%s.%s] Bulk deleted %d documents", dbName, collName, len(models))
 		}
 
 	case "replace":
@@ -741,27 +753,31 @@ func (w *Worker) processGroup(group OperationGroup) {
 		if _, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered)); err != nil {
 			bulkWriteException, ok := err.(mongo.BulkWriteException)
 			if ok {
-				w.log.Errorf("Bulk replace partially failed: %d failed", len(bulkWriteException.WriteErrors))
+				w.log.Errorf("[%s.%s] Bulk replace partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
 
 				// Process individual errors
 				for _, writeErr := range bulkWriteException.WriteErrors {
-					w.log.Errorf("Replace error at index %d: %v", writeErr.Index, writeErr.Message)
+					var failedDocID interface{}
+					if writeErr.Index < len(group.Operations) {
+						failedDocID = group.Operations[writeErr.Index].DocumentID
+					}
+					w.log.Errorf("[%s.%s] Replace error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
 
 					// Retry the failed operation
 					if writeErr.Index < len(group.Operations) {
 						op := group.Operations[writeErr.Index]
 						filter := bson.M{"_id": op.DocumentID}
 						if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
-							w.log.Errorf("Retry replace failed: %v", err)
+							w.log.Errorf("[%s.%s] Retry replace failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
 						}
 					}
 				}
 			} else {
 				// Handle non-bulk write errors
 				if err == context.Canceled {
-					w.log.Debugf("Bulk replace canceled due to context cancellation")
+					w.log.Debugf("[%s.%s] Bulk replace canceled due to context cancellation", dbName, collName)
 				} else {
-					w.log.Errorf("Error performing bulk replace: %v", err)
+					w.log.Errorf("[%s.%s] Error performing bulk replace: %v", dbName, collName, err)
 				}
 
 				// Fall back to individual replaces
@@ -769,15 +785,15 @@ func (w *Worker) processGroup(group OperationGroup) {
 					filter := bson.M{"_id": op.DocumentID}
 					if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
 						if err == context.Canceled {
-							w.log.Debugf("Replacing document %v canceled due to context cancellation", op.DocumentID)
+							w.log.Debugf("[%s.%s] Replacing document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
 						} else {
-							w.log.Errorf("Error replacing document %v: %v", op.DocumentID, err)
+							w.log.Errorf("[%s.%s] Error replacing document _id=%v: %v", dbName, collName, op.DocumentID, err)
 						}
 					}
 				}
 			}
 		} else {
-			w.log.Debugf("Bulk replaced %d documents", len(models))
+			w.log.Debugf("[%s.%s] Bulk replaced %d documents", dbName, collName, len(models))
 		}
 	}
 }

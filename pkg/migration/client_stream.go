@@ -216,12 +216,28 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 
 										// Process individual errors
 										for _, writeErr := range bulkWriteException.WriteErrors {
-											r.log.Debugf("Insert error at index %d: %v", writeErr.Index, writeErr.Message)
+											// Extract document ID for logging
+											var errDocID interface{}
+											if writeErr.Index < len(batch) {
+												switch d := batch[writeErr.Index].(type) {
+												case bson.D:
+													for _, elem := range d {
+														if elem.Key == "_id" {
+															errDocID = elem.Value
+															break
+														}
+													}
+												case bson.M:
+													errDocID = d["_id"]
+												}
+											}
+
+											r.log.Debugf("[%s.%s] Insert error at index %d, _id=%v: %v", sourceDB, sourceCollection, writeErr.Index, errDocID, writeErr.Message)
 
 											// Check if it's a duplicate key error (code 11000)
 											if writeErr.Code == 11000 && writeErr.Index < len(batch) {
 												// Skip duplicate key errors as they likely mean the document already exists
-												r.log.Debugf("Skipping duplicate document at index %d", writeErr.Index)
+												r.log.Debugf("[%s.%s] Skipping duplicate document _id=%v at index %d", sourceDB, sourceCollection, errDocID, writeErr.Index)
 											} else if writeErr.Index < len(batch) {
 												// For non-duplicate key errors, retry with upsert
 												doc := batch[writeErr.Index]
@@ -243,7 +259,7 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 												if id != nil {
 													filter := bson.M{"_id": id}
 													if _, err := targetDBCollection.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); err != nil {
-														r.log.Errorf("Retry upsert failed for document with ID %v: %v", id, err)
+														r.log.Errorf("[%s.%s] Retry upsert failed for document _id=%v: %v", sourceDB, sourceCollection, id, err)
 													}
 												}
 											}

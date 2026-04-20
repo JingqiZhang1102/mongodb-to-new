@@ -252,7 +252,7 @@ func (r *OplogReplicator) migrateCollection(ctx context.Context, sourceCol, targ
 	for cursor.Next(ctx) {
 		var doc bson.D
 		if err := cursor.Decode(&doc); err != nil {
-			r.log.Errorf("Error decoding document: %v", err)
+			r.log.Errorf("[%s.%s] Error decoding document: %v", sourceDB, sourceCollection, err)
 			continue
 		}
 
@@ -332,9 +332,23 @@ func (r *OplogReplicator) insertBatchWithRetry(ctx context.Context, targetCol *m
 						writeErr.Index, sourceDB, sourceCollection, writeErr.Message)
 
 					if writeErr.Index < len(batch) {
+						// Extract document ID for logging
+						var retryDocID interface{}
+						switch d := batch[writeErr.Index].(type) {
+						case bson.D:
+							for _, elem := range d {
+								if elem.Key == "_id" {
+									retryDocID = elem.Value
+									break
+								}
+							}
+						case bson.M:
+							retryDocID = d["_id"]
+						}
+
 						if _, err := targetCol.InsertOne(ctx, batch[writeErr.Index]); err != nil {
-							r.log.Errorf("Retry insert failed for document in %s.%s: %v",
-								sourceDB, sourceCollection, err)
+							r.log.Errorf("[%s.%s] Retry insert failed for document _id=%v: %v",
+								sourceDB, sourceCollection, retryDocID, err)
 						} else {
 							successCount++
 						}
