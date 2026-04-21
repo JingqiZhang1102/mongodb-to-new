@@ -164,11 +164,18 @@ func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pai
 		r.syncIndexesLegacy(ctx, pair)
 	}
 
-	semaphore := make(chan struct{}, r.config.InitialMigrationWorkers)
+	// Use ConcurrentCollections for collection-level concurrency (separate from per-collection worker count)
+	concurrentCollections := r.config.ConcurrentCollections
+	if concurrentCollections <= 0 {
+		concurrentCollections = 4
+	}
+	r.log.Infof("Processing up to %d collections concurrently", concurrentCollections)
+	semaphore := make(chan struct{}, concurrentCollections)
 	var wg sync.WaitGroup
 
 	var totalMigratedCount int64
 	var totalCollections int
+	var completedCollections int64
 	var mu sync.Mutex
 
 	for sourceDB, collections := range r.collectionMap {
@@ -207,8 +214,11 @@ func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pai
 
 				migratedCount := r.migrateCollection(ctx, sourceCol, targetCol, count, sourceDB, sourceCollection)
 
+				// Update overall statistics and log overall progress
 				mu.Lock()
 				totalMigratedCount += migratedCount
+				completedCollections++
+				r.log.Infof("Overall progress: %d/%d collections completed", completedCollections, totalCollections)
 				mu.Unlock()
 			}(sourceDB, sourceCollection, targetCollection)
 		}
@@ -382,14 +392,15 @@ func (r *OplogReplicatorLegacy) tailOplog(ctx context.Context, afterTimestamp bs
 	i := uint32(afterTimestamp & 0xFFFFFFFF)
 	r.log.Infof("Starting oplog tailing from timestamp: T=%d, I=%d", t, i)
 
-	// Build allowed namespaces for filtering
-	var nsFilter []string
+	// Build allowed namespaces map for O(1) filtering (important for databases with many collections)
+	nsFilterMap := make(map[string]bool)
 	for sourceDB, collections := range r.collectionMap {
 		for sourceCollection := range collections {
 			namespace := fmt.Sprintf("%s.%s", sourceDB, sourceCollection)
-			nsFilter = append(nsFilter, namespace)
+			nsFilterMap[namespace] = true
 		}
 	}
+	r.log.Infof("Watching %d namespaces for oplog events", len(nsFilterMap))
 
 	// Get mgo session for GTM
 	session := r.sourceDB.GetSession()
@@ -404,12 +415,7 @@ func (r *OplogReplicatorLegacy) tailOplog(ctx context.Context, afterTimestamp bs
 			return afterTimestamp
 		},
 		NamespaceFilter: func(op *gtm.Op) bool {
-			for _, ns := range nsFilter {
-				if op.Namespace == ns {
-					return true
-				}
-			}
-			return false
+			return nsFilterMap[op.Namespace]
 		},
 		OpLogDatabaseName:   &oplogDB,
 		OpLogCollectionName: &oplogColl,

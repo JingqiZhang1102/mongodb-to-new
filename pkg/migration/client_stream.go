@@ -122,13 +122,19 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		}
 
 		// Use a semaphore to limit the number of concurrent collection migrations
-		// Process up to InitialMigrationWorkers collections concurrently
-		semaphore := make(chan struct{}, r.config.InitialMigrationWorkers)
+		// Use ConcurrentCollections for collection-level concurrency (separate from per-collection worker count)
+		concurrentCollections := r.config.ConcurrentCollections
+		if concurrentCollections <= 0 {
+			concurrentCollections = 4
+		}
+		r.log.Infof("Processing up to %d collections concurrently", concurrentCollections)
+		semaphore := make(chan struct{}, concurrentCollections)
 		var wg sync.WaitGroup
 
 		// Track overall statistics
 		var totalMigratedCount int64
 		var totalCollections int
+		var completedCollections int64
 		var mu sync.Mutex // Mutex for thread-safe updates to statistics
 
 		// Iterate through all collections in the map
@@ -402,9 +408,11 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 					r.log.Infof("Migration for %s.%s completed successfully! Total documents: %d",
 						sourceDB, sourceCollection, migratedCount)
 
-					// Update overall statistics
+					// Update overall statistics and log overall progress
 					mu.Lock()
 					totalMigratedCount += migratedCount
+					completedCollections++
+					r.log.Infof("Overall progress: %d/%d collections completed", completedCollections, totalCollections)
 					mu.Unlock()
 				}(sourceDB, sourceCollection, targetCollection)
 			}
