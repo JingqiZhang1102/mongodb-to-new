@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"io"
 	"os"
 	"time"
 
@@ -23,6 +24,19 @@ func New() *Logger {
 	log.SetLevel(logrus.InfoLevel)
 
 	return &Logger{Logger: log}
+}
+
+// SetOutputFile configures the logger to write to both stdout and the specified file.
+// The file is opened in append mode (created if it doesn't exist).
+// Returns the file handle so the caller can close it on shutdown.
+func (l *Logger) SetOutputFile(filePath string) (*os.File, error) {
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
+	multiWriter := io.MultiWriter(os.Stdout, file)
+	l.Logger.SetOutput(multiWriter)
+	return file, nil
 }
 
 // SetLevel sets the logging level

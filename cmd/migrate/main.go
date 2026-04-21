@@ -19,6 +19,7 @@ func main() {
 	configPath := flag.String("config", "mongodb_replication_config.json", "Path to configuration file")
 	mode := flag.String("mode", "migrate", "Operation mode: 'migrate' or 'live'")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
+	logFile := flag.String("log-file", "", "Path to log file (logs to both stdout and file when specified)")
 	help := flag.Bool("help", false, "Display help information")
 	flag.Parse()
 
@@ -31,6 +32,16 @@ func main() {
 	// Create logger
 	log := logger.New()
 	log.SetLevel(*logLevel)
+
+	// Set up log file if specified
+	if *logFile != "" {
+		file, err := log.SetOutputFile(*logFile)
+		if err != nil {
+			log.Fatalf("Failed to open log file %s: %v", *logFile, err)
+		}
+		defer file.Close()
+		log.Infof("Logging to file: %s", *logFile)
+	}
 
 	// Load configuration
 	log.Info("Loading configuration...")
@@ -96,9 +107,12 @@ func displayUsage() {
 	fmt.Println("        Operation mode: 'migrate' or 'live' (default \"migrate\")")
 	fmt.Println("  -log-level string")
 	fmt.Println("        Log level: debug, info, warn, error (default \"info\")")
+	fmt.Println("  -log-file string")
+	fmt.Println("        Path to log file (logs to both stdout and file when specified)")
 	fmt.Println("  -help")
 	fmt.Println("        Display this help information")
 	fmt.Println("Examples:")
 	fmt.Println("  migrate -mode=live")
 	fmt.Println("  migrate -config=custom_config.json -mode=migrate -log-level=debug")
+	fmt.Println("  migrate -mode=live -log-file=migration.log")
 }
