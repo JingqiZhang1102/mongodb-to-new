@@ -15,12 +15,12 @@
     {
       "source": {
         "connectionString": "mongodb://127.0.0.1:27019/?replicaSet=rs30",
-        "database": "test1",
+        "database": "test2",
         "replicationMethod": "oplog-legacy"
       },
       "target": {
         "connectionString": "mongodb://127.0.0.1:27017/?replicaSet=rs0",
-        "database": "test1",
+        "database": "test2",
         "syncAllIndexes": true
       }
     }
