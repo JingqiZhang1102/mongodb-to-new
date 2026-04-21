@@ -1004,15 +1004,15 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 // When pair.Target.SyncAllIndexes is true, it syncs ALL indexes (except _id_) for every
 // collection in the collections list. Otherwise it uses the explicit pair.Target.Indexes config.
 func (m *Migrator) syncIndexes(ctx context.Context, sourceDB, targetDB *db.MongoDB, pair config.DatabasePair, collections []config.CollectionConfig) error {
-	m.log.Info("Starting index synchronization...")
+	m.log.Info("Starting async index synchronization (fire-and-forget)...")
+
+	var indexCount int
 
 	if pair.Target.SyncAllIndexes {
 		// Auto-sync all indexes for every migrated collection
 		m.log.Info("SyncAllIndexes enabled: syncing all indexes (excluding _id_) for all collections")
 
 		for _, collConfig := range collections {
-			m.log.Infof("Syncing all indexes for collection: %s", collConfig.SourceCollection)
-
 			// Get all indexes from source collection
 			sourceIndexes, err := sourceDB.ListIndexes(ctx, collConfig.SourceCollection)
 			if err != nil {
@@ -1034,21 +1034,16 @@ func (m *Migrator) syncIndexes(ctx context.Context, sourceDB, targetDB *db.Mongo
 					continue
 				}
 
-				// Create index on target
-				m.log.Infof("Creating index '%s' on target collection '%s'", indexName, targetCollName)
-				if err := targetDB.CreateIndexFromDefinition(ctx, targetCollName, indexDef); err != nil {
-					m.log.Warnf("Failed to create index '%s': %v (continuing anyway)", indexName, err)
-				} else {
-					m.log.Infof("Successfully created index '%s'", indexName)
-				}
+				// Fire-and-forget: launch async index creation with a dedicated client
+				m.log.Infof("Launching async index creation: '%s' on target collection '%s'", indexName, targetCollName)
+				targetDB.CreateIndexFromDefinitionAsync(pair.Target.ConnectionString, targetCollName, indexDef)
+				indexCount++
 			}
 		}
 	}
 
 	// Also process explicit index configs if provided
 	for _, indexConfig := range pair.Target.Indexes {
-		m.log.Infof("Syncing indexes for collection: %s", indexConfig.SourceCollection)
-
 		// Get all indexes from source collection
 		sourceIndexes, err := sourceDB.ListIndexes(ctx, indexConfig.SourceCollection)
 		if err != nil {
@@ -1085,17 +1080,14 @@ func (m *Migrator) syncIndexes(ctx context.Context, sourceDB, targetDB *db.Mongo
 				continue
 			}
 
-			// Create index on target
-			m.log.Infof("Creating index '%s' on target collection '%s'", indexName, targetCollName)
-			if err := targetDB.CreateIndexFromDefinition(ctx, targetCollName, indexDef); err != nil {
-				m.log.Warnf("Failed to create index '%s': %v (continuing anyway)", indexName, err)
-			} else {
-				m.log.Infof("Successfully created index '%s'", indexName)
-			}
+			// Fire-and-forget: launch async index creation with a dedicated client
+			m.log.Infof("Launching async index creation: '%s' on target collection '%s'", indexName, targetCollName)
+			targetDB.CreateIndexFromDefinitionAsync(pair.Target.ConnectionString, targetCollName, indexDef)
+			indexCount++
 		}
 	}
 
-	m.log.Info("Index synchronization completed")
+	m.log.Infof("Launched %d async index creation tasks. Proceeding with data migration.", indexCount)
 	return nil
 }
 

@@ -224,10 +224,10 @@ func (m *MongoDB) CreateIndexFromDefinition(ctx context.Context, collectionName 
 		opts.SetWeights(weights)
 	}
 
-	// Add background option if present (deprecated in MongoDB 4.2+, but still supported)
-	if background, ok := indexDef["background"].(bool); ok && background {
-		opts.SetBackground(true)
-	}
+	// Always build indexes in the background to avoid blocking and timeouts.
+	// On MongoDB < 4.2: the server returns immediately, index builds asynchronously.
+	// On MongoDB 4.2+: this option is deprecated and ignored (all builds are hybrid/non-blocking).
+	opts.SetBackground(true)
 
 	indexModel.Options = opts
 
@@ -237,5 +237,105 @@ func (m *MongoDB) CreateIndexFromDefinition(ctx context.Context, collectionName 
 		return fmt.Errorf("failed to create index '%s' on collection %s: %w", indexName, collectionName, err)
 	}
 
+	return nil
+}
+
+// CreateIndexFromDefinitionAsync creates an index asynchronously in a goroutine.
+// It uses a dedicated MongoDB client with no socket timeout so index builds can run
+// as long as needed without being killed by the main client's 120-second socket timeout.
+// The goroutine logs success or failure — the caller does not wait.
+func (m *MongoDB) CreateIndexFromDefinitionAsync(connectionString, collectionName string, indexDef bson.M) {
+	// Extract index name for logging
+	indexName, _ := indexDef["name"].(string)
+
+	go func() {
+		startTime := time.Now()
+
+		// Create a dedicated client with no socket timeout for long-running index builds
+		clientOptions := options.Client().
+			ApplyURI(connectionString).
+			SetMaxPoolSize(4).
+			SetMinPoolSize(1).
+			SetConnectTimeout(30 * time.Second)
+		// Intentionally NO SetSocketTimeout — index builds can take hours
+
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Hour)
+		defer cancel()
+
+		client, err := mongo.Connect(ctx, clientOptions)
+		if err != nil {
+			m.log.Errorf("[async] Failed to connect for index '%s' on '%s': %v", indexName, collectionName, err)
+			return
+		}
+		defer client.Disconnect(ctx)
+
+		// Create the index using the dedicated client
+		collection := client.Database(m.database.Name()).Collection(collectionName)
+
+		if err := m.createIndexOnCollection(ctx, collection, collectionName, indexDef); err != nil {
+			m.log.Warnf("[async] Failed to create index '%s' on '%s': %v (took %v)", indexName, collectionName, err, time.Since(startTime).Round(time.Second))
+		} else {
+			m.log.Infof("[async] Successfully created index '%s' on '%s' (took %v)", indexName, collectionName, time.Since(startTime).Round(time.Second))
+		}
+	}()
+}
+
+// createIndexOnCollection is a helper that creates an index on a given collection.
+// It contains the shared index model building logic used by both sync and async paths.
+func (m *MongoDB) createIndexOnCollection(ctx context.Context, collection *mongo.Collection, collectionName string, indexDef bson.M) error {
+	indexName, ok := indexDef["name"].(string)
+	if !ok {
+		return fmt.Errorf("index definition missing 'name' field")
+	}
+
+	keysRaw, ok := indexDef["key"]
+	if !ok {
+		return fmt.Errorf("index definition missing 'key' field")
+	}
+
+	var keys bson.D
+	switch k := keysRaw.(type) {
+	case bson.D:
+		keys = k
+	case bson.M:
+		for key, value := range k {
+			keys = append(keys, bson.E{Key: key, Value: value})
+		}
+	default:
+		return fmt.Errorf("unexpected type for index keys: %T", keysRaw)
+	}
+
+	indexModel := mongo.IndexModel{Keys: keys}
+	opts := options.Index().SetName(indexName)
+
+	if unique, ok := indexDef["unique"].(bool); ok && unique {
+		opts.SetUnique(true)
+	}
+	if sparse, ok := indexDef["sparse"].(bool); ok && sparse {
+		opts.SetSparse(true)
+	}
+	if expireAfter, ok := indexDef["expireAfterSeconds"].(int32); ok {
+		opts.SetExpireAfterSeconds(expireAfter)
+	}
+	if partialFilter, ok := indexDef["partialFilterExpression"]; ok {
+		opts.SetPartialFilterExpression(partialFilter)
+	}
+	if defaultLanguage, ok := indexDef["default_language"].(string); ok {
+		opts.SetDefaultLanguage(defaultLanguage)
+	}
+	if languageOverride, ok := indexDef["language_override"].(string); ok {
+		opts.SetLanguageOverride(languageOverride)
+	}
+	if weights, ok := indexDef["weights"]; ok {
+		opts.SetWeights(weights)
+	}
+	opts.SetBackground(true)
+
+	indexModel.Options = opts
+
+	_, err := collection.Indexes().CreateOne(ctx, indexModel)
+	if err != nil {
+		return fmt.Errorf("failed to create index '%s' on collection %s: %w", indexName, collectionName, err)
+	}
 	return nil
 }

@@ -716,15 +716,16 @@ func (r *OplogReplicatorLegacy) distributeOplogEvent(ctx context.Context, op *gt
 
 // syncIndexesLegacy syncs indexes from the legacy mgo source to the modern driver target.
 // This uses the mgo driver's Indexes() method to list source indexes and converts them
-// to the format expected by the modern driver's CreateIndexFromDefinition.
+// to the format expected by the modern driver's CreateIndexFromDefinitionAsync.
+// Index creation is fire-and-forget — goroutines run in the background with dedicated clients.
 func (r *OplogReplicatorLegacy) syncIndexesLegacy(ctx context.Context, pair config.DatabasePair) {
+	var indexCount int
+
 	if pair.Target.SyncAllIndexes {
-		r.log.Info("SyncAllIndexes enabled: syncing all indexes (excluding _id_) for all collections")
+		r.log.Info("SyncAllIndexes enabled: launching async index creation (excluding _id_) for all collections")
 
 		for _, colls := range r.collectionMap {
 			for srcColl, tgtColl := range colls {
-				r.log.Infof("Syncing all indexes for collection: %s -> %s", srcColl, tgtColl)
-
 				mgoIndexes, err := r.sourceDB.ListIndexes(srcColl)
 				if err != nil {
 					r.log.Warnf("Failed to list indexes for %s: %v (continuing anyway)", srcColl, err)
@@ -738,12 +739,9 @@ func (r *OplogReplicatorLegacy) syncIndexesLegacy(ctx context.Context, pair conf
 
 					indexDef := convertMgoIndexToModernBsonM(idx)
 
-					r.log.Infof("Creating index '%s' on target collection '%s'", idx.Name, tgtColl)
-					if err := r.targetDB.CreateIndexFromDefinition(ctx, tgtColl, indexDef); err != nil {
-						r.log.Warnf("Failed to create index '%s': %v (continuing anyway)", idx.Name, err)
-					} else {
-						r.log.Infof("Successfully created index '%s'", idx.Name)
-					}
+					r.log.Infof("Launching async index creation: '%s' on target collection '%s'", idx.Name, tgtColl)
+					r.targetDB.CreateIndexFromDefinitionAsync(pair.Target.ConnectionString, tgtColl, indexDef)
+					indexCount++
 				}
 			}
 		}
@@ -751,8 +749,6 @@ func (r *OplogReplicatorLegacy) syncIndexesLegacy(ctx context.Context, pair conf
 
 	// Also process explicit index configs if provided
 	for _, indexConfig := range pair.Target.Indexes {
-		r.log.Infof("Syncing indexes for collection: %s", indexConfig.SourceCollection)
-
 		mgoIndexes, err := r.sourceDB.ListIndexes(indexConfig.SourceCollection)
 		if err != nil {
 			r.log.Warnf("Failed to list indexes for %s: %v (continuing anyway)", indexConfig.SourceCollection, err)
@@ -786,16 +782,13 @@ func (r *OplogReplicatorLegacy) syncIndexesLegacy(ctx context.Context, pair conf
 
 			indexDef := convertMgoIndexToModernBsonM(idx)
 
-			r.log.Infof("Creating index '%s' on target collection '%s'", idx.Name, tgtColl)
-			if err := r.targetDB.CreateIndexFromDefinition(ctx, tgtColl, indexDef); err != nil {
-				r.log.Warnf("Failed to create index '%s': %v (continuing anyway)", idx.Name, err)
-			} else {
-				r.log.Infof("Successfully created index '%s'", idx.Name)
-			}
+			r.log.Infof("Launching async index creation: '%s' on target collection '%s'", idx.Name, tgtColl)
+			r.targetDB.CreateIndexFromDefinitionAsync(pair.Target.ConnectionString, tgtColl, indexDef)
+			indexCount++
 		}
 	}
 
-	r.log.Info("Index synchronization (legacy mode) completed")
+	r.log.Infof("Launched %d async index creation tasks (legacy mode). Proceeding with data migration.", indexCount)
 }
 
 // convertMgoIndexToModernBsonM converts an mgo.Index to a modern driver bson.M
