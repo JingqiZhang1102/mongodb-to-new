@@ -133,15 +133,20 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 
 		// Track overall statistics
 		var totalMigratedCount int64
-		var totalCollections int
 		var completedCollections int64
 		var mu sync.Mutex // Mutex for thread-safe updates to statistics
+
+		// Pre-compute total collection count before launching goroutines
+		// so the progress log always shows the correct total
+		totalCollections := 0
+		for _, colls := range r.collectionMap {
+			totalCollections += len(colls)
+		}
 
 		// Iterate through all collections in the map
 		for sourceDB, collections := range r.collectionMap {
 			for sourceCollection, targetCollection := range collections {
 				wg.Add(1)
-				totalCollections++
 
 				// Acquire semaphore
 				semaphore <- struct{}{}

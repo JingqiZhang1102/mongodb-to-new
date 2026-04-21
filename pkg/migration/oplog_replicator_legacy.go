@@ -174,14 +174,19 @@ func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pai
 	var wg sync.WaitGroup
 
 	var totalMigratedCount int64
-	var totalCollections int
 	var completedCollections int64
 	var mu sync.Mutex
+
+	// Pre-compute total collection count before launching goroutines
+	// so the progress log always shows the correct total
+	totalCollections := 0
+	for _, colls := range r.collectionMap {
+		totalCollections += len(colls)
+	}
 
 	for sourceDB, collections := range r.collectionMap {
 		for sourceCollection, targetCollection := range collections {
 			wg.Add(1)
-			totalCollections++
 
 			semaphore <- struct{}{}
 
@@ -243,6 +248,7 @@ func (r *OplogReplicatorLegacy) migrateCollection(ctx context.Context, sourceCol
 
 	var batch []interface{}
 	var migratedCount int64
+	var lastLoggedPercentage int = -1 // Start at -1 to ensure 0% is logged
 	var doc bson.M
 
 	for iter.Next(&doc) {
@@ -252,6 +258,16 @@ func (r *OplogReplicatorLegacy) migrateCollection(ctx context.Context, sourceCol
 		if len(batch) >= writeBatchSize {
 			migratedCount += r.insertBatchWithRetry(ctx, targetCol, batch, sourceDB, sourceCollection)
 			batch = nil
+
+			// Log progress at every 10% threshold
+			if count > 0 {
+				currentPercentage := int(float64(migratedCount) / float64(count) * 10)
+				if currentPercentage > lastLoggedPercentage {
+					lastLoggedPercentage = currentPercentage
+					r.log.Infof("Collection %s.%s progress: %d/%d documents (%.0f%%)",
+						sourceDB, sourceCollection, migratedCount, count, float64(currentPercentage)*10)
+				}
+			}
 		}
 
 		// Reset doc for next iteration
