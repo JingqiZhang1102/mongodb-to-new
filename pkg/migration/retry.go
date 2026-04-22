@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gsbingo17/mongodb-migration/pkg/config"
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -36,6 +37,19 @@ type RetryManager struct {
 	Logger            *logger.Logger
 }
 
+// NewRetryManagerFromConfig creates a RetryManager from config settings
+func NewRetryManagerFromConfig(cfg *config.Config, log *logger.Logger) *RetryManager {
+	return NewRetryManager(
+		cfg.RetryConfig.MaxRetries,
+		time.Duration(cfg.RetryConfig.BaseDelayMs)*time.Millisecond,
+		time.Duration(cfg.RetryConfig.MaxDelayMs)*time.Millisecond,
+		cfg.RetryConfig.EnableBatchSplitting,
+		cfg.RetryConfig.MinBatchSize,
+		cfg.RetryConfig.ConvertInvalidIds,
+		log,
+	)
+}
+
 // NewRetryManager creates a new retry manager
 func NewRetryManager(maxRetries int, baseDelay, maxDelay time.Duration, enableBatchSplit bool, minBatchSize int, convertInvalidIds bool, log *logger.Logger) *RetryManager {
 	return &RetryManager{
@@ -61,7 +75,11 @@ func (r *RetryManager) ClassifyError(err error) ErrorType {
 	if strings.Contains(errStr, "socket was unexpectedly closed") ||
 		strings.Contains(errStr, "EOF") ||
 		strings.Contains(errStr, "connection reset by peer") ||
-		strings.Contains(errStr, "i/o timeout") {
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "i/o timeout") ||
+		strings.Contains(errStr, "DeadlineExceeded") ||
+		strings.Contains(errStr, "Deadline exceeded") ||
+		strings.Contains(errStr, "deadline exceeded") {
 		return ErrorTypeConnection
 	}
 

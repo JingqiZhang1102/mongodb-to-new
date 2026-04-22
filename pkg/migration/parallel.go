@@ -34,6 +34,7 @@ type EventDistributor struct {
 	forceOrderedOperations    bool
 	flushInterval             time.Duration // Flush interval in milliseconds
 	dlq                       DLQ           // Dead Letter Queue for failed documents
+	retryManager              *RetryManager // Retry manager for transient errors
 
 	// Statistics tracking
 	statsMu              sync.Mutex    // Mutex for thread-safe updates to statistics
@@ -53,6 +54,9 @@ func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 	// Use stats interval from config
 	statsInterval := time.Duration(cfg.StatsIntervalMinutes) * time.Minute
 
+	// Create retry manager from config
+	retryMgr := NewRetryManagerFromConfig(cfg, log)
+
 	return &EventDistributor{
 		workers:                   make([]*Worker, incrementalWorkerCount),
 		incrementalWorkerCount:    incrementalWorkerCount,
@@ -69,6 +73,7 @@ func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 		forceOrderedOperations:    forceOrderedOperations,
 		flushInterval:             flushInterval,
 		dlq:                       dlq,
+		retryManager:              retryMgr,
 
 		// Initialize statistics tracking
 		statsInterval:        statsInterval,
@@ -131,9 +136,9 @@ func (d *EventDistributor) waitForWorkersToFinish() {
 
 // Start begins the event distribution process
 func (d *EventDistributor) Start() error {
-	// Initialize workers
+	// Initialize workers with retry manager
 	for i := 0; i < d.incrementalWorkerCount; i++ {
-		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq)
+		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager)
 	}
 
 	// Set up context cancellation handling
@@ -348,6 +353,9 @@ type Worker struct {
 	// Dead Letter Queue for failed documents
 	dlq DLQ
 
+	// Retry manager for transient error handling
+	retryManager *RetryManager
+
 	// For shutdown coordination
 	wg sync.WaitGroup
 
@@ -382,7 +390,7 @@ func (w *Worker) flushCurrentGroup() bool {
 // NewWorker creates a new worker
 func NewWorker(id int, ctx context.Context, log *logger.Logger,
 	targetDB *db.MongoDB, collectionMap map[string]map[string]string,
-	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ) *Worker {
+	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager) *Worker {
 
 	return &Worker{
 		id:                        id,
@@ -394,6 +402,7 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 		incrementalWriteBatchSize: incrementalWriteBatchSize,
 		forceOrderedOperations:    forceOrderedOperations,
 		dlq:                       dlq,
+		retryManager:              retryManager,
 	}
 }
 
@@ -576,30 +585,51 @@ func (w *Worker) processGroup(group OperationGroup) {
 					}
 				}
 			} else {
-				// Handle non-bulk write errors
+				// Handle non-bulk write errors (e.g., broken pipe, connection reset, deadline exceeded)
 				if err == context.Canceled {
 					w.log.Debugf("[%s.%s] Bulk insert canceled due to context cancellation", dbName, collName)
 				} else {
 					w.log.Errorf("[%s.%s] Error performing bulk insert: %v", dbName, collName, err)
 				}
 
-				// Fall back to individual operations with upsert for all documents
-				for _, op := range group.Operations {
-					// Try insert first
-					if _, err := targetCollection.InsertOne(w.ctx, op.Document); err != nil {
-						// If insert fails, try upsert
-						filter := bson.M{"_id": op.DocumentID}
-						if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
-							if err == context.Canceled {
-								w.log.Debugf("[%s.%s] Upserting document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
-							} else {
-								w.log.Errorf("[%s.%s] Error upserting document _id=%v: %v", dbName, collName, op.DocumentID, err)
-								if w.dlq != nil {
-									w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
-								}
-							}
+				// For transient errors, retry the bulk operation with backoff before falling back
+				bulkRetrySucceeded := false
+				if w.retryManager != nil && err != context.Canceled {
+					errType := w.retryManager.ClassifyError(err)
+					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
+						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk insert with backoff...", dbName, collName)
+						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
+							_, retryInsertErr := targetCollection.InsertMany(w.ctx, docs, options.InsertMany().SetOrdered(useOrdered))
+							return retryInsertErr
+						})
+						if retryErr == nil {
+							w.log.Infof("[%s.%s] Bulk insert succeeded after retry", dbName, collName)
+							bulkRetrySucceeded = true
 						} else {
-							w.log.Debugf("[%s.%s] Successfully upserted document _id=%v after insert failed", dbName, collName, op.DocumentID)
+							w.log.Warnf("[%s.%s] Bulk insert still failed after retries: %v. Falling back to individual operations.", dbName, collName, retryErr)
+						}
+					}
+				}
+
+				if !bulkRetrySucceeded {
+					// Fall back to individual operations with upsert for all documents
+					for _, op := range group.Operations {
+						// Try insert first
+						if _, err := targetCollection.InsertOne(w.ctx, op.Document); err != nil {
+							// If insert fails, try upsert
+							filter := bson.M{"_id": op.DocumentID}
+							if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
+								if err == context.Canceled {
+									w.log.Debugf("[%s.%s] Upserting document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
+								} else {
+									w.log.Errorf("[%s.%s] Error upserting document _id=%v: %v", dbName, collName, op.DocumentID, err)
+									if w.dlq != nil {
+										w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
+									}
+								}
+							} else {
+								w.log.Debugf("[%s.%s] Successfully upserted document _id=%v after insert failed", dbName, collName, op.DocumentID)
+							}
 						}
 					}
 				}
@@ -678,6 +708,29 @@ func (w *Worker) processGroup(group OperationGroup) {
 					w.log.Errorf("[%s.%s] Error performing bulk update: %v", dbName, collName, err)
 				}
 
+				// For transient errors, retry the bulk operation with backoff before falling back
+				bulkRetrySucceeded := false
+				if w.retryManager != nil && err != context.Canceled {
+					errType := w.retryManager.ClassifyError(err)
+					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
+						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk update with backoff...", dbName, collName)
+						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
+							_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
+							return retryBulkErr
+						})
+						if retryErr == nil {
+							w.log.Infof("[%s.%s] Bulk update succeeded after retry", dbName, collName)
+							bulkRetrySucceeded = true
+						} else {
+							w.log.Warnf("[%s.%s] Bulk update still failed after retries: %v. Falling back to individual operations.", dbName, collName, retryErr)
+						}
+					}
+				}
+
+				if bulkRetrySucceeded {
+					break
+				}
+
 				// Fall back to individual updates
 				for _, op := range group.Operations {
 					filter := bson.M{"_id": op.DocumentID}
@@ -753,6 +806,29 @@ func (w *Worker) processGroup(group OperationGroup) {
 					w.log.Errorf("[%s.%s] Error performing bulk delete: %v", dbName, collName, err)
 				}
 
+				// For transient errors, retry the bulk operation with backoff before falling back
+				bulkRetrySucceeded := false
+				if w.retryManager != nil && err != context.Canceled {
+					errType := w.retryManager.ClassifyError(err)
+					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
+						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk delete with backoff...", dbName, collName)
+						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
+							_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
+							return retryBulkErr
+						})
+						if retryErr == nil {
+							w.log.Infof("[%s.%s] Bulk delete succeeded after retry", dbName, collName)
+							bulkRetrySucceeded = true
+						} else {
+							w.log.Warnf("[%s.%s] Bulk delete still failed after retries: %v. Falling back to individual operations.", dbName, collName, retryErr)
+						}
+					}
+				}
+
+				if bulkRetrySucceeded {
+					break
+				}
+
 				// Fall back to individual deletes
 				for _, op := range group.Operations {
 					filter := bson.M{"_id": op.DocumentID}
@@ -814,6 +890,29 @@ func (w *Worker) processGroup(group OperationGroup) {
 					w.log.Debugf("[%s.%s] Bulk replace canceled due to context cancellation", dbName, collName)
 				} else {
 					w.log.Errorf("[%s.%s] Error performing bulk replace: %v", dbName, collName, err)
+				}
+
+				// For transient errors, retry the bulk operation with backoff before falling back
+				bulkRetrySucceeded := false
+				if w.retryManager != nil && err != context.Canceled {
+					errType := w.retryManager.ClassifyError(err)
+					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
+						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk replace with backoff...", dbName, collName)
+						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
+							_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
+							return retryBulkErr
+						})
+						if retryErr == nil {
+							w.log.Infof("[%s.%s] Bulk replace succeeded after retry", dbName, collName)
+							bulkRetrySucceeded = true
+						} else {
+							w.log.Warnf("[%s.%s] Bulk replace still failed after retries: %v. Falling back to individual operations.", dbName, collName, retryErr)
+						}
+					}
+				}
+
+				if bulkRetrySucceeded {
+					break
 				}
 
 				// Fall back to individual replaces

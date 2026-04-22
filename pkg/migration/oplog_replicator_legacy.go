@@ -28,6 +28,7 @@ type OplogReplicatorLegacy struct {
 	collectionMap map[string]map[string]string // Map of database -> source collection -> target collection
 	mu            sync.Mutex                   // Mutex for thread-safe operations
 	dlq           DLQ                          // Dead Letter Queue for failed documents
+	retryManager  *RetryManager                // Retry manager for transient errors
 }
 
 // NewOplogReplicatorLegacy creates a new oplog-based replicator using GTM legacy
@@ -146,6 +147,9 @@ func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTime
 		// Use saved timestamp - properly combine T and I components
 		afterTimestamp = bson.MongoTimestamp((int64(savedTimestamp.Timestamp.T) << 32) | int64(savedTimestamp.Timestamp.I))
 	}
+
+	// Create retry manager from config
+	r.retryManager = NewRetryManagerFromConfig(r.config, r.log)
 
 	// Perform initial migration if needed
 	if needsInitialMigration {
@@ -373,39 +377,61 @@ func (r *OplogReplicatorLegacy) insertBatchWithRetry(ctx context.Context, target
 				r.log.Errorf("Error performing bulk insert for %s.%s: %v", sourceDB, sourceCollection, err)
 			}
 
-			// Fall back to individual operations with upsert for all documents
-			for _, doc := range batch {
-				// Try insert first
-				if _, err := targetCol.InsertOne(ctx, doc); err != nil {
-					// If insert fails, try upsert
-					var docID interface{}
-					if docMap, ok := doc.(map[string]interface{}); ok {
-						docID = docMap["_id"]
+			// For transient errors, retry the bulk operation with backoff before falling back
+			bulkRetrySucceeded := false
+			if r.retryManager != nil && err != context.Canceled {
+				errType := r.retryManager.ClassifyError(err)
+				if errType == ErrorTypeConnection || errType == ErrorTypeContention {
+					r.log.Infof("Transient error detected for %s.%s. Retrying bulk insert with backoff...", sourceDB, sourceCollection)
+					retryErr := r.retryManager.RetryWithBackoff(ctx, func() error {
+						_, retryInsertErr := targetCol.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false))
+						return retryInsertErr
+					})
+					if retryErr == nil {
+						r.log.Infof("Bulk insert for %s.%s succeeded after retry", sourceDB, sourceCollection)
+						bulkRetrySucceeded = true
+						successCount = int64(len(batch))
+					} else {
+						r.log.Warnf("Bulk insert for %s.%s still failed after retries: %v. Falling back to individual operations.", sourceDB, sourceCollection, retryErr)
 					}
-
-					if docID != nil {
-						filter := modernbson.M{"_id": docID}
-						if _, err := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); err != nil {
-							if err == context.Canceled {
-								r.log.Debugf("Upserting document %v in %s.%s canceled due to context cancellation",
-									docID, sourceDB, sourceCollection)
-							} else {
-								r.log.Errorf("Error upserting document %v in %s.%s: %v",
-									docID, sourceDB, sourceCollection, err)
-								if r.dlq != nil {
-									r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
-								}
-							}
-						} else {
-							r.log.Debugf("Successfully upserted document %v in %s.%s after insert failed",
-								docID, sourceDB, sourceCollection)
-							successCount++
-						}
-					}
-				} else {
-					successCount++
 				}
 			}
+
+			if !bulkRetrySucceeded {
+				// Fall back to individual operations with upsert for all documents
+				for _, doc := range batch {
+					// Try insert first
+					if _, err := targetCol.InsertOne(ctx, doc); err != nil {
+						// If insert fails, try upsert
+						var docID interface{}
+						if docMap, ok := doc.(map[string]interface{}); ok {
+							docID = docMap["_id"]
+						}
+
+						if docID != nil {
+							filter := modernbson.M{"_id": docID}
+							if _, err := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); err != nil {
+								if err == context.Canceled {
+									r.log.Debugf("Upserting document %v in %s.%s canceled due to context cancellation",
+										docID, sourceDB, sourceCollection)
+								} else {
+									r.log.Errorf("Error upserting document %v in %s.%s: %v",
+										docID, sourceDB, sourceCollection, err)
+									if r.dlq != nil {
+										r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
+									}
+								}
+							} else {
+								r.log.Debugf("Successfully upserted document %v in %s.%s after insert failed",
+									docID, sourceDB, sourceCollection)
+								successCount++
+							}
+						}
+					} else {
+						successCount++
+					}
+				}
+			} // end if !bulkRetrySucceeded
 		}
 	} else {
 		// All documents inserted successfully
@@ -464,7 +490,7 @@ func (r *OplogReplicatorLegacy) tailOplog(ctx context.Context, afterTimestamp bs
 	r.log.Infof("Starting parallel oplog processing with %d workers", r.config.IncrementalWorkerCount)
 	workers := make([]*Worker, r.config.IncrementalWorkerCount)
 	for i := 0; i < r.config.IncrementalWorkerCount; i++ {
-		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionMap, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq)
+		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionMap, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager)
 	}
 
 	// Set up context cancellation handling for workers
