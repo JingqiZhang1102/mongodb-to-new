@@ -23,6 +23,7 @@ type ClientLevelReplicator struct {
 	log           *logger.Logger
 	collectionMap map[string]map[string]string // Map of database -> source collection -> target collection
 	mu            sync.Mutex                   // Mutex for thread-safe operations
+	dlq           DLQ                          // Dead Letter Queue for failed documents
 }
 
 // NewClientLevelReplicator creates a new client-level replicator
@@ -34,6 +35,11 @@ func NewClientLevelReplicator(sourceDB, targetDB *db.MongoDB, cfg *config.Config
 		log:           log,
 		collectionMap: make(map[string]map[string]string),
 	}
+}
+
+// SetDLQ sets the Dead Letter Queue writer for this replicator
+func (r *ClientLevelReplicator) SetDLQ(dlq DLQ) {
+	r.dlq = dlq
 }
 
 // AddCollection adds a collection to be watched
@@ -271,6 +277,9 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 													filter := bson.M{"_id": id}
 													if _, err := targetDBCollection.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); err != nil {
 														r.log.Errorf("[%s.%s] Retry upsert failed for document _id=%v: %v", sourceDB, sourceCollection, id, err)
+														if r.dlq != nil {
+															r.dlq.WriteFailed(sourceDB, sourceCollection, id, err, "initial", "insert", doc)
+														}
 													}
 												}
 											}
@@ -476,6 +485,7 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		r.config.ForceOrderedOperations,
 		time.Duration(r.config.FlushIntervalMs)*time.Millisecond,
 		r.config,
+		r.dlq,
 	)
 
 	// Start event distribution

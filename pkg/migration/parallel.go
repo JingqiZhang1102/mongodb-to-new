@@ -33,6 +33,7 @@ type EventDistributor struct {
 	incrementalWriteBatchSize int
 	forceOrderedOperations    bool
 	flushInterval             time.Duration // Flush interval in milliseconds
+	dlq                       DLQ           // Dead Letter Queue for failed documents
 
 	// Statistics tracking
 	statsMu              sync.Mutex    // Mutex for thread-safe updates to statistics
@@ -47,7 +48,7 @@ func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 	changeStream *mongo.ChangeStream, log *logger.Logger,
 	resumeTokenPath string, checkpointInterval time.Duration,
 	saveThreshold, incrementalWorkerCount, incrementalWriteBatchSize int,
-	forceOrderedOperations bool, flushInterval time.Duration, cfg *config.Config) *EventDistributor {
+	forceOrderedOperations bool, flushInterval time.Duration, cfg *config.Config, dlq DLQ) *EventDistributor {
 
 	// Use stats interval from config
 	statsInterval := time.Duration(cfg.StatsIntervalMinutes) * time.Minute
@@ -67,6 +68,7 @@ func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 		incrementalWriteBatchSize: incrementalWriteBatchSize,
 		forceOrderedOperations:    forceOrderedOperations,
 		flushInterval:             flushInterval,
+		dlq:                       dlq,
 
 		// Initialize statistics tracking
 		statsInterval:        statsInterval,
@@ -131,7 +133,7 @@ func (d *EventDistributor) waitForWorkersToFinish() {
 func (d *EventDistributor) Start() error {
 	// Initialize workers
 	for i := 0; i < d.incrementalWorkerCount; i++ {
-		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations)
+		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq)
 	}
 
 	// Set up context cancellation handling
@@ -343,6 +345,9 @@ type Worker struct {
 	// Force ordered operations for all types
 	forceOrderedOperations bool
 
+	// Dead Letter Queue for failed documents
+	dlq DLQ
+
 	// For shutdown coordination
 	wg sync.WaitGroup
 
@@ -377,7 +382,7 @@ func (w *Worker) flushCurrentGroup() bool {
 // NewWorker creates a new worker
 func NewWorker(id int, ctx context.Context, log *logger.Logger,
 	targetDB *db.MongoDB, collectionMap map[string]map[string]string,
-	incrementalWriteBatchSize int, forceOrderedOperations bool) *Worker {
+	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ) *Worker {
 
 	return &Worker{
 		id:                        id,
@@ -388,6 +393,7 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 		processingQueue:           make([]*OperationGroup, 0),
 		incrementalWriteBatchSize: incrementalWriteBatchSize,
 		forceOrderedOperations:    forceOrderedOperations,
+		dlq:                       dlq,
 	}
 }
 
@@ -550,6 +556,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 							filter := bson.M{"_id": op.DocumentID}
 							if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
 								w.log.Debugf("[%s.%s] Upsert fallback failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
+								if w.dlq != nil {
+									w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
+								}
 							} else {
 								w.log.Debugf("[%s.%s] Successfully upserted document _id=%v after duplicate key error", dbName, collName, op.DocumentID)
 							}
@@ -559,6 +568,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 						if writeErr.Index < len(docs) {
 							if _, err := targetCollection.InsertOne(w.ctx, docs[writeErr.Index]); err != nil {
 								w.log.Errorf("[%s.%s] Retry insert failed for document _id=%v: %v", dbName, collName, failedDocID, err)
+								if w.dlq != nil {
+									w.dlq.WriteFailed(dbName, collName, failedDocID, err, "incremental", "insert", docs[writeErr.Index])
+								}
 							}
 						}
 					}
@@ -582,6 +594,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 								w.log.Debugf("[%s.%s] Upserting document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
 							} else {
 								w.log.Errorf("[%s.%s] Error upserting document _id=%v: %v", dbName, collName, op.DocumentID, err)
+								if w.dlq != nil {
+									w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
+								}
 							}
 						} else {
 							w.log.Debugf("[%s.%s] Successfully upserted document _id=%v after insert failed", dbName, collName, op.DocumentID)
@@ -641,10 +656,16 @@ func (w *Worker) processGroup(group OperationGroup) {
 						if op.UpdateDescription != nil {
 							if _, err := targetCollection.UpdateOne(w.ctx, filter, op.UpdateDescription, options.Update().SetUpsert(true)); err != nil {
 								w.log.Errorf("[%s.%s] Retry modifier update failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
+								if w.dlq != nil {
+									w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.UpdateDescription)
+								}
 							}
 						} else if op.Document != nil {
 							if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
 								w.log.Errorf("[%s.%s] Retry replace update failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
+								if w.dlq != nil {
+									w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
+								}
 							}
 						}
 					}
@@ -668,6 +689,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 								w.log.Debugf("[%s.%s] Updating document _id=%v (modifier) canceled due to context cancellation", dbName, collName, op.DocumentID)
 							} else {
 								w.log.Errorf("[%s.%s] Error updating document _id=%v (modifier): %v", dbName, collName, op.DocumentID, err)
+								if w.dlq != nil {
+									w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.UpdateDescription)
+								}
 							}
 						}
 					} else if op.Document != nil {
@@ -676,6 +700,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 								w.log.Debugf("[%s.%s] Replacing document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
 							} else {
 								w.log.Errorf("[%s.%s] Error replacing document _id=%v: %v", dbName, collName, op.DocumentID, err)
+								if w.dlq != nil {
+									w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
+								}
 							}
 						}
 					}
@@ -712,6 +739,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 						filter := bson.M{"_id": op.DocumentID}
 						if _, err := targetCollection.DeleteOne(w.ctx, filter); err != nil {
 							w.log.Errorf("[%s.%s] Retry delete failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
+							if w.dlq != nil {
+								w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "delete", nil)
+							}
 						}
 					}
 				}
@@ -731,6 +761,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 							w.log.Debugf("[%s.%s] Deleting document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
 						} else {
 							w.log.Errorf("[%s.%s] Error deleting document _id=%v: %v", dbName, collName, op.DocumentID, err)
+							if w.dlq != nil {
+								w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "delete", nil)
+							}
 						}
 					}
 				}
@@ -769,6 +802,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 						filter := bson.M{"_id": op.DocumentID}
 						if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
 							w.log.Errorf("[%s.%s] Retry replace failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
+							if w.dlq != nil {
+								w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
+							}
 						}
 					}
 				}
@@ -788,6 +824,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 							w.log.Debugf("[%s.%s] Replacing document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
 						} else {
 							w.log.Errorf("[%s.%s] Error replacing document _id=%v: %v", dbName, collName, op.DocumentID, err)
+							if w.dlq != nil {
+								w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
+							}
 						}
 					}
 				}

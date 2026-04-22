@@ -25,6 +25,7 @@ type OplogReplicator struct {
 	log           *logger.Logger
 	collectionMap map[string]map[string]string // Map of database -> source collection -> target collection
 	mu            sync.Mutex                   // Mutex for thread-safe operations
+	dlq           DLQ                          // Dead Letter Queue for failed documents
 }
 
 // NewOplogReplicator creates a new oplog-based replicator
@@ -36,6 +37,11 @@ func NewOplogReplicator(sourceDB, targetDB *db.MongoDB, cfg *config.Config, log 
 		log:           log,
 		collectionMap: make(map[string]map[string]string),
 	}
+}
+
+// SetDLQ sets the Dead Letter Queue writer for this replicator
+func (r *OplogReplicator) SetDLQ(dlq DLQ) {
+	r.dlq = dlq
 }
 
 // AddCollection adds a collection to be watched
@@ -344,6 +350,9 @@ func (r *OplogReplicator) insertBatchWithRetry(ctx context.Context, targetCol *m
 							if _, err := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); err != nil {
 								r.log.Debugf("Upsert fallback failed for document %v in %s.%s: %v",
 									docID, sourceDB, sourceCollection, err)
+								if r.dlq != nil {
+									r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
+								}
 							} else {
 								r.log.Debugf("Successfully upserted document %v in %s.%s after duplicate key error",
 									docID, sourceDB, sourceCollection)
@@ -374,6 +383,9 @@ func (r *OplogReplicator) insertBatchWithRetry(ctx context.Context, targetCol *m
 						if _, err := targetCol.InsertOne(ctx, batch[writeErr.Index]); err != nil {
 							r.log.Errorf("[%s.%s] Retry insert failed for document _id=%v: %v",
 								sourceDB, sourceCollection, retryDocID, err)
+							if r.dlq != nil {
+								r.dlq.WriteFailed(sourceDB, sourceCollection, retryDocID, err, "initial", "insert", batch[writeErr.Index])
+							}
 						} else {
 							successCount++
 						}
@@ -415,6 +427,9 @@ func (r *OplogReplicator) insertBatchWithRetry(ctx context.Context, targetCol *m
 							} else {
 								r.log.Errorf("Error upserting document %v in %s.%s: %v",
 									docID, sourceDB, sourceCollection, err)
+								if r.dlq != nil {
+									r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
+								}
 							}
 						} else {
 							r.log.Debugf("Successfully upserted document %v in %s.%s after insert failed",
@@ -474,7 +489,7 @@ func (r *OplogReplicator) tailOplog(ctx context.Context, afterTimestamp primitiv
 	r.log.Infof("Starting parallel oplog processing with %d workers", r.config.IncrementalWorkerCount)
 	workers := make([]*Worker, r.config.IncrementalWorkerCount)
 	for i := 0; i < r.config.IncrementalWorkerCount; i++ {
-		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionMap, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations)
+		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionMap, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq)
 	}
 
 	// Set up context cancellation handling for workers

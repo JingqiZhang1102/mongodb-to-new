@@ -107,6 +107,14 @@ func (m *Migrator) getCheckpointPath(prefix string, pairIndex int) string {
 	return fmt.Sprintf("%s-pair%d.json", prefix, pairIndex)
 }
 
+// getDLQPath generates a per-pair DLQ file path
+func (m *Migrator) getDLQPath(pairIndex int) string {
+	if len(m.config.DatabasePairs) == 1 {
+		return "dlq-global.jsonl"
+	}
+	return fmt.Sprintf("dlq-pair%d.jsonl", pairIndex)
+}
+
 // processDatabasePair processes a single database pair
 func (m *Migrator) processDatabasePair(ctx context.Context, pair config.DatabasePair, pairIndex int, mode string) error {
 	// Check if this is legacy mode - if so, handle it separately
@@ -265,6 +273,20 @@ func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, t
 		globalResumeToken = nil
 	}
 
+	// Create DLQ writer for this database pair
+	dlqPath := m.getDLQPath(pairIndex)
+	dlq, err := NewDLQWriter(dlqPath, m.log)
+	if err != nil {
+		m.log.Warnf("Failed to create DLQ writer at %s: %v (continuing without DLQ)", dlqPath, err)
+		dlq = nil
+	}
+	var dlqInterface DLQ = &NopDLQWriter{}
+	if dlq != nil {
+		dlqInterface = dlq
+		defer dlq.Close()
+	}
+	replicator.SetDLQ(dlqInterface)
+
 	// Start client-level replication (which will handle index sync during initial migration)
 	return replicator.StartReplication(ctx, globalResumeToken, globalResumeTokenPath, pair, m)
 }
@@ -295,6 +317,20 @@ func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB
 	if oplogTimestamp != nil {
 		globalTimestamp = oplogTimestamp
 	}
+
+	// Create DLQ writer for this database pair
+	dlqPath := m.getDLQPath(pairIndex)
+	dlq, err := NewDLQWriter(dlqPath, m.log)
+	if err != nil {
+		m.log.Warnf("Failed to create DLQ writer at %s: %v (continuing without DLQ)", dlqPath, err)
+		dlq = nil
+	}
+	var dlqInterface DLQ = &NopDLQWriter{}
+	if dlq != nil {
+		dlqInterface = dlq
+		defer dlq.Close()
+	}
+	replicator.SetDLQ(dlqInterface)
 
 	// Start oplog replication (which will handle index sync during initial migration)
 	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, pair, m)
@@ -342,6 +378,20 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 	if oplogTimestamp != nil {
 		globalTimestamp = oplogTimestamp
 	}
+
+	// Create DLQ writer for this database pair
+	dlqPath := m.getDLQPath(pairIndex)
+	dlq, err := NewDLQWriter(dlqPath, m.log)
+	if err != nil {
+		m.log.Warnf("Failed to create DLQ writer at %s: %v (continuing without DLQ)", dlqPath, err)
+		dlq = nil
+	}
+	var dlqInterface DLQ = &NopDLQWriter{}
+	if dlq != nil {
+		dlqInterface = dlq
+		defer dlq.Close()
+	}
+	replicator.SetDLQ(dlqInterface)
 
 	// Start legacy oplog replication
 	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, pair, m)
