@@ -45,23 +45,39 @@ func TransformFieldNames(doc interface{}, log *logger.Logger, dbName, collName s
 
 	switch d := doc.(type) {
 	case bson.D:
-		result := make(bson.D, len(d))
-		for i, elem := range d {
+		result := make(bson.D, 0, len(d))
+		for _, elem := range d {
+			// Remove empty field names (Firestore does not support them)
+			if elem.Key == "" {
+				if log != nil {
+					log.Warnf("Removed empty field name from document [db=%s, collection=%s, _id=%v]",
+						dbName, collName, docID)
+				}
+				continue
+			}
 			newKey := renameFieldName(elem.Key)
 			if newKey != elem.Key && log != nil {
 				log.Infof("Renamed field \"%s\" to \"%s\" in document [db=%s, collection=%s, _id=%v]",
 					elem.Key, newKey, dbName, collName, docID)
 			}
-			result[i] = bson.E{
+			result = append(result, bson.E{
 				Key:   newKey,
 				Value: TransformFieldNames(elem.Value, log, dbName, collName, docID),
-			}
+			})
 		}
 		return result
 
 	case bson.M:
 		result := make(bson.M, len(d))
 		for k, v := range d {
+			// Remove empty field names (Firestore does not support them)
+			if k == "" {
+				if log != nil {
+					log.Warnf("Removed empty field name from document [db=%s, collection=%s, _id=%v]",
+						dbName, collName, docID)
+				}
+				continue
+			}
 			newKey := renameFieldName(k)
 			if newKey != k && log != nil {
 				log.Infof("Renamed field \"%s\" to \"%s\" in document [db=%s, collection=%s, _id=%v]",
@@ -74,6 +90,14 @@ func TransformFieldNames(doc interface{}, log *logger.Logger, dbName, collName s
 	case map[string]interface{}:
 		result := make(map[string]interface{}, len(d))
 		for k, v := range d {
+			// Remove empty field names (Firestore does not support them)
+			if k == "" {
+				if log != nil {
+					log.Warnf("Removed empty field name from document [db=%s, collection=%s, _id=%v]",
+						dbName, collName, docID)
+				}
+				continue
+			}
 			newKey := renameFieldName(k)
 			if newKey != k && log != nil {
 				log.Infof("Renamed field \"%s\" to \"%s\" in document [db=%s, collection=%s, _id=%v]",
