@@ -31,11 +31,17 @@ func extractDocID(doc interface{}) interface{} {
 }
 
 // renameFieldName renames a field name if it matches the __*__ pattern.
-// Fields like __name__ are not supported by Firestore, so we strip one underscore
-// from each side: __name__ → _name_
+// Fields like __name__ are not supported by Firestore, so we strip leading/trailing
+// underscores and add back exactly one on each side: __name__ → _name_
+// All-underscore fields (e.g. __, ___, ____, _____) are collapsed to a single "_".
 func renameFieldName(name string) string {
-	if len(name) >= 5 && strings.HasPrefix(name, "__") && strings.HasSuffix(name, "__") {
-		return "_" + name[2:len(name)-2] + "_"
+	if strings.HasPrefix(name, "__") && strings.HasSuffix(name, "__") {
+		trimmed := strings.Trim(name, "_")
+		if trimmed == "" {
+			// All underscores (e.g. __, ___, ____, _____) → single underscore
+			return "_"
+		}
+		return "_" + trimmed + "_"
 	}
 	return name
 }
