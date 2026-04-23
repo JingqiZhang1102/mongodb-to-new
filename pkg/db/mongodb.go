@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
@@ -13,9 +14,10 @@ import (
 
 // MongoDB represents a MongoDB connection
 type MongoDB struct {
-	client   *mongo.Client
-	database *mongo.Database
-	log      *logger.Logger
+	client         *mongo.Client
+	database       *mongo.Database
+	log            *logger.Logger
+	indexSemaphore chan struct{} // limits concurrent async index builds to prevent Firestore cross-transaction contention
 }
 
 // NewMongoDB creates a new MongoDB connection
@@ -47,9 +49,10 @@ func NewMongoDB(connectionString, databaseName string, log *logger.Logger) (*Mon
 	database := client.Database(databaseName)
 
 	return &MongoDB{
-		client:   client,
-		database: database,
-		log:      log,
+		client:         client,
+		database:       database,
+		log:            log,
+		indexSemaphore: make(chan struct{}, 1), // serialize async index builds to prevent Firestore cross-transaction contention
 	}, nil
 }
 
@@ -240,15 +243,41 @@ func (m *MongoDB) CreateIndexFromDefinition(ctx context.Context, collectionName 
 	return nil
 }
 
+// isContentionError checks if an error is a Firestore cross-transaction contention error.
+func isContentionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "cross-transaction contention") ||
+		strings.Contains(errStr, "Aborted") && strings.Contains(errStr, "contention") ||
+		strings.Contains(errStr, "too much contention")
+}
+
 // CreateIndexFromDefinitionAsync creates an index asynchronously in a goroutine.
 // It uses a dedicated MongoDB client with no socket timeout so index builds can run
 // as long as needed without being killed by the main client's 120-second socket timeout.
+//
+// Throttling: A semaphore (capacity=1) serializes index builds to prevent Firestore
+// cross-transaction contention. Goroutines queue up and execute one at a time.
+//
+// Retry: If a contention error still occurs (e.g., from an external process), the
+// operation retries up to 3 times with 30s/60s/120s delays.
+//
 // The goroutine logs success or failure — the caller does not wait.
 func (m *MongoDB) CreateIndexFromDefinitionAsync(connectionString, collectionName string, indexDef bson.M) {
 	// Extract index name for logging
 	indexName, _ := indexDef["name"].(string)
 
 	go func() {
+		// Acquire semaphore — blocks until a slot is available.
+		// This serializes index creation to avoid Firestore cross-transaction contention.
+		if m.indexSemaphore != nil {
+			m.log.Debugf("[async] Index '%s' on '%s': waiting for semaphore...", indexName, collectionName)
+			m.indexSemaphore <- struct{}{}
+			defer func() { <-m.indexSemaphore }()
+		}
+
 		startTime := time.Now()
 
 		// Create a dedicated client with no socket timeout for long-running index builds
@@ -269,14 +298,48 @@ func (m *MongoDB) CreateIndexFromDefinitionAsync(connectionString, collectionNam
 		}
 		defer client.Disconnect(ctx)
 
-		// Create the index using the dedicated client
+		// Create the index using the dedicated client, with retry for contention errors
 		collection := client.Database(m.database.Name()).Collection(collectionName)
 
-		if err := m.createIndexOnCollection(ctx, collection, collectionName, indexDef); err != nil {
-			m.log.Warnf("[async] Failed to create index '%s' on '%s': %v (took %v)", indexName, collectionName, err, time.Since(startTime).Round(time.Second))
-		} else {
-			m.log.Infof("[async] Successfully created index '%s' on '%s' (took %v)", indexName, collectionName, time.Since(startTime).Round(time.Second))
+		const maxRetries = 3
+		retryDelays := []time.Duration{30 * time.Second, 60 * time.Second, 120 * time.Second}
+
+		var lastErr error
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			if attempt > 0 {
+				delay := retryDelays[attempt-1]
+				m.log.Infof("[async] Retrying index '%s' on '%s' (attempt %d/%d) after %v...",
+					indexName, collectionName, attempt, maxRetries, delay)
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					m.log.Warnf("[async] Context canceled while waiting to retry index '%s' on '%s'", indexName, collectionName)
+					return
+				}
+			}
+
+			lastErr = m.createIndexOnCollection(ctx, collection, collectionName, indexDef)
+			if lastErr == nil {
+				m.log.Infof("[async] Successfully created index '%s' on '%s' (took %v)",
+					indexName, collectionName, time.Since(startTime).Round(time.Second))
+
+				// Small cooldown after success to reduce pressure on Firestore metadata
+				time.Sleep(2 * time.Second)
+				return
+			}
+
+			// Only retry on contention errors
+			if !isContentionError(lastErr) {
+				break
+			}
+
+			m.log.Warnf("[async] Contention error creating index '%s' on '%s': %v (attempt %d/%d, took %v so far)",
+				indexName, collectionName, lastErr, attempt+1, maxRetries+1, time.Since(startTime).Round(time.Second))
 		}
+
+		// All attempts exhausted or non-contention error
+		m.log.Warnf("[async] Failed to create index '%s' on '%s': %v (took %v)",
+			indexName, collectionName, lastErr, time.Since(startTime).Round(time.Second))
 	}()
 }
 
