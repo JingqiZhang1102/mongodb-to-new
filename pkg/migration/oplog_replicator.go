@@ -258,45 +258,121 @@ func (r *OplogReplicator) performInitialMigration(ctx context.Context, pair conf
 	return nil
 }
 
-// migrateCollection migrates a single collection with sophisticated error handling
+// migrateCollection migrates a single collection with sophisticated error handling.
+// It uses NoCursorTimeout to prevent server-side cursor expiration, and includes
+// cursor resumption logic as a safety net for network interruptions.
 func (r *OplogReplicator) migrateCollection(ctx context.Context, sourceCol, targetCol *mongo.Collection, count int64, sourceDB, sourceCollection string) int64 {
 	readBatchSize := r.config.InitialReadBatchSize
 	writeBatchSize := r.config.InitialWriteBatchSize
 
-	cursor, err := sourceCol.Find(ctx, bson.D{}, options.Find().SetBatchSize(int32(readBatchSize)))
-	if err != nil {
-		r.log.Errorf("Error creating cursor for %s.%s: %v", sourceDB, sourceCollection, err)
-		return 0
-	}
-	defer cursor.Close(ctx)
+	const maxCursorResumes = 10 // Maximum number of cursor resumption attempts
 
 	var batch []interface{}
 	var migratedCount int64
 	var lastLoggedPercentage int = -1 // Start at -1 to ensure 0% is logged
+	var lastID interface{}            // Track last successfully read _id for cursor resumption
+	var cursorResumeCount int
 
-	for cursor.Next(ctx) {
-		var doc bson.D
-		if err := cursor.Decode(&doc); err != nil {
-			r.log.Errorf("[%s.%s] Error decoding document: %v", sourceDB, sourceCollection, err)
-			continue
+	for {
+		// Build query: on first pass, read all documents sorted by _id.
+		// On resumption, read from after the last successfully read _id.
+		var filter bson.D
+		if lastID == nil {
+			filter = bson.D{}
+		} else {
+			r.log.Infof("[%s.%s] Resuming cursor from _id=%v (resume attempt %d/%d)",
+				sourceDB, sourceCollection, lastID, cursorResumeCount, maxCursorResumes)
+			filter = bson.D{{Key: "_id", Value: bson.D{{Key: "$gt", Value: lastID}}}}
 		}
 
-		batch = append(batch, doc)
+		findOpts := options.Find().
+			SetBatchSize(int32(readBatchSize)).
+			SetSort(bson.D{{Key: "_id", Value: 1}}).
+			SetNoCursorTimeout(true)
 
-		if len(batch) >= writeBatchSize {
-			migratedCount += r.insertBatchWithRetry(ctx, targetCol, batch, sourceDB, sourceCollection)
-			batch = nil
+		cursor, err := sourceCol.Find(ctx, filter, findOpts)
+		if err != nil {
+			r.log.Errorf("Error creating cursor for %s.%s: %v", sourceDB, sourceCollection, err)
+			return migratedCount
+		}
 
-			// Log progress at every 10% threshold
-			if count > 0 {
-				currentPercentage := int(float64(migratedCount) / float64(count) * 10)
-				if currentPercentage > lastLoggedPercentage {
-					lastLoggedPercentage = currentPercentage
-					r.log.Infof("Collection %s.%s progress: %d/%d documents (%.0f%%)",
-						sourceDB, sourceCollection, migratedCount, count, float64(currentPercentage)*10)
+		cursorFailed := false
+
+		for cursor.Next(ctx) {
+			var doc bson.D
+			if err := cursor.Decode(&doc); err != nil {
+				r.log.Errorf("[%s.%s] Error decoding document: %v", sourceDB, sourceCollection, err)
+				continue
+			}
+
+			// Track last _id for cursor resumption
+			for _, elem := range doc {
+				if elem.Key == "_id" {
+					lastID = elem.Value
+					break
+				}
+			}
+
+			batch = append(batch, doc)
+
+			if len(batch) >= writeBatchSize {
+				migratedCount += r.insertBatchWithRetry(ctx, targetCol, batch, sourceDB, sourceCollection)
+				batch = nil
+
+				// Log progress at every 10% threshold
+				if count > 0 {
+					currentPercentage := int(float64(migratedCount) / float64(count) * 10)
+					if currentPercentage > lastLoggedPercentage {
+						lastLoggedPercentage = currentPercentage
+						r.log.Infof("Collection %s.%s progress: %d/%d documents (%.0f%%)",
+							sourceDB, sourceCollection, migratedCount, count, float64(currentPercentage)*10)
+					}
 				}
 			}
 		}
+
+		// Check for cursor errors
+		if err := cursor.Err(); err != nil {
+			r.log.Warnf("[%s.%s] Cursor error after %d documents: %v", sourceDB, sourceCollection, migratedCount, err)
+			cursor.Close(ctx)
+
+			// Check if context is canceled
+			if ctx.Err() != nil {
+				r.log.Infof("[%s.%s] Context canceled, stopping migration", sourceDB, sourceCollection)
+				break
+			}
+
+			// Attempt cursor resumption if we have a last _id and haven't exceeded max resumes
+			cursorResumeCount++
+			if lastID != nil && cursorResumeCount <= maxCursorResumes {
+				r.log.Infof("[%s.%s] Will attempt cursor resumption from last _id=%v", sourceDB, sourceCollection, lastID)
+
+				// Insert any pending batch before resuming
+				if len(batch) > 0 {
+					migratedCount += r.insertBatchWithRetry(ctx, targetCol, batch, sourceDB, sourceCollection)
+					batch = nil
+				}
+
+				cursorFailed = true
+			} else {
+				if cursorResumeCount > maxCursorResumes {
+					r.log.Errorf("[%s.%s] Exceeded maximum cursor resume attempts (%d). Stopping migration at %d documents.",
+						sourceDB, sourceCollection, maxCursorResumes, migratedCount)
+				} else {
+					r.log.Errorf("[%s.%s] Cursor error with no last _id to resume from. Stopping migration at %d documents.",
+						sourceDB, sourceCollection, migratedCount)
+				}
+				break
+			}
+		} else {
+			cursor.Close(ctx)
+		}
+
+		// If cursor didn't fail, we've finished iterating successfully
+		if !cursorFailed {
+			break
+		}
+		// Otherwise, the loop continues with a new cursor from lastID
 	}
 
 	// Insert remaining documents

@@ -248,44 +248,107 @@ func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pai
 	return nil
 }
 
-// migrateCollection migrates a single collection from mgo source to modern driver target
+// migrateCollection migrates a single collection from mgo source to modern driver target.
+// It includes cursor resumption logic: if the cursor becomes invalid (e.g., server-side timeout),
+// it re-queries from the last successfully read _id and continues the migration.
 func (r *OplogReplicatorLegacy) migrateCollection(ctx context.Context, sourceCol *mgo.Collection, targetCol *mongod.Collection, count int, sourceDB, sourceCollection string) int64 {
 	readBatchSize := r.config.InitialReadBatchSize
 	writeBatchSize := r.config.InitialWriteBatchSize
 
-	iter := sourceCol.Find(nil).Batch(readBatchSize).Iter()
-	defer iter.Close()
+	const maxCursorResumes = 10 // Maximum number of cursor resumption attempts
 
 	var batch []interface{}
 	var migratedCount int64
 	var lastLoggedPercentage int = -1 // Start at -1 to ensure 0% is logged
-	var doc bson.M
+	var lastID interface{}            // Track last successfully read _id for cursor resumption
+	var cursorResumeCount int
 
-	for iter.Next(&doc) {
-		// Convert mgo bson.M to interface{} for modern driver
-		batch = append(batch, convertMgoBSONToInterface(doc))
-
-		if len(batch) >= writeBatchSize {
-			migratedCount += r.insertBatchWithRetry(ctx, targetCol, batch, sourceDB, sourceCollection)
-			batch = nil
-
-			// Log progress at every 10% threshold
-			if count > 0 {
-				currentPercentage := int(float64(migratedCount) / float64(count) * 10)
-				if currentPercentage > lastLoggedPercentage {
-					lastLoggedPercentage = currentPercentage
-					r.log.Infof("Collection %s.%s progress: %d/%d documents (%.0f%%)",
-						sourceDB, sourceCollection, migratedCount, count, float64(currentPercentage)*10)
-				}
-			}
+	for {
+		// Build query: on first pass, read all documents sorted by _id.
+		// On resumption, read from after the last successfully read _id.
+		var query *mgo.Query
+		if lastID == nil {
+			query = sourceCol.Find(nil).Sort("_id").Batch(readBatchSize)
+		} else {
+			r.log.Infof("[%s.%s] Resuming cursor from _id=%v (resume attempt %d/%d)",
+				sourceDB, sourceCollection, lastID, cursorResumeCount, maxCursorResumes)
+			query = sourceCol.Find(bson.M{"_id": bson.M{"$gt": lastID}}).Sort("_id").Batch(readBatchSize)
 		}
 
-		// Reset doc for next iteration
-		doc = bson.M{}
-	}
+		iter := query.Iter()
+		var doc bson.M
+		cursorFailed := false
 
-	if err := iter.Err(); err != nil {
-		r.log.Errorf("[%s.%s] Error iterating documents: %v", sourceDB, sourceCollection, err)
+		for iter.Next(&doc) {
+			// Track last _id for cursor resumption
+			if id, ok := doc["_id"]; ok {
+				lastID = id
+			}
+
+			// Convert mgo bson.M to interface{} for modern driver
+			batch = append(batch, convertMgoBSONToInterface(doc))
+
+			if len(batch) >= writeBatchSize {
+				migratedCount += r.insertBatchWithRetry(ctx, targetCol, batch, sourceDB, sourceCollection)
+				batch = nil
+
+				// Log progress at every 10% threshold
+				if count > 0 {
+					currentPercentage := int(float64(migratedCount) / float64(count) * 10)
+					if currentPercentage > lastLoggedPercentage {
+						lastLoggedPercentage = currentPercentage
+						r.log.Infof("Collection %s.%s progress: %d/%d documents (%.0f%%)",
+							sourceDB, sourceCollection, migratedCount, count, float64(currentPercentage)*10)
+					}
+				}
+			}
+
+			// Reset doc for next iteration
+			doc = bson.M{}
+		}
+
+		// Check for cursor errors
+		if err := iter.Err(); err != nil {
+			r.log.Warnf("[%s.%s] Cursor error after %d documents: %v", sourceDB, sourceCollection, migratedCount, err)
+			iter.Close()
+
+			// Check if context is canceled
+			if ctx.Err() != nil {
+				r.log.Infof("[%s.%s] Context canceled, stopping migration", sourceDB, sourceCollection)
+				break
+			}
+
+			// Attempt cursor resumption if we have a last _id and haven't exceeded max resumes
+			cursorResumeCount++
+			if lastID != nil && cursorResumeCount <= maxCursorResumes {
+				r.log.Infof("[%s.%s] Will attempt cursor resumption from last _id=%v", sourceDB, sourceCollection, lastID)
+
+				// Insert any pending batch before resuming
+				if len(batch) > 0 {
+					migratedCount += r.insertBatchWithRetry(ctx, targetCol, batch, sourceDB, sourceCollection)
+					batch = nil
+				}
+
+				cursorFailed = true
+			} else {
+				if cursorResumeCount > maxCursorResumes {
+					r.log.Errorf("[%s.%s] Exceeded maximum cursor resume attempts (%d). Stopping migration at %d documents.",
+						sourceDB, sourceCollection, maxCursorResumes, migratedCount)
+				} else {
+					r.log.Errorf("[%s.%s] Cursor error with no last _id to resume from. Stopping migration at %d documents.",
+						sourceDB, sourceCollection, migratedCount)
+				}
+				break
+			}
+		} else {
+			iter.Close()
+		}
+
+		// If cursor didn't fail, we've finished iterating successfully
+		if !cursorFailed {
+			break
+		}
+		// Otherwise, the loop continues with a new cursor from lastID
 	}
 
 	// Insert remaining documents
