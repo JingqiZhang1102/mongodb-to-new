@@ -76,7 +76,7 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 		}(i, pair)
 	}
 
-	// Wait for interrupt signal
+	// Wait for interrupt signal or all pairs to complete
 	m.log.Info("Live replication active. Press Ctrl+C to stop.")
 
 	shutdownCtx, cancelFunc := context.WithCancel(ctx)
@@ -86,6 +86,13 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 	go func() {
 		sig := <-sigChan
 		m.log.Infof("Received %s signal. Initiating graceful shutdown...", sig)
+		cancelFunc()
+	}()
+
+	// Also cancel when all database pairs complete (e.g., all indexOnly pairs finish)
+	go func() {
+		wg.Wait()
+		m.log.Info("All database pairs completed. Shutting down.")
 		cancelFunc()
 	}()
 
