@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
@@ -17,7 +18,8 @@ type MongoDB struct {
 	client         *mongo.Client
 	database       *mongo.Database
 	log            *logger.Logger
-	indexSemaphore chan struct{} // limits concurrent async index builds to prevent Firestore cross-transaction contention
+	indexSemaphore chan struct{}  // limits concurrent async index builds to prevent Firestore cross-transaction contention
+	indexWg        sync.WaitGroup // tracks in-flight async index creation goroutines
 }
 
 // NewMongoDB creates a new MongoDB connection
@@ -54,6 +56,12 @@ func NewMongoDB(connectionString, databaseName string, log *logger.Logger) (*Mon
 		log:            log,
 		indexSemaphore: make(chan struct{}, 1), // serialize async index builds to prevent Firestore cross-transaction contention
 	}, nil
+}
+
+// WaitForIndexCreation blocks until all async index creation goroutines have finished.
+// Used by index-only mode to ensure the process doesn't exit before indexes are created.
+func (m *MongoDB) WaitForIndexCreation() {
+	m.indexWg.Wait()
 }
 
 // Close closes the MongoDB connection
@@ -269,7 +277,11 @@ func (m *MongoDB) CreateIndexFromDefinitionAsync(connectionString, collectionNam
 	// Extract index name for logging
 	indexName, _ := indexDef["name"].(string)
 
+	// Track this goroutine so callers can wait for all index builds to finish
+	m.indexWg.Add(1)
+
 	go func() {
+		defer m.indexWg.Done()
 		// Acquire semaphore — blocks until a slot is available.
 		// This serializes index creation to avoid Firestore cross-transaction contention.
 		if m.indexSemaphore != nil {

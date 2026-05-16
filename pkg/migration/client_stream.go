@@ -125,6 +125,14 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 			if err := migrator.syncIndexes(ctx, r.sourceDB, r.targetDB, pair, collections); err != nil {
 				r.log.Warnf("Index sync encountered issues: %v (continuing with migration)", err)
 			}
+
+			// Index-Only mode: wait for all async index builds then return without migrating data
+			if pair.Target.IndexOnly {
+				r.log.Info("IndexOnly mode enabled. Waiting for all async index creation to complete...")
+				r.targetDB.WaitForIndexCreation()
+				r.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration and change stream.")
+				return nil
+			}
 		}
 
 		// Use a semaphore to limit the number of concurrent collection migrations
@@ -439,6 +447,30 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		r.log.Infof("Initial migration completed in %.2f seconds. Total collections: %d, Total documents: %d",
 			initialMigrationDuration.Seconds(), totalCollections, totalMigratedCount)
 		r.log.Info("Starting incremental replication.")
+	}
+
+	// Index-Only mode: sync indexes (if not already done during initial migration) and exit
+	if pair.Target.IndexOnly {
+		if !needsInitialMigration && (pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0) {
+			// Resume token exists, so initial migration was skipped — sync indexes now
+			r.log.Info("IndexOnly mode: resume token exists, performing index sync directly")
+			var collections []config.CollectionConfig
+			for _, colls := range r.collectionMap {
+				for src, tgt := range colls {
+					collections = append(collections, config.CollectionConfig{
+						SourceCollection: src,
+						TargetCollection: tgt,
+					})
+				}
+			}
+			if err := migrator.syncIndexes(ctx, r.sourceDB, r.targetDB, pair, collections); err != nil {
+				r.log.Warnf("Index sync encountered issues: %v", err)
+			}
+			r.log.Info("IndexOnly mode: waiting for all async index creation to complete...")
+			r.targetDB.WaitForIndexCreation()
+		}
+		r.log.Info("IndexOnly mode: skipping change stream. Index replication complete.")
+		return nil
 	}
 
 	// Create client-level change stream with the resume token and batch size

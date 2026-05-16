@@ -175,6 +175,14 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 			m.log.Warnf("Index sync encountered issues: %v (continuing with migration)", err)
 			// Continue with migration even if index sync has issues
 		}
+
+		// Index-Only mode: wait for all async index builds then return without migrating data
+		if pair.Target.IndexOnly {
+			m.log.Info("IndexOnly mode enabled. Waiting for all async index creation to complete...")
+			targetDB.WaitForIndexCreation()
+			m.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration.")
+			return nil
+		}
 	}
 
 	// Process each collection
@@ -1072,6 +1080,19 @@ func (m *Migrator) syncIndexes(ctx context.Context, sourceDB, targetDB *db.Mongo
 
 			targetCollName := collConfig.TargetCollection
 
+			// List existing indexes on the target to skip already-created ones
+			existingIndexNames := make(map[string]bool)
+			targetIndexes, err := targetDB.ListIndexes(ctx, targetCollName)
+			if err != nil {
+				m.log.Debugf("Could not list target indexes for %s: %v (will attempt all)", targetCollName, err)
+			} else {
+				for _, idx := range targetIndexes {
+					if name, ok := idx["name"].(string); ok {
+						existingIndexNames[name] = true
+					}
+				}
+			}
+
 			for _, indexDef := range sourceIndexes {
 				indexName, ok := indexDef["name"].(string)
 				if !ok {
@@ -1081,6 +1102,12 @@ func (m *Migrator) syncIndexes(ctx context.Context, sourceDB, targetDB *db.Mongo
 
 				// Skip _id_ index (MongoDB creates this automatically)
 				if indexName == "_id_" {
+					continue
+				}
+
+				// Skip if index already exists on target
+				if existingIndexNames[indexName] {
+					m.log.Infof("Index '%s' already exists on target collection '%s', skipping", indexName, targetCollName)
 					continue
 				}
 

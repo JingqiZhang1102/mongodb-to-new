@@ -159,6 +159,19 @@ func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTime
 		r.log.Info("Initial migration completed. Starting incremental replication.")
 	}
 
+	// Index-Only mode: sync indexes (if not already done during initial migration) and exit
+	if pair.Target.IndexOnly {
+		if !needsInitialMigration && (pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0) {
+			// Checkpoint exists, so performInitialMigration was skipped — sync indexes now
+			r.log.Info("IndexOnly mode: checkpoint exists, performing index sync directly")
+			r.syncIndexesLegacy(ctx, pair)
+			r.log.Info("IndexOnly mode: waiting for all async index creation to complete...")
+			r.targetDB.WaitForIndexCreation()
+		}
+		r.log.Info("IndexOnly mode: skipping oplog tailing. Index replication complete.")
+		return nil
+	}
+
 	// Start oplog tailing using GTM legacy
 	return r.tailOplog(ctx, afterTimestamp, timestampPath)
 }
@@ -172,6 +185,14 @@ func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pai
 	if pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0 {
 		r.log.Info("Syncing indexes before initial migration (legacy mode)")
 		r.syncIndexesLegacy(ctx, pair)
+
+		// Index-Only mode: wait for all async index builds then return without migrating data
+		if pair.Target.IndexOnly {
+			r.log.Info("IndexOnly mode enabled. Waiting for all async index creation to complete...")
+			r.targetDB.WaitForIndexCreation()
+			r.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration.")
+			return nil
+		}
 	}
 
 	// Use ConcurrentCollections for collection-level concurrency (separate from per-collection worker count)
@@ -852,8 +873,27 @@ func (r *OplogReplicatorLegacy) syncIndexesLegacy(ctx context.Context, pair conf
 					continue
 				}
 
+				// List existing indexes on the target to skip already-created ones
+				existingIndexNames := make(map[string]bool)
+				targetIndexes, err := r.targetDB.ListIndexes(ctx, tgtColl)
+				if err != nil {
+					r.log.Debugf("Could not list target indexes for %s: %v (will attempt all)", tgtColl, err)
+				} else {
+					for _, idx := range targetIndexes {
+						if name, ok := idx["name"].(string); ok {
+							existingIndexNames[name] = true
+						}
+					}
+				}
+
 				for _, idx := range mgoIndexes {
 					if idx.Name == "_id_" {
+						continue
+					}
+
+					// Skip if index already exists on target
+					if existingIndexNames[idx.Name] {
+						r.log.Infof("Index '%s' already exists on target collection '%s', skipping", idx.Name, tgtColl)
 						continue
 					}
 

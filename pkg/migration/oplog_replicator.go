@@ -120,6 +120,30 @@ func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp 
 		r.log.Info("Initial migration completed. Starting incremental replication.")
 	}
 
+	// Index-Only mode: sync indexes (if not already done during initial migration) and exit
+	if pair.Target.IndexOnly {
+		if !needsInitialMigration && (pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0) {
+			// Checkpoint exists, so performInitialMigration was skipped — sync indexes now
+			r.log.Info("IndexOnly mode: checkpoint exists, performing index sync directly")
+			var collections []config.CollectionConfig
+			for _, colls := range r.collectionMap {
+				for src, tgt := range colls {
+					collections = append(collections, config.CollectionConfig{
+						SourceCollection: src,
+						TargetCollection: tgt,
+					})
+				}
+			}
+			if err := migrator.syncIndexes(ctx, r.sourceDB, r.targetDB, pair, collections); err != nil {
+				r.log.Warnf("Index sync encountered issues: %v", err)
+			}
+			r.log.Info("IndexOnly mode: waiting for all async index creation to complete...")
+			r.targetDB.WaitForIndexCreation()
+		}
+		r.log.Info("IndexOnly mode: skipping oplog tailing. Index replication complete.")
+		return nil
+	}
+
 	// Start oplog tailing using GTM
 	return r.tailOplog(ctx, afterTimestamp, timestampPath)
 }
@@ -176,6 +200,14 @@ func (r *OplogReplicator) performInitialMigration(ctx context.Context, pair conf
 		}
 		if err := migrator.syncIndexes(ctx, r.sourceDB, r.targetDB, pair, collections); err != nil {
 			r.log.Warnf("Index sync encountered issues: %v (continuing with migration)", err)
+		}
+
+		// Index-Only mode: wait for all async index builds then return without migrating data
+		if pair.Target.IndexOnly {
+			r.log.Info("IndexOnly mode enabled. Waiting for all async index creation to complete...")
+			r.targetDB.WaitForIndexCreation()
+			r.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration.")
+			return nil
 		}
 	}
 

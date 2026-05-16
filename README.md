@@ -186,19 +186,23 @@ If you want to migrate only specific collections or rename collections during mi
   - **convertInvalidIds**: Automatically convert invalid _id types to string (default: true). When enabled, the system will detect errors like "_id must be an objectId, string, long; found int" and automatically convert the problematic _id fields to strings.
 
 #### Index Synchronization Configuration
-- **indexes**: (Optional) An array of index configurations for synchronizing indexes from source to target collections.
+- **syncAllIndexes**: (Optional) When set to `true`, automatically syncs all indexes (excluding `_id_`) from every source collection to the corresponding target collection. Default is `false`.
+- **indexOnly**: (Optional) When set to `true`, the tool **only syncs indexes** and skips all data migration and incremental replication. The process exits after all indexes are created. Must be used with `syncAllIndexes: true` or explicit `indexes` configuration. Default is `false`.
+- **indexes**: (Optional) An array of index configurations for synchronizing specific indexes from source to target collections.
   - **sourceCollection**: The name of the source collection containing the indexes to sync.
   - **indexNames**: An array of index names to synchronize (the tool will retrieve the full index definitions from the source).
 
 **Index Sync Behavior:**
 - Index synchronization occurs **only during initial migration** (not during incremental replication)
 - Indexes are created on the target collection **before data migration** begins
+- **Skip existing indexes**: If an index already exists on the target collection, it is skipped (no duplicate creation attempts)
 - The tool automatically resolves the target collection name:
   - If a mapping is defined in the `collections` configuration, it uses the mapped target collection name
   - If no mapping is found, it assumes the target collection has the same name as the source collection
 - **Non-blocking errors**: If index creation fails, the tool logs a warning and continues with data migration
 - **Preserves existing indexes**: Indexes already present on the target collection that don't exist in the source are kept unchanged
 - The `_id_` index is automatically skipped as it's created by MongoDB
+- **Async with throttling**: Index builds are launched asynchronously with a concurrency limit of 1 to prevent Firestore cross-transaction contention. Each build uses a dedicated client with no socket timeout so long-running index builds are not killed.
 
 **Example Configuration:**
 ```json
@@ -237,6 +241,51 @@ If you want to migrate only specific collections or rename collections during mi
 In this example:
 - The `email_1` and `created_at_-1` indexes from the `users` collection will be created on the `app_users` collection (following the collection mapping)
 - The `user_id_1` and `status_1_created_at_-1` indexes from the `orders` collection will be created on the `orders` collection (same name, no mapping)
+
+#### Index-Only Replication
+
+If you want to **only sync indexes** without migrating any data, set `indexOnly` to `true`. This is useful when:
+- You want to pre-create indexes on the target before running a full migration
+- You need to sync indexes independently of data migration
+- You want to verify index compatibility with the target (e.g., Firestore)
+
+```json
+{
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://localhost:27017/?replicaSet=rs0",
+        "database": "source_db",
+        "replicationMethod": "oplog-legacy"
+      },
+      "target": {
+        "connectionString": "mongodb://target:27017",
+        "database": "target_db",
+        "syncAllIndexes": true,
+        "indexOnly": true
+      }
+    }
+  ]
+}
+```
+
+**Index-Only Replication Behavior:**
+- Works with all modes: `migrate`, `changestream`, `oplog`, and `oplog-legacy`
+- Reads all index definitions from the source database
+- Skips indexes that already exist on the target (no duplicate creation)
+- Creates indexes asynchronously with throttling (one at a time) to prevent Firestore cross-transaction contention
+- Waits for all index builds to complete before exiting
+- **No data is migrated** — only index definitions are synced
+- **No incremental replication** — the process exits after indexes are created (no oplog tailing or change stream)
+
+You can run it with either mode:
+```bash
+# Using migrate mode (simplest — no replica set needed for target)
+./migrate -mode=migrate
+
+# Using live mode (will sync indexes and exit without starting replication)
+./migrate -mode=live
+```
 
 #### Replication Method Configuration
 - **replicationMethod**: (Optional) Specifies the replication method for live mode. Possible values:

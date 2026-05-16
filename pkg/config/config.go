@@ -69,6 +69,7 @@ type TargetConfig struct {
 	Database         string             `json:"database"`
 	Collections      []CollectionConfig `json:"collections,omitempty"`
 	SyncAllIndexes   bool               `json:"syncAllIndexes,omitempty"` // Sync all indexes (excluding _id_) from source
+	IndexOnly        bool               `json:"indexOnly,omitempty"`      // Only sync indexes, skip data migration
 	Indexes          []IndexSyncConfig  `json:"indexes,omitempty"`
 }
 
