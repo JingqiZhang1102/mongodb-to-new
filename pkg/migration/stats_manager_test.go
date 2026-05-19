@@ -15,18 +15,43 @@ func TestStatsManagerEventCounting(t *testing.T) {
 
 	now := time.Now()
 
-	// Record batch of 5 operations
-	ops5 := make([]WriteOperation, 5)
+	// Record batch of 5 operations of different types
+	ops5 := []WriteOperation{
+		{OpType: "insert"},
+		{OpType: "update"},
+		{OpType: "delete"},
+		{OpType: "replace"},
+		{OpType: "insert"},
+	}
 	sm.RecordLags(ops5, now)
-	if sm.eventsSinceLastStats != 5 {
-		t.Errorf("expected eventsSinceLastStats 5, got %d", sm.eventsSinceLastStats)
+	
+	totalProcessed5 := sm.GetProcessedCount("insert") + sm.GetProcessedCount("update") + sm.GetProcessedCount("replace") + sm.GetProcessedCount("delete")
+	if totalProcessed5 != 5 {
+		t.Errorf("expected total processed 5, got %d", totalProcessed5)
+	}
+	if sm.GetProcessedCount("insert") != 2 {
+		t.Errorf("expected inserts processed count 2, got %d", sm.GetProcessedCount("insert"))
+	}
+	if sm.GetProcessedCount("update")+sm.GetProcessedCount("replace") != 2 {
+		t.Errorf("expected updates+replaces processed count 2, got %d", sm.GetProcessedCount("update")+sm.GetProcessedCount("replace"))
+	}
+	if sm.GetProcessedCount("delete") != 1 {
+		t.Errorf("expected deletes processed count 1, got %d", sm.GetProcessedCount("delete"))
 	}
 
 	// Record batch of 10 operations
 	ops10 := make([]WriteOperation, 10)
+	for i := range ops10 {
+		ops10[i].OpType = "insert"
+	}
 	sm.RecordLags(ops10, now)
-	if sm.eventsSinceLastStats != 15 {
-		t.Errorf("expected eventsSinceLastStats 15, got %d", sm.eventsSinceLastStats)
+	
+	totalProcessed15 := sm.GetProcessedCount("insert") + sm.GetProcessedCount("update") + sm.GetProcessedCount("replace") + sm.GetProcessedCount("delete")
+	if totalProcessed15 != 15 {
+		t.Errorf("expected total processed 15, got %d", totalProcessed15)
+	}
+	if sm.GetProcessedCount("insert") != 12 {
+		t.Errorf("expected inserts processed count 12, got %d", sm.GetProcessedCount("insert"))
 	}
 }
 
@@ -36,7 +61,7 @@ func TestStatsManagerReportStats(t *testing.T) {
 
 	now := time.Now()
 	ops := []WriteOperation{
-		{EventTime: now.Add(-250 * time.Millisecond)},
+		{EventTime: now.Add(-250 * time.Millisecond), OpType: "insert"},
 	}
 	sm.RecordLags(ops, now)
 
@@ -44,8 +69,8 @@ func TestStatsManagerReportStats(t *testing.T) {
 	sm.ReportStats()
 
 	// Counters should reset to 0 after report
-	if sm.eventsSinceLastStats != 0 {
-		t.Errorf("expected eventsSinceLastStats to reset to 0, got %d", sm.eventsSinceLastStats)
+	if sm.GetProcessedCount("insert") != 0 {
+		t.Errorf("expected inserts processed count to reset to 0, got %d", sm.GetProcessedCount("insert"))
 	}
 	if sm.lagTracker.count != 0 {
 		t.Errorf("expected lagTracker count to reset to 0, got %d", sm.lagTracker.count)
@@ -99,7 +124,7 @@ func TestStatsManagerConcurrency(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
 				sm.RecordLags([]WriteOperation{
-					{EventTime: now.Add(-1 * time.Millisecond)},
+					{EventTime: now.Add(-1 * time.Millisecond), OpType: "insert"},
 				}, now)
 			}
 		}()
@@ -108,10 +133,92 @@ func TestStatsManagerConcurrency(t *testing.T) {
 	wg.Wait()
 
 	expectedEvents := workersCount * iterations
-	if sm.eventsSinceLastStats != expectedEvents {
-		t.Errorf("expected %d events, got %d", expectedEvents, sm.eventsSinceLastStats)
+	processedEvents := sm.GetProcessedCount("insert")
+	if processedEvents != expectedEvents {
+		t.Errorf("expected %d events, got %d", expectedEvents, processedEvents)
 	}
 	if sm.lagTracker.count != int64(expectedEvents) {
 		t.Errorf("expected %d lag records, got %d", expectedEvents, sm.lagTracker.count)
+	}
+}
+
+func TestStatsManagerMetrics(t *testing.T) {
+	log := logger.New()
+	sm := NewStatsManager(log, 5*time.Minute)
+
+	// Test single increment for all three
+	sm.IncrementUpdateDocMissing()
+	sm.IncrementEventsReceived("insert")
+	sm.IncrementEventsFailed("insert")
+
+	sm.mu.Lock()
+	missingCount := sm.updateDocMissingSinceLastStats
+	sm.mu.Unlock()
+	inputCount := sm.GetReceivedCount("insert")
+	failedCount := sm.GetFailedCount("insert")
+
+	if missingCount != 1 {
+		t.Errorf("expected updateDocMissingSinceLastStats 1, got %d", missingCount)
+	}
+	if inputCount != 1 {
+		t.Errorf("expected insertsReceivedSinceLastStats 1, got %d", inputCount)
+	}
+	if failedCount != 1 {
+		t.Errorf("expected insertsFailedSinceLastStats 1, got %d", failedCount)
+	}
+
+	// Test concurrent increments
+	var wg sync.WaitGroup
+	workersCount := 10
+	iterations := 100
+	for i := 0; i < workersCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				sm.IncrementUpdateDocMissing()
+				sm.IncrementEventsReceived("insert")
+				sm.IncrementEventsFailed("insert")
+			}
+		}()
+	}
+	wg.Wait()
+
+	sm.mu.Lock()
+	missingCount = sm.updateDocMissingSinceLastStats
+	sm.mu.Unlock()
+	inputCount = sm.GetReceivedCount("insert")
+	failedCount = sm.GetFailedCount("insert")
+
+	expectedCount := 1 + workersCount*iterations
+	if missingCount != expectedCount {
+		t.Errorf("expected updateDocMissingSinceLastStats %d, got %d", expectedCount, missingCount)
+	}
+	if inputCount != expectedCount {
+		t.Errorf("expected insertsReceivedSinceLastStats %d, got %d", expectedCount, inputCount)
+	}
+	if failedCount != expectedCount {
+		t.Errorf("expected insertsFailedSinceLastStats %d, got %d", expectedCount, failedCount)
+	}
+
+	// Verify ReportStats logs without panic
+	sm.ReportStats()
+
+	// Counters should reset after ReportStats
+	sm.mu.Lock()
+	missingCountAfter := sm.updateDocMissingSinceLastStats
+	sm.mu.Unlock()
+
+	if missingCountAfter != 0 {
+		t.Errorf("expected updateDocMissingSinceLastStats to reset to 0, got %d", missingCountAfter)
+	}
+	if sm.GetReceivedCount("insert") != 0 || sm.GetReceivedCount("update") != 0 || sm.GetReceivedCount("delete") != 0 {
+		t.Errorf("expected received counters to reset to 0")
+	}
+	if sm.GetProcessedCount("insert") != 0 || sm.GetProcessedCount("update") != 0 || sm.GetProcessedCount("delete") != 0 {
+		t.Errorf("expected processed counters to reset to 0")
+	}
+	if sm.GetFailedCount("insert") != 0 || sm.GetFailedCount("update") != 0 || sm.GetFailedCount("delete") != 0 {
+		t.Errorf("expected failed counters to reset to 0")
 	}
 }

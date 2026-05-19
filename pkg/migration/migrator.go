@@ -122,6 +122,14 @@ func (m *Migrator) getDLQPath(pairIndex int) string {
 	return fmt.Sprintf("dlq-pair%d.jsonl", pairIndex)
 }
 
+// getInitialMigrationStatePath generates a per-pair initial migration state file path
+func (m *Migrator) getInitialMigrationStatePath(pairIndex int) string {
+	if len(m.config.DatabasePairs) == 1 {
+		return "initialMigrationState-global.json"
+	}
+	return fmt.Sprintf("initialMigrationState-pair%d.json", pairIndex)
+}
+
 // processDatabasePair processes a single database pair
 func (m *Migrator) processDatabasePair(ctx context.Context, pair config.DatabasePair, pairIndex int, mode string) error {
 	// Check if this is legacy mode - if so, handle it separately
@@ -288,6 +296,14 @@ func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, t
 		globalResumeToken = nil
 	}
 
+	// Load initial migration state
+	initialMigrationStatePath := m.getInitialMigrationStatePath(pairIndex)
+	m.log.Infof("Using initial migration state file: %s", initialMigrationStatePath)
+	initialMigrationState, err := LoadInitialMigrationState(initialMigrationStatePath)
+	if err != nil {
+		return fmt.Errorf("failed to load initial migration state: %w", err)
+	}
+
 	// Create DLQ writer for this database pair
 	dlqPath := m.getDLQPath(pairIndex)
 	dlq, err := NewDLQWriter(dlqPath, m.log)
@@ -303,7 +319,7 @@ func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, t
 	replicator.SetDLQ(dlqInterface)
 
 	// Start client-level replication (which will handle index sync during initial migration)
-	return replicator.StartReplication(ctx, globalResumeToken, globalResumeTokenPath, pair, m)
+	return replicator.StartReplication(ctx, globalResumeToken, globalResumeTokenPath, initialMigrationState, initialMigrationStatePath, pair, m)
 }
 
 // startOplogReplication starts replication using oplog tailing
@@ -327,6 +343,14 @@ func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB
 		oplogTimestamp = nil
 	}
 
+	// Load initial migration state
+	initialMigrationStatePath := m.getInitialMigrationStatePath(pairIndex)
+	m.log.Infof("Using initial migration state file: %s", initialMigrationStatePath)
+	initialMigrationState, err := LoadInitialMigrationState(initialMigrationStatePath)
+	if err != nil {
+		return fmt.Errorf("failed to load initial migration state: %w", err)
+	}
+
 	// Convert to interface{} for compatibility with StartReplication signature
 	var globalTimestamp interface{}
 	if oplogTimestamp != nil {
@@ -348,7 +372,7 @@ func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB
 	replicator.SetDLQ(dlqInterface)
 
 	// Start oplog replication (which will handle index sync during initial migration)
-	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, pair, m)
+	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, m)
 }
 
 // startOplogReplicationLegacy starts replication using legacy GTM + mgo for old MongoDB versions
@@ -388,6 +412,14 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 		oplogTimestamp = nil
 	}
 
+	// Load initial migration state
+	initialMigrationStatePath := m.getInitialMigrationStatePath(pairIndex)
+	m.log.Infof("Using initial migration state file: %s", initialMigrationStatePath)
+	initialMigrationState, err := LoadInitialMigrationState(initialMigrationStatePath)
+	if err != nil {
+		return fmt.Errorf("failed to load initial migration state: %w", err)
+	}
+
 	// Convert to interface{} for compatibility with StartReplication signature
 	var globalTimestamp interface{}
 	if oplogTimestamp != nil {
@@ -409,7 +441,7 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 	replicator.SetDLQ(dlqInterface)
 
 	// Start legacy oplog replication
-	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, pair, m)
+	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, m)
 }
 
 // getCollectionsToProcess determines which collections to process

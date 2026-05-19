@@ -225,6 +225,11 @@ func (d *EventDistributor) Start() error {
 			continue
 		}
 
+		opType, _ := changeEvent["operationType"].(string)
+		if d.statsManager != nil {
+			d.statsManager.IncrementEventsReceived(opType)
+		}
+
 		// Extract document ID for hashing
 		documentKey, ok := changeEvent["documentKey"].(bson.M)
 		if !ok {
@@ -356,10 +361,38 @@ func (w *Worker) flushCurrentGroup() bool {
 	return false
 }
 
+type statsTrackingDLQ struct {
+	underlyingDlq DLQ
+	statsManager  *StatsManager
+}
+
+func (s *statsTrackingDLQ) WriteFailed(sourceDB, sourceCollection string, documentID interface{}, err error, phase, opType string, document interface{}) {
+	s.underlyingDlq.WriteFailed(sourceDB, sourceCollection, documentID, err, phase, opType, document)
+	if s.statsManager != nil {
+		s.statsManager.IncrementEventsFailed(opType)
+	}
+}
+
+func (s *statsTrackingDLQ) Count() int64 {
+	return s.underlyingDlq.Count()
+}
+
+func (s *statsTrackingDLQ) Close() {
+	s.underlyingDlq.Close()
+}
+
 // NewWorker creates a new worker
 func NewWorker(id int, ctx context.Context, log *logger.Logger,
 	targetDB *db.MongoDB, collectionMap map[string]map[string]string,
 	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager, statsManager *StatsManager) *Worker {
+
+	var workerDLQ DLQ = dlq
+	if dlq != nil && statsManager != nil {
+		workerDLQ = &statsTrackingDLQ{
+			underlyingDlq: dlq,
+			statsManager:  statsManager,
+		}
+	}
 
 	return &Worker{
 		id:                        id,
@@ -370,7 +403,7 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 		processingQueue:           make([]*OperationGroup, 0),
 		incrementalWriteBatchSize: incrementalWriteBatchSize,
 		forceOrderedOperations:    forceOrderedOperations,
-		dlq:                       dlq,
+		dlq:                       workerDLQ,
 		retryManager:              retryManager,
 		statsManager:              statsManager,
 	}
@@ -395,8 +428,14 @@ func (w *Worker) ProcessEvent(event bson.M) {
 	// This is needed because legacy oplog replicator returns map[string]interface{}
 	fullDocument := event["fullDocument"]
 
+	// If this is an update operation in the change stream path and fullDocument is nil, skip it and record metric
+	if opType == "update" && fullDocument == nil && w.statsManager != nil {
+		w.statsManager.IncrementUpdateDocMissing()
+		return
+	}
+
 	// Get updateDescription for modifier updates ($set, $inc, etc.)
-	updateDescription := event["updateDescription"]
+	var updateDescription interface{}
 
 	// Extract clusterTime or wallTime for lag tracking
 	eventTime := ExtractEventTime(event)

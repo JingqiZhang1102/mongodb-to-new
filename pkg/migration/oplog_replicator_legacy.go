@@ -98,9 +98,37 @@ func (r *OplogReplicatorLegacy) getCurrentOplogTimestamp() (*primitive.Timestamp
 }
 
 // StartReplication starts the oplog-based replication using GTM legacy
-func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTimestamp interface{}, timestampPath string, pair config.DatabasePair, migrator *Migrator) error {
+func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTimestamp interface{}, timestampPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, migrator *Migrator) error {
+	// Abort if the initial migration state was completed with failures, or if DLQ has entries
+	if initialMigrationState != nil && initialMigrationState.Status == StatusCompletedWithFailures {
+		return fmt.Errorf("cannot start replication: initial migration completed with failures in a previous run")
+	}
+	if r.dlq != nil {
+		if _, isNop := r.dlq.(*NopDLQWriter); !isNop {
+			if r.dlq.Count() > 0 {
+				return fmt.Errorf("cannot start replication: DLQ contains failed documents")
+			}
+		}
+	}
+
+	// Enforce safety invariants between Initial Migration State and Oplog Timestamp Checkpoint
+	if initialMigrationState == nil {
+		if globalTimestamp != nil {
+			return fmt.Errorf("safety violation: initial migration state file does not exist, but a global oplog timestamp checkpoint exists. Clean up checkpoint file or ensure state is in sync before proceeding")
+		}
+	} else if initialMigrationState.Status == StatusCompleted {
+		if globalTimestamp == nil {
+			return fmt.Errorf("safety violation: initial migration state is marked as completed, but no global oplog timestamp checkpoint was found. Clean up state file or restore checkpoint before proceeding")
+		}
+	}
+
 	var needsInitialMigration bool
 	var afterTimestamp bson.MongoTimestamp
+
+	// We need to run initial migration if no state file exists OR if it is not marked completed
+	if initialMigrationState == nil || !initialMigrationState.IsCompleted() {
+		needsInitialMigration = true
+	}
 
 	// Load saved timestamp if exists
 	var savedTimestamp *OplogTimestamp
@@ -117,7 +145,7 @@ func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTime
 	}
 
 	if savedTimestamp == nil {
-		r.log.Info("No oplog timestamp found. Will get current oplog position and perform initial migration.")
+		r.log.Info("No oplog timestamp found. Will get current oplog position.")
 
 		// Get current oplog timestamp BEFORE initial migration to prevent data loss
 		// This follows the same pattern as change stream mode
@@ -142,7 +170,6 @@ func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTime
 		// Convert timestamp to bson.MongoTimestamp for GTM
 		// MongoTimestamp is int64 where high 32 bits are T (seconds), low 32 bits are I (increment)
 		afterTimestamp = bson.MongoTimestamp((int64(currentOplogTimestamp.T) << 32) | int64(currentOplogTimestamp.I))
-		needsInitialMigration = true
 	} else {
 		// Use saved timestamp - properly combine T and I components
 		afterTimestamp = bson.MongoTimestamp((int64(savedTimestamp.Timestamp.T) << 32) | int64(savedTimestamp.Timestamp.I))
@@ -153,10 +180,40 @@ func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTime
 
 	// Perform initial migration if needed
 	if needsInitialMigration {
-		if err := r.performInitialMigration(ctx, pair, migrator); err != nil {
+		// Mark initial migration state as incomplete before starting
+		if err := SaveInitialMigrationState(initialMigrationStatePath, StatusInProgress, 0); err != nil {
+			r.log.Errorf("Error saving initial migration state as incomplete: %v", err)
+		}
+
+		_, totalFailedCount, err := r.performInitialMigration(ctx, pair, migrator)
+		if err != nil {
 			return fmt.Errorf("initial migration failed: %w", err)
 		}
+
+		// Determine if initial migration completed with failures
+		status := StatusCompleted
+		if totalFailedCount > 0 {
+			status = StatusCompletedWithFailures
+		}
+		if r.dlq != nil {
+			if _, isNop := r.dlq.(*NopDLQWriter); !isNop {
+				if r.dlq.Count() > 0 {
+					status = StatusCompletedWithFailures
+				}
+			}
+		}
+
+		// Mark initial migration state as complete
+		if err := SaveInitialMigrationState(initialMigrationStatePath, status, totalFailedCount); err != nil {
+			r.log.Errorf("Error saving initial migration state as complete: %v", err)
+		}
+
+		if status == StatusCompletedWithFailures {
+			return fmt.Errorf("initial migration completed with %d failures and/or DLQ entries. Aborting replication", totalFailedCount)
+		}
 		r.log.Info("Initial migration completed. Starting incremental replication.")
+	} else {
+		r.log.Info("Initial migration already marked as completed. Skipping.")
 	}
 
 	// Index-Only mode: sync indexes (if not already done during initial migration) and exit
@@ -177,7 +234,7 @@ func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTime
 }
 
 // performInitialMigration performs the initial migration using mgo for source
-func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pair config.DatabasePair, migrator *Migrator) error {
+func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pair config.DatabasePair, migrator *Migrator) (int64, int64, error) {
 	initialMigrationStart := time.Now()
 	r.log.Info("Performing initial migration for all collections")
 
@@ -191,7 +248,7 @@ func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pai
 			r.log.Info("IndexOnly mode enabled. Waiting for all async index creation to complete...")
 			r.targetDB.WaitForIndexCreation()
 			r.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration.")
-			return nil
+			return 0, 0, nil
 		}
 	}
 
@@ -205,6 +262,7 @@ func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pai
 	var wg sync.WaitGroup
 
 	var totalMigratedCount int64
+	var totalFailedCount int64
 	var completedCollections int64
 	var mu sync.Mutex
 
@@ -248,11 +306,12 @@ func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pai
 					return
 				}
 
-				migratedCount := r.migrateCollection(ctx, sourceCol, targetCol, count, sourceDB, sourceCollection)
+				successCount, failedCount := r.migrateCollection(ctx, sourceCol, targetCol, count, sourceDB, sourceCollection)
 
 				// Update overall statistics and log overall progress
 				mu.Lock()
-				totalMigratedCount += migratedCount
+				totalMigratedCount += successCount
+				totalFailedCount += failedCount
 				completedCollections++
 				r.log.Infof("Overall progress: %d/%d collections completed", completedCollections, totalCollections)
 				mu.Unlock()
@@ -263,23 +322,29 @@ func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pai
 	wg.Wait()
 
 	initialMigrationDuration := time.Since(initialMigrationStart)
-	r.log.Infof("Initial migration completed in %.2f seconds. Total collections: %d, Total documents: %d",
-		initialMigrationDuration.Seconds(), totalCollections, totalMigratedCount)
+	totalAttempted := totalMigratedCount + totalFailedCount
+	var failurePercentage float64
+	if totalAttempted > 0 {
+		failurePercentage = (float64(totalFailedCount) * 100.0) / float64(totalAttempted)
+	}
+	r.log.Infof("Initial migration completed in %.2f seconds. Total collections: %d, Total documents: %d (Success: %d, Failed: %d, Failure Rate: %.2f%%)",
+		initialMigrationDuration.Seconds(), totalCollections, totalAttempted, totalMigratedCount, totalFailedCount, failurePercentage)
 
-	return nil
+	return totalMigratedCount, totalFailedCount, nil
 }
 
 // migrateCollection migrates a single collection from mgo source to modern driver target.
 // It includes cursor resumption logic: if the cursor becomes invalid (e.g., server-side timeout),
 // it re-queries from the last successfully read _id and continues the migration.
-func (r *OplogReplicatorLegacy) migrateCollection(ctx context.Context, sourceCol *mgo.Collection, targetCol *mongod.Collection, count int, sourceDB, sourceCollection string) int64 {
+func (r *OplogReplicatorLegacy) migrateCollection(ctx context.Context, sourceCol *mgo.Collection, targetCol *mongod.Collection, count int, sourceDB, sourceCollection string) (int64, int64) {
 	readBatchSize := r.config.InitialReadBatchSize
 	writeBatchSize := r.config.InitialWriteBatchSize
 
 	const maxCursorResumes = 10 // Maximum number of cursor resumption attempts
 
 	var batch []interface{}
-	var migratedCount int64
+	var successCount int64
+	var failedCount int64
 	var lastLoggedPercentage int = -1 // Start at -1 to ensure 0% is logged
 	var lastID interface{}            // Track last successfully read _id for cursor resumption
 	var cursorResumeCount int
@@ -310,16 +375,20 @@ func (r *OplogReplicatorLegacy) migrateCollection(ctx context.Context, sourceCol
 			batch = append(batch, convertMgoBSONToInterface(doc))
 
 			if len(batch) >= writeBatchSize {
-				migratedCount += r.insertBatchWithRetry(ctx, targetCol, batch, sourceDB, sourceCollection)
+				batchSize := int64(len(batch))
+				succeeded := r.insertBatchWithRetry(ctx, targetCol, batch, sourceDB, sourceCollection)
+				successCount += succeeded
+				failedCount += batchSize - succeeded
 				batch = nil
 
 				// Log progress at every 10% threshold
 				if count > 0 {
-					currentPercentage := int(float64(migratedCount) / float64(count) * 10)
+					currentCount := successCount + failedCount
+					currentPercentage := int(float64(currentCount) / float64(count) * 10)
 					if currentPercentage > lastLoggedPercentage {
 						lastLoggedPercentage = currentPercentage
-						r.log.Infof("Collection %s.%s progress: %d/%d documents (%.0f%%)",
-							sourceDB, sourceCollection, migratedCount, count, float64(currentPercentage)*10)
+						r.log.Infof("Collection %s.%s progress: %d/%d documents (%.0f%%) - Successful: %d, Failed: %d",
+							sourceDB, sourceCollection, currentCount, count, float64(currentPercentage)*10, successCount, failedCount)
 					}
 				}
 			}
@@ -330,7 +399,8 @@ func (r *OplogReplicatorLegacy) migrateCollection(ctx context.Context, sourceCol
 
 		// Check for cursor errors
 		if err := iter.Err(); err != nil {
-			r.log.Warnf("[%s.%s] Cursor error after %d documents: %v", sourceDB, sourceCollection, migratedCount, err)
+			currentCount := successCount + failedCount
+			r.log.Warnf("[%s.%s] Cursor error after %d documents: %v", sourceDB, sourceCollection, currentCount, err)
 			iter.Close()
 
 			// Check if context is canceled
@@ -346,18 +416,22 @@ func (r *OplogReplicatorLegacy) migrateCollection(ctx context.Context, sourceCol
 
 				// Insert any pending batch before resuming
 				if len(batch) > 0 {
-					migratedCount += r.insertBatchWithRetry(ctx, targetCol, batch, sourceDB, sourceCollection)
+					batchSize := int64(len(batch))
+					succeeded := r.insertBatchWithRetry(ctx, targetCol, batch, sourceDB, sourceCollection)
+					successCount += succeeded
+					failedCount += batchSize - succeeded
 					batch = nil
 				}
 
 				cursorFailed = true
 			} else {
+				currentCount = successCount + failedCount
 				if cursorResumeCount > maxCursorResumes {
 					r.log.Errorf("[%s.%s] Exceeded maximum cursor resume attempts (%d). Stopping migration at %d documents.",
-						sourceDB, sourceCollection, maxCursorResumes, migratedCount)
+						sourceDB, sourceCollection, maxCursorResumes, currentCount)
 				} else {
 					r.log.Errorf("[%s.%s] Cursor error with no last _id to resume from. Stopping migration at %d documents.",
-						sourceDB, sourceCollection, migratedCount)
+						sourceDB, sourceCollection, currentCount)
 				}
 				break
 			}
@@ -374,11 +448,21 @@ func (r *OplogReplicatorLegacy) migrateCollection(ctx context.Context, sourceCol
 
 	// Insert remaining documents
 	if len(batch) > 0 {
-		migratedCount += r.insertBatchWithRetry(ctx, targetCol, batch, sourceDB, sourceCollection)
+		batchSize := int64(len(batch))
+		succeeded := r.insertBatchWithRetry(ctx, targetCol, batch, sourceDB, sourceCollection)
+		successCount += succeeded
+		failedCount += batchSize - succeeded
 	}
 
-	r.log.Infof("Migration for %s.%s completed: %d documents", sourceDB, sourceCollection, migratedCount)
-	return migratedCount
+	totalCount := successCount + failedCount
+	if failedCount > 0 {
+		r.log.Warnf("Migration for %s.%s completed with %d failures! Successful: %d, Failed: %d, Total: %d",
+			sourceDB, sourceCollection, failedCount, successCount, failedCount, totalCount)
+	} else {
+		r.log.Infof("Migration for %s.%s completed successfully! Total documents: %d",
+			sourceDB, sourceCollection, totalCount)
+	}
+	return successCount, failedCount
 }
 
 // insertBatchWithRetry inserts a batch of documents with sophisticated error handling
