@@ -37,10 +37,7 @@ type EventDistributor struct {
 	retryManager              *RetryManager // Retry manager for transient errors
 
 	// Statistics tracking
-	statsMu              sync.Mutex    // Mutex for thread-safe updates to statistics
-	statsInterval        time.Duration // Statistics reporting interval
-	lastStatsTime        time.Time     // Time of last stats report
-	eventsSinceLastStats int           // Events processed since last stats report
+	statsManager  *StatsManager // Manager for statistics and replication lag
 }
 
 // NewEventDistributor creates a new event distributor
@@ -76,9 +73,7 @@ func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 		retryManager:              retryMgr,
 
 		// Initialize statistics tracking
-		statsInterval:        statsInterval,
-		lastStatsTime:        time.Now(),
-		eventsSinceLastStats: 0,
+		statsManager:  NewStatsManager(log, statsInterval),
 	}
 }
 
@@ -136,9 +131,14 @@ func (d *EventDistributor) waitForWorkersToFinish() {
 
 // Start begins the event distribution process
 func (d *EventDistributor) Start() error {
-	// Initialize workers with retry manager
+	// Start the statistics manager periodic reporting
+	if d.statsManager != nil {
+		d.statsManager.Start(d.ctx)
+	}
+
+	// Initialize workers with retry manager and stats manager
 	for i := 0; i < d.incrementalWorkerCount; i++ {
-		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager)
+		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.statsManager)
 	}
 
 	// Set up context cancellation handling
@@ -179,36 +179,7 @@ func (d *EventDistributor) Start() error {
 		}
 	}()
 
-	// Set up statistics reporting
-	statsTicker := time.NewTicker(d.statsInterval)
-	defer statsTicker.Stop()
 
-	go func() {
-		for {
-			select {
-			case <-statsTicker.C:
-				// Calculate and log statistics
-				d.statsMu.Lock()
-				eventCount := d.eventsSinceLastStats
-				duration := time.Since(d.lastStatsTime)
-				d.eventsSinceLastStats = 0
-				d.lastStatsTime = time.Now()
-				d.statsMu.Unlock()
-
-				if duration > 0 && eventCount > 0 {
-					rate := float64(eventCount) / duration.Seconds()
-					d.log.Infof("Change stream statistics: Processed %d events in the last %v (%.2f events/second)",
-						eventCount, duration.Round(time.Second), rate)
-				} else if eventCount > 0 {
-					d.log.Infof("Change stream statistics: Processed %d events since last report", eventCount)
-				} else {
-					d.log.Info("Change stream statistics: No events processed since last report")
-				}
-			case <-d.ctx.Done():
-				return
-			}
-		}
-	}()
 
 	// Main loop to read from change stream and distribute events
 	var changeCount int
@@ -269,10 +240,6 @@ func (d *EventDistributor) Start() error {
 		// Send event to appropriate worker
 		d.workers[workerIndex].ProcessEvent(changeEvent)
 
-		// Update statistics counter
-		d.statsMu.Lock()
-		d.eventsSinceLastStats++
-		d.statsMu.Unlock()
 
 		// Handle resume token checkpointing
 		changeCount++
@@ -317,6 +284,7 @@ type WriteOperation struct {
 	UpdateDescription interface{} // For modifier updates ($set, $inc, etc.)
 	Namespace         string
 	OpType            string
+	EventTime         time.Time
 }
 
 // OperationGroup represents a group of operations of the same type and namespace
@@ -334,6 +302,7 @@ type Worker struct {
 	log           *logger.Logger
 	targetDB      *db.MongoDB
 	collectionMap map[string]map[string]string
+	statsManager  *StatsManager
 
 	// Current group being built
 	currentGroup *OperationGroup
@@ -390,7 +359,7 @@ func (w *Worker) flushCurrentGroup() bool {
 // NewWorker creates a new worker
 func NewWorker(id int, ctx context.Context, log *logger.Logger,
 	targetDB *db.MongoDB, collectionMap map[string]map[string]string,
-	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager) *Worker {
+	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager, statsManager *StatsManager) *Worker {
 
 	return &Worker{
 		id:                        id,
@@ -403,6 +372,7 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 		forceOrderedOperations:    forceOrderedOperations,
 		dlq:                       dlq,
 		retryManager:              retryManager,
+		statsManager:              statsManager,
 	}
 }
 
@@ -428,6 +398,9 @@ func (w *Worker) ProcessEvent(event bson.M) {
 	// Get updateDescription for modifier updates ($set, $inc, etc.)
 	updateDescription := event["updateDescription"]
 
+	// Extract clusterTime or wallTime for lag tracking
+	eventTime := ExtractEventTime(event)
+
 	// Debug log for worker events
 	w.log.Debugf("Worker %d received event: type=%s, namespace=%s, docID=%v, hasFullDoc=%v, hasUpdateDesc=%v",
 		w.id, opType, namespace, docID, fullDocument != nil, updateDescription != nil)
@@ -439,6 +412,7 @@ func (w *Worker) ProcessEvent(event bson.M) {
 		UpdateDescription: updateDescription,
 		Namespace:         namespace,
 		OpType:            opType,
+		EventTime:         eventTime,
 	}
 
 	// Check if we need to create a new group
@@ -933,6 +907,11 @@ func (w *Worker) processGroup(group OperationGroup) {
 		} else {
 			w.log.Debugf("[%s.%s] Bulk replaced %d documents", dbName, collName, len(models))
 		}
+	}
+
+	// Record replication lag for successfully processed operations
+	if w.statsManager != nil {
+		w.statsManager.RecordLags(group.Operations, time.Now())
 	}
 }
 
