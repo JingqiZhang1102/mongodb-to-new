@@ -627,7 +627,7 @@ func (w *Worker) processGroup(group OperationGroup) {
 			if op.UpdateDescription != nil {
 				// Modifier update - use UpdateOne with update operators ($set, $inc, etc.)
 				// Transform __*__ field names in update description for Firestore compatibility
-				transformed, err := TransformFieldNames(op.UpdateDescription, w.log, dbName, collName, op.DocumentID)
+				transformed, err := TransformFieldNames(func() interface{} { ud := BuildUpdateDocument(op.UpdateDescription, w.log); if len(ud) == 0 { return op.UpdateDescription }; return ud }(), w.log, dbName, collName, op.DocumentID)
 				if err != nil {
 					w.log.Errorf("[%s.%s] Field name transformation failed for update modifier operation, document _id=%v: %v", dbName, collName, op.DocumentID, err)
 					if w.dlq != nil {
@@ -682,7 +682,7 @@ func (w *Worker) processGroup(group OperationGroup) {
 
 						// Retry with the appropriate method based on operation type
 						if op.UpdateDescription != nil {
-							if _, err := targetCollection.UpdateOne(w.ctx, filter, op.UpdateDescription, options.Update().SetUpsert(true)); err != nil {
+							if _, err := targetCollection.UpdateOne(w.ctx, filter, func() interface{} { ud := BuildUpdateDocument(op.UpdateDescription, w.log); if len(ud) == 0 { return op.UpdateDescription }; return ud }(), options.Update().SetUpsert(true)); err != nil {
 								w.log.Errorf("[%s.%s] Retry modifier update failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
 								if w.dlq != nil {
 									w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.UpdateDescription)
@@ -735,7 +735,7 @@ func (w *Worker) processGroup(group OperationGroup) {
 
 					// Use the appropriate method based on operation type
 					if op.UpdateDescription != nil {
-						if _, err := targetCollection.UpdateOne(w.ctx, filter, op.UpdateDescription, options.Update().SetUpsert(true)); err != nil {
+						if _, err := targetCollection.UpdateOne(w.ctx, filter, func() interface{} { ud := BuildUpdateDocument(op.UpdateDescription, w.log); if len(ud) == 0 { return op.UpdateDescription }; return ud }(), options.Update().SetUpsert(true)); err != nil {
 							if err == context.Canceled {
 								w.log.Debugf("[%s.%s] Updating document _id=%v (modifier) canceled due to context cancellation", dbName, collName, op.DocumentID)
 							} else {
@@ -983,4 +983,63 @@ func (w *Worker) Shutdown() {
 
 	// Wait for any ongoing processing to complete
 	w.WaitForCompletion()
+}
+
+
+// BuildUpdateDocument converts change stream updateDescription to standard update operators ($set/$unset)
+func BuildUpdateDocument(updateDesc interface{}, log *logger.Logger) bson.M {
+	if updateDesc == nil {
+		return nil
+	}
+	var updatedFields interface{}
+	var removedFields []interface{}
+	
+	switch d := updateDesc.(type) {
+	case bson.M:
+		updatedFields = d["updatedFields"]
+		if rf, ok := d["removedFields"].([]interface{}); ok {
+			removedFields = rf
+		} else if rfA, ok := d["removedFields"].(primitive.A); ok {
+			removedFields = []interface{}(rfA)
+		}
+	case bson.D:
+		for _, elem := range d {
+			if elem.Key == "updatedFields" {
+				updatedFields = elem.Value
+			} else if elem.Key == "removedFields" {
+				if rf, ok := elem.Value.(primitive.A); ok {
+					removedFields = []interface{}(rf)
+				}
+			}
+		}
+	case map[string]interface{}:
+		updatedFields = d["updatedFields"]
+		if rf, ok := d["removedFields"].([]interface{}); ok {
+			removedFields = rf
+		}
+	}
+	
+	updateDoc := bson.M{}
+	if updatedFields != nil {
+		if ufMap, ok := updatedFields.(bson.M); ok && len(ufMap) > 0 {
+			updateDoc["$" + "set"] = ufMap
+		} else if ufD, ok := updatedFields.(bson.D); ok && len(ufD) > 0 {
+			updateDoc["$" + "set"] = ufD
+		} else if ufMapInterface, ok := updatedFields.(map[string]interface{}); ok && len(ufMapInterface) > 0 {
+			updateDoc["$" + "set"] = ufMapInterface
+		}
+	}
+	
+	if len(removedFields) > 0 {
+		unsetDoc := bson.M{}
+		for _, field := range removedFields {
+			if fieldStr, ok := field.(string); ok {
+				unsetDoc[fieldStr] = 1
+			}
+		}
+		if len(unsetDoc) > 0 {
+			updateDoc["$" + "unset"] = unsetDoc
+		}
+	}
+	return updateDoc
 }
