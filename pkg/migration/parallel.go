@@ -515,7 +515,15 @@ func (w *Worker) processGroup(group OperationGroup) {
 		var docs []interface{}
 		for _, op := range group.Operations {
 			// Transform __*__ field names to _*_ for Firestore compatibility
-			docs = append(docs, TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID))
+			transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
+			if err != nil {
+				w.log.Errorf("[%s.%s] Field name transformation failed for insert operation, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+				if w.dlq != nil {
+					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
+				}
+				continue
+			}
+			docs = append(docs, transformed)
 		}
 
 		if _, err := targetCollection.InsertMany(w.ctx, docs, options.InsertMany().SetOrdered(useOrdered)); err != nil {
@@ -619,17 +627,33 @@ func (w *Worker) processGroup(group OperationGroup) {
 			if op.UpdateDescription != nil {
 				// Modifier update - use UpdateOne with update operators ($set, $inc, etc.)
 				// Transform __*__ field names in update description for Firestore compatibility
+				transformed, err := TransformFieldNames(op.UpdateDescription, w.log, dbName, collName, op.DocumentID)
+				if err != nil {
+					w.log.Errorf("[%s.%s] Field name transformation failed for update modifier operation, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+					if w.dlq != nil {
+						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.UpdateDescription)
+					}
+					continue
+				}
 				model := mongo.NewUpdateOneModel().
 					SetFilter(bson.M{"_id": op.DocumentID}).
-					SetUpdate(TransformFieldNames(op.UpdateDescription, w.log, dbName, collName, op.DocumentID)).
+					SetUpdate(transformed).
 					SetUpsert(true)
 				models = append(models, model)
 			} else if op.Document != nil {
 				// Full document replacement - use ReplaceOne
 				// Transform __*__ field names to _*_ for Firestore compatibility
+				transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
+				if err != nil {
+					w.log.Errorf("[%s.%s] Field name transformation failed for update replacement operation, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+					if w.dlq != nil {
+						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
+					}
+					continue
+				}
 				model := mongo.NewReplaceOneModel().
 					SetFilter(bson.M{"_id": op.DocumentID}).
-					SetReplacement(TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)).
+					SetReplacement(transformed).
 					SetUpsert(true)
 				models = append(models, model)
 			} else {
@@ -826,9 +850,17 @@ func (w *Worker) processGroup(group OperationGroup) {
 		var models []mongo.WriteModel
 		for _, op := range group.Operations {
 			// Transform __*__ field names to _*_ for Firestore compatibility
+			transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
+			if err != nil {
+				w.log.Errorf("[%s.%s] Field name transformation failed for replace operation, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+				if w.dlq != nil {
+					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
+				}
+				continue
+			}
 			model := mongo.NewReplaceOneModel().
 				SetFilter(bson.M{"_id": op.DocumentID}).
-				SetReplacement(TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)).
+				SetReplacement(transformed).
 				SetUpsert(true)
 			models = append(models, model)
 		}

@@ -229,7 +229,18 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 
 							for batch := range batchChan {
 								// Transform __*__ field names to _*_ for Firestore compatibility
-								batch = TransformBatch(batch, r.log, sourceDB, sourceCollection)
+								transformedBatch, err := TransformBatch(batch, r.log, sourceDB, sourceCollection)
+								if err != nil {
+									r.log.Errorf("Field name transformation failed for batch in %s.%s: %v", sourceDB, sourceCollection, err)
+									for _, doc := range batch {
+										docID := extractDocID(doc)
+										if r.dlq != nil {
+											r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
+										}
+									}
+									continue
+								}
+								batch = transformedBatch
 
 								// Process batch
 								if _, err := targetDBCollection.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false)); err != nil {

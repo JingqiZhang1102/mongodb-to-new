@@ -667,7 +667,11 @@ func processBatch(ctx context.Context, collection *mongo.Collection, batch []int
 	}
 
 	// Transform __*__ field names to _*_ for Firestore compatibility
-	batch = TransformBatch(batch, log, dbName, collName)
+	transformedBatch, transErr := TransformBatch(batch, log, dbName, collName)
+	if transErr != nil {
+		return fmt.Errorf("failed to transform field names: %w", transErr)
+	}
+	batch = transformedBatch
 
 	// If upsert mode is enabled, use upsert operations directly
 	if useUpsert {

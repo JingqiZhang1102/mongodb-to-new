@@ -420,7 +420,18 @@ func (r *OplogReplicator) migrateCollection(ctx context.Context, sourceCol, targ
 // Returns the count of successfully inserted documents
 func (r *OplogReplicator) insertBatchWithRetry(ctx context.Context, targetCol *mongo.Collection, batch []interface{}, sourceDB, sourceCollection string) int64 {
 	// Transform __*__ field names to _*_ for Firestore compatibility
-	batch = TransformBatch(batch, r.log, sourceDB, sourceCollection)
+	transformedBatch, err := TransformBatch(batch, r.log, sourceDB, sourceCollection)
+	if err != nil {
+		r.log.Errorf("Field name transformation failed for batch in %s.%s: %v", sourceDB, sourceCollection, err)
+		for _, doc := range batch {
+			docID := extractDocID(doc)
+			if r.dlq != nil {
+				r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
+			}
+		}
+		return 0
+	}
+	batch = transformedBatch
 
 	var successCount int64
 
