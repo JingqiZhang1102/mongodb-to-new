@@ -10,9 +10,10 @@ import (
 
 // Status enum constants for Initial Migration State
 const (
-	StatusInProgress           = "inprogress"
-	StatusCompleted            = "completed"
+	StatusInProgress            = "inprogress"
+	StatusCompleted             = "completed"
 	StatusCompletedWithFailures = "completed_with_failures"
+	StatusSkipped               = "skipped"
 )
 
 // InitialMigrationState represents the completion state of the initial migration phase
@@ -24,7 +25,7 @@ type InitialMigrationState struct {
 
 // IsCompleted helper returns whether the initial migration is finished (regardless of failures)
 func (s *InitialMigrationState) IsCompleted() bool {
-	return s != nil && (s.Status == StatusCompleted || s.Status == StatusCompletedWithFailures)
+	return s != nil && (s.Status == StatusCompleted || s.Status == StatusCompletedWithFailures || s.Status == StatusSkipped)
 }
 
 // LoadInitialMigrationState loads the initial migration state from a file

@@ -17,7 +17,7 @@ import (
 func main() {
 	// Parse command-line flags
 	configPath := flag.String("config", "mongodb_replication_config.json", "Path to configuration file")
-	mode := flag.String("mode", "migrate", "Operation mode: 'migrate' or 'live'")
+	mode := flag.String("mode", "migrate", "Operation mode: 'migrate', 'live', or 'live-only'")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	logFile := flag.String("log-file", "", "Path to log file (logs to both stdout and file when specified)")
 	help := flag.Bool("help", false, "Display help information")
@@ -51,8 +51,8 @@ func main() {
 	}
 
 	// Validate mode
-	if *mode != "migrate" && *mode != "live" {
-		log.Fatalf("Invalid mode: %s. Please choose either 'migrate' or 'live'", *mode)
+	if *mode != "migrate" && *mode != "live" && *mode != "live-only" {
+		log.Fatalf("Invalid mode: %s. Please choose either 'migrate', 'live', or 'live-only'", *mode)
 	}
 
 	// Create context with cancellation
@@ -104,7 +104,7 @@ func displayUsage() {
 	fmt.Println("  -config string")
 	fmt.Println("        Path to configuration file (default \"mongodb_replication_config.json\")")
 	fmt.Println("  -mode string")
-	fmt.Println("        Operation mode: 'migrate' or 'live' (default \"migrate\")")
+	fmt.Println("        Operation mode: 'migrate', 'live', or 'live-only' (default \"migrate\")")
 	fmt.Println("  -log-level string")
 	fmt.Println("        Log level: debug, info, warn, error (default \"info\")")
 	fmt.Println("  -log-file string")
@@ -113,6 +113,7 @@ func displayUsage() {
 	fmt.Println("        Display this help information")
 	fmt.Println("Examples:")
 	fmt.Println("  migrate -mode=live")
+	fmt.Println("  migrate -mode=live-only")
 	fmt.Println("  migrate -config=custom_config.json -mode=migrate -log-level=debug")
 	fmt.Println("  migrate -mode=live -log-file=migration.log")
 }

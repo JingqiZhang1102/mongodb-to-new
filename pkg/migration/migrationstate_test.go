@@ -91,14 +91,32 @@ func TestMigrationStateLifecycle(t *testing.T) {
 		t.Errorf("expected CompletedAt to be non-zero for completed state")
 	}
 
-	// 5. Delete non-existent file (should not error)
+	// 5. Save skipped state
+	err = SaveInitialMigrationState(stateFilePath, StatusSkipped, 0)
+	if err != nil {
+		t.Fatalf("failed to save skipped state: %v", err)
+	}
+
+	// Load and verify skipped state
+	state, err = LoadInitialMigrationState(stateFilePath)
+	if err != nil {
+		t.Fatalf("failed to load skipped state: %v", err)
+	}
+	if !state.IsCompleted() {
+		t.Errorf("expected IsCompleted to be true for skipped state")
+	}
+	if state.Status != StatusSkipped {
+		t.Errorf("expected Status to be StatusSkipped, got %q", state.Status)
+	}
+
+	// 6. Delete non-existent file (should not error)
 	nonExistentPath := filepath.Join(tmpDir, "does-not-exist.json")
 	err = DeleteInitialMigrationState(nonExistentPath)
 	if err != nil {
 		t.Errorf("unexpected error deleting non-existent file: %v", err)
 	}
 
-	// 6. Delete existing file and verify it is gone
+	// 7. Delete existing file and verify it is gone
 	err = DeleteInitialMigrationState(stateFilePath)
 	if err != nil {
 		t.Fatalf("failed to delete existing state file: %v", err)

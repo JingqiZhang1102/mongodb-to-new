@@ -59,7 +59,7 @@ func (r *ClientLevelReplicator) AddCollection(sourceDB, targetDB, sourceCollecti
 }
 
 // StartReplication starts the client-level replication
-func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResumeToken interface{}, globalResumeTokenPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, migrator *Migrator) error {
+func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResumeToken interface{}, globalResumeTokenPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, liveOnly bool, migrator *Migrator) error {
 	// Abort if the initial migration state was completed with failures, or if DLQ has entries
 	if initialMigrationState != nil && initialMigrationState.Status == StatusCompletedWithFailures {
 		return fmt.Errorf("cannot start replication: initial migration completed with failures in a previous run")
@@ -77,9 +77,9 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		if globalResumeToken != nil {
 			return fmt.Errorf("safety violation: initial migration state file does not exist, but a global resume token checkpoint exists. Clean up checkpoint file or ensure state is in sync before proceeding")
 		}
-	} else if initialMigrationState.Status == StatusCompleted {
+	} else if initialMigrationState.Status == StatusCompleted || initialMigrationState.Status == StatusSkipped {
 		if globalResumeToken == nil {
-			return fmt.Errorf("safety violation: initial migration state is marked as completed, but no global resume token checkpoint was found. Clean up state file or restore checkpoint before proceeding")
+			return fmt.Errorf("safety violation: initial migration state is marked as %s, but no global resume token checkpoint was found. Clean up state file or restore checkpoint before proceeding", initialMigrationState.Status)
 		}
 	}
 
@@ -89,12 +89,27 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 
 	// We need to run initial migration if no state file exists OR if it is not marked completed
 	if initialMigrationState == nil || !initialMigrationState.IsCompleted() {
-		needsInitialMigration = true
+		if liveOnly {
+			r.log.Info("Live-only mode enabled. Skipping initial migration phase.")
+			if err := SaveInitialMigrationState(initialMigrationStatePath, StatusSkipped, 0); err != nil {
+				r.log.Errorf("Error saving initial migration state as skipped: %v", err)
+			}
+			needsInitialMigration = false
+			initialMigrationState = &InitialMigrationState{
+				Status: StatusSkipped,
+			}
+		} else {
+			needsInitialMigration = true
+		}
 	}
 
-	// If no resume token is available, we need to create one and then perform initial migration
+	// If no resume token is available, we need to create one
 	if globalResumeToken == nil {
-		r.log.Info("No global resume token found. Creating a new one and will perform initial migration.")
+		if liveOnly {
+			r.log.Info("No global resume token found in live-only mode. Obtaining current resume token to start incremental replication.")
+		} else {
+			r.log.Info("No global resume token found. Creating a new one and will perform initial migration.")
+		}
 
 		// Create a change stream to get an initial resume token
 		initialChangeStream, err := r.sourceDB.CreateClientLevelChangeStream(ctx, nil, 0)
@@ -610,7 +625,7 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 
 			// Perform initial migration again
 			r.log.Info("Starting fresh with initial migration...")
-			return r.StartReplication(ctx, nil, globalResumeTokenPath, nil, initialMigrationStatePath, pair, migrator)
+			return r.StartReplication(ctx, nil, globalResumeTokenPath, nil, initialMigrationStatePath, pair, liveOnly, migrator)
 		}
 
 		return fmt.Errorf("failed to create client-level change stream: %w", err)

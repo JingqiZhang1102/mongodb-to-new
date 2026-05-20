@@ -15,7 +15,7 @@ func TestStartReplicationSafetyInvariants(t *testing.T) {
 	ctx := context.TODO()
 
 	// Case 1: initialMigrationState is nil, but globalResumeToken is NOT nil (fresh run violation)
-	err := r.StartReplication(ctx, "some-resume-token", "path", nil, "state-path", config.DatabasePair{}, nil)
+	err := r.StartReplication(ctx, "some-resume-token", "path", nil, "state-path", config.DatabasePair{}, false, nil)
 	if err == nil {
 		t.Errorf("expected error when state is nil but resume token exists")
 	} else if !strings.Contains(err.Error(), "safety violation: initial migration state file does not exist") {
@@ -24,7 +24,7 @@ func TestStartReplicationSafetyInvariants(t *testing.T) {
 
 	// Case 2: initialMigrationState is Completed, but globalResumeToken is nil (resumption violation)
 	completedState := &InitialMigrationState{Status: StatusCompleted}
-	err = r.StartReplication(ctx, nil, "path", completedState, "state-path", config.DatabasePair{}, nil)
+	err = r.StartReplication(ctx, nil, "path", completedState, "state-path", config.DatabasePair{}, false, nil)
 	if err == nil {
 		t.Errorf("expected error when state is completed but resume token is nil")
 	} else if !strings.Contains(err.Error(), "safety violation: initial migration state is marked as completed") {
@@ -33,10 +33,19 @@ func TestStartReplicationSafetyInvariants(t *testing.T) {
 
 	// Case 3: initialMigrationState is CompletedWithFailures (abort run)
 	failedState := &InitialMigrationState{Status: StatusCompletedWithFailures}
-	err = r.StartReplication(ctx, "some-resume-token", "path", failedState, "state-path", config.DatabasePair{}, nil)
+	err = r.StartReplication(ctx, "some-resume-token", "path", failedState, "state-path", config.DatabasePair{}, false, nil)
 	if err == nil {
 		t.Errorf("expected error when state is CompletedWithFailures")
 	} else if !strings.Contains(err.Error(), "cannot start replication: initial migration completed with failures in a previous run") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+
+	// Case 4: initialMigrationState is Skipped, but globalResumeToken is nil (resumption violation for live-only)
+	skippedState := &InitialMigrationState{Status: StatusSkipped}
+	err = r.StartReplication(ctx, nil, "path", skippedState, "state-path", config.DatabasePair{}, true, nil)
+	if err == nil {
+		t.Errorf("expected error when state is skipped but resume token is nil")
+	} else if !strings.Contains(err.Error(), "safety violation: initial migration state is marked as skipped") {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }

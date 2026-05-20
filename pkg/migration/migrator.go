@@ -35,8 +35,8 @@ func NewMigrator(config *config.Config, log *logger.Logger) *Migrator {
 // Start starts the migration or replication process
 func (m *Migrator) Start(ctx context.Context, mode string) error {
 	// Validate mode
-	if mode != "migrate" && mode != "live" {
-		return fmt.Errorf("invalid mode: %s, must be 'migrate' or 'live'", mode)
+	if mode != "migrate" && mode != "live" && mode != "live-only" {
+		return fmt.Errorf("invalid mode: %s, must be 'migrate', 'live', or 'live-only'", mode)
 	}
 
 	m.log.Infof("Starting MongoDB to MongoDB %s process", mode)
@@ -132,8 +132,10 @@ func (m *Migrator) getInitialMigrationStatePath(pairIndex int) string {
 
 // processDatabasePair processes a single database pair
 func (m *Migrator) processDatabasePair(ctx context.Context, pair config.DatabasePair, pairIndex int, mode string) error {
+	liveOnly := mode == "live-only"
+
 	// Check if this is legacy mode - if so, handle it separately
-	if mode == "live" && pair.Source.ReplicationMethod == "oplog-legacy" {
+	if (mode == "live" || mode == "live-only") && pair.Source.ReplicationMethod == "oplog-legacy" {
 		// For legacy mode, don't connect here - let startOplogReplicationLegacy handle it
 		collections := pair.Target.Collections
 		if len(collections) == 0 {
@@ -160,7 +162,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 				return nil
 			}
 		}
-		return m.startOplogReplicationLegacy(ctx, pair.Source.Database, pair.Target.Database, collections, pair, pairIndex)
+		return m.startOplogReplicationLegacy(ctx, pair.Source.Database, pair.Target.Database, collections, pair, pairIndex, liveOnly)
 	}
 
 	// Connect to source MongoDB (modern driver)
@@ -234,9 +236,9 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 
 		// Wait for all migrations to complete
 		wg.Wait()
-	} else if mode == "live" {
+	} else if mode == "live" || mode == "live-only" {
 		// Use client-level change stream for live replication
-		if err := m.startClientLevelReplication(ctx, sourceDB, targetDB, pair.Source.Database, pair.Target.Database, collections, pair, pairIndex); err != nil {
+		if err := m.startClientLevelReplication(ctx, sourceDB, targetDB, pair.Source.Database, pair.Target.Database, collections, pair, pairIndex, liveOnly); err != nil {
 			// We don't need to check for context.Canceled here anymore as it's handled in the lower layers
 			return fmt.Errorf("error starting client-level replication: %w", err)
 		}
@@ -256,7 +258,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 }
 
 // startClientLevelReplication starts replication using either change streams or oplog
-func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int) error {
+func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool) error {
 	// Determine replication method
 	replicationMethod := pair.Source.ReplicationMethod
 	if replicationMethod == "" {
@@ -267,15 +269,15 @@ func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, ta
 
 	if replicationMethod == "oplog" {
 		// Use oplog-based replication
-		return m.startOplogReplication(ctx, sourceDB, targetDB, sourceDBName, targetDBName, collections, pair, pairIndex)
+		return m.startOplogReplication(ctx, sourceDB, targetDB, sourceDBName, targetDBName, collections, pair, pairIndex, liveOnly)
 	} else {
 		// Use change stream-based replication (default)
-		return m.startChangeStreamReplication(ctx, sourceDB, targetDB, sourceDBName, targetDBName, collections, pair, pairIndex)
+		return m.startChangeStreamReplication(ctx, sourceDB, targetDB, sourceDBName, targetDBName, collections, pair, pairIndex, liveOnly)
 	}
 }
 
 // startChangeStreamReplication starts replication using change streams
-func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int) error {
+func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool) error {
 	m.log.Info("Starting change stream-based replication for all collections")
 
 	// Create client-level replicator
@@ -319,11 +321,11 @@ func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, t
 	replicator.SetDLQ(dlqInterface)
 
 	// Start client-level replication (which will handle index sync during initial migration)
-	return replicator.StartReplication(ctx, globalResumeToken, globalResumeTokenPath, initialMigrationState, initialMigrationStatePath, pair, m)
+	return replicator.StartReplication(ctx, globalResumeToken, globalResumeTokenPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m)
 }
 
 // startOplogReplication starts replication using oplog tailing
-func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int) error {
+func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool) error {
 	m.log.Info("Starting oplog-based replication for all collections")
 
 	// Use modern oplog replicator
@@ -372,11 +374,11 @@ func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB
 	replicator.SetDLQ(dlqInterface)
 
 	// Start oplog replication (which will handle index sync during initial migration)
-	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, m)
+	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m)
 }
 
 // startOplogReplicationLegacy starts replication using legacy GTM + mgo for old MongoDB versions
-func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int) error {
+func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool) error {
 	m.log.Info("Starting legacy oplog-based replication (using mgo driver for MongoDB 3.0/3.2)")
 
 	// Connect to source MongoDB using legacy driver (mgo)
@@ -441,7 +443,7 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 	replicator.SetDLQ(dlqInterface)
 
 	// Start legacy oplog replication
-	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, m)
+	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m)
 }
 
 // getCollectionsToProcess determines which collections to process

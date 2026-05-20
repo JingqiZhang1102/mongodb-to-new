@@ -62,7 +62,7 @@ func (r *OplogReplicator) AddCollection(sourceDB, targetDB, sourceCollection, ta
 }
 
 // StartReplication starts the oplog-based replication
-func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp interface{}, timestampPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, migrator *Migrator) error {
+func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp interface{}, timestampPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, liveOnly bool, migrator *Migrator) error {
 	// Abort if the initial migration state was completed with failures, or if DLQ has entries
 	if initialMigrationState != nil && initialMigrationState.Status == StatusCompletedWithFailures {
 		return fmt.Errorf("cannot start replication: initial migration completed with failures in a previous run")
@@ -80,9 +80,9 @@ func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp 
 		if globalTimestamp != nil {
 			return fmt.Errorf("safety violation: initial migration state file does not exist, but a global oplog timestamp checkpoint exists. Clean up checkpoint file or ensure state is in sync before proceeding")
 		}
-	} else if initialMigrationState.Status == StatusCompleted {
+	} else if initialMigrationState.Status == StatusCompleted || initialMigrationState.Status == StatusSkipped {
 		if globalTimestamp == nil {
-			return fmt.Errorf("safety violation: initial migration state is marked as completed, but no global oplog timestamp checkpoint was found. Clean up state file or restore checkpoint before proceeding")
+			return fmt.Errorf("safety violation: initial migration state is marked as %s, but no global oplog timestamp checkpoint was found. Clean up state file or restore checkpoint before proceeding", initialMigrationState.Status)
 		}
 	}
 
@@ -91,7 +91,18 @@ func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp 
 
 	// We need to run initial migration if no state file exists OR if it is not marked completed
 	if initialMigrationState == nil || !initialMigrationState.IsCompleted() {
-		needsInitialMigration = true
+		if liveOnly {
+			r.log.Info("Live-only mode enabled. Skipping initial migration phase.")
+			if err := SaveInitialMigrationState(initialMigrationStatePath, StatusSkipped, 0); err != nil {
+				r.log.Errorf("Error saving initial migration state as skipped: %v", err)
+			}
+			needsInitialMigration = false
+			initialMigrationState = &InitialMigrationState{
+				Status: StatusSkipped,
+			}
+		} else {
+			needsInitialMigration = true
+		}
 	}
 
 	// Convert globalTimestamp to OplogTimestamp if it exists
@@ -113,7 +124,11 @@ func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp 
 
 	// If no timestamp is available, get current cluster time
 	if savedTimestamp == nil {
-		r.log.Info("No oplog timestamp found. Capturing current cluster time.")
+		if liveOnly {
+			r.log.Info("No oplog timestamp found in live-only mode. Obtaining current cluster time to start incremental replication.")
+		} else {
+			r.log.Info("No oplog timestamp found. Capturing current cluster time.")
+		}
 
 		// Get current cluster time as starting point
 		currentTime, err := r.getCurrentClusterTime(ctx)
