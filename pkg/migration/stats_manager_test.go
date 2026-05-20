@@ -150,12 +150,22 @@ func TestStatsManagerMetrics(t *testing.T) {
 	sm.IncrementUpdateDocMissing()
 	sm.IncrementEventsReceived("insert")
 	sm.IncrementEventsFailed("insert")
+	sm.IncrementSequentialRetries(3)
+	sm.RecordBulkWrite(42, true)
+	sm.RecordBulkWrite(10, false)
+	sm.IncrementTimeoutFlushes()
 
 	sm.mu.Lock()
 	missingCount := sm.updateDocMissingSinceLastStats
 	sm.mu.Unlock()
 	inputCount := sm.GetReceivedCount("insert")
 	failedCount := sm.GetFailedCount("insert")
+	seqRetriesCount := sm.GetSequentialRetries()
+	orderedWritesCount := sm.GetOrderedBulkWrites()
+	orderedWritesSize := sm.GetOrderedBulkWritesSize()
+	unorderedWritesCount := sm.GetUnorderedBulkWrites()
+	unorderedWritesSize := sm.GetUnorderedBulkWritesSize()
+	timeoutFlushesCount := sm.GetTimeoutFlushes()
 
 	if missingCount != 1 {
 		t.Errorf("expected updateDocMissingSinceLastStats 1, got %d", missingCount)
@@ -165,6 +175,24 @@ func TestStatsManagerMetrics(t *testing.T) {
 	}
 	if failedCount != 1 {
 		t.Errorf("expected insertsFailedSinceLastStats 1, got %d", failedCount)
+	}
+	if seqRetriesCount != 3 {
+		t.Errorf("expected sequential retries 3, got %d", seqRetriesCount)
+	}
+	if orderedWritesCount != 1 {
+		t.Errorf("expected ordered bulk writes 1, got %d", orderedWritesCount)
+	}
+	if orderedWritesSize != 42 {
+		t.Errorf("expected ordered bulk writes size 42, got %d", orderedWritesSize)
+	}
+	if unorderedWritesCount != 1 {
+		t.Errorf("expected unordered bulk writes 1, got %d", unorderedWritesCount)
+	}
+	if unorderedWritesSize != 10 {
+		t.Errorf("expected unordered bulk writes size 10, got %d", unorderedWritesSize)
+	}
+	if timeoutFlushesCount != 1 {
+		t.Errorf("expected timeout flushes 1, got %d", timeoutFlushesCount)
 	}
 
 	// Test concurrent increments
@@ -211,6 +239,24 @@ func TestStatsManagerMetrics(t *testing.T) {
 
 	if missingCountAfter != 0 {
 		t.Errorf("expected updateDocMissingSinceLastStats to reset to 0, got %d", missingCountAfter)
+	}
+	if sm.GetSequentialRetries() != 0 {
+		t.Errorf("expected sequential retries to reset to 0, got %d", sm.GetSequentialRetries())
+	}
+	if sm.GetOrderedBulkWrites() != 0 {
+		t.Errorf("expected ordered bulk writes to reset to 0, got %d", sm.GetOrderedBulkWrites())
+	}
+	if sm.GetOrderedBulkWritesSize() != 0 {
+		t.Errorf("expected ordered bulk writes size to reset to 0, got %d", sm.GetOrderedBulkWritesSize())
+	}
+	if sm.GetUnorderedBulkWrites() != 0 {
+		t.Errorf("expected unordered bulk writes to reset to 0, got %d", sm.GetUnorderedBulkWrites())
+	}
+	if sm.GetUnorderedBulkWritesSize() != 0 {
+		t.Errorf("expected unordered bulk writes size to reset to 0, got %d", sm.GetUnorderedBulkWritesSize())
+	}
+	if sm.GetTimeoutFlushes() != 0 {
+		t.Errorf("expected timeout flushes to reset to 0, got %d", sm.GetTimeoutFlushes())
 	}
 	if sm.GetReceivedCount("insert") != 0 || sm.GetReceivedCount("update") != 0 || sm.GetReceivedCount("delete") != 0 {
 		t.Errorf("expected received counters to reset to 0")

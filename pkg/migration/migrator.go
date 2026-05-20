@@ -14,14 +14,16 @@ import (
 	"github.com/gsbingo17/mongodb-migration/pkg/db"
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // Migrator handles the migration and replication process
 type Migrator struct {
-	config *config.Config
-	log    *logger.Logger
+	config       *config.Config
+	log          *logger.Logger
+	CdcStartTime *primitive.Timestamp
 }
 
 // NewMigrator creates a new migrator
@@ -321,7 +323,7 @@ func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, t
 	replicator.SetDLQ(dlqInterface)
 
 	// Start client-level replication (which will handle index sync during initial migration)
-	return replicator.StartReplication(ctx, globalResumeToken, globalResumeTokenPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m)
+	return replicator.StartReplication(ctx, globalResumeToken, globalResumeTokenPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m.CdcStartTime, m)
 }
 
 // startOplogReplication starts replication using oplog tailing
@@ -374,7 +376,7 @@ func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB
 	replicator.SetDLQ(dlqInterface)
 
 	// Start oplog replication (which will handle index sync during initial migration)
-	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m)
+	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m.CdcStartTime, m)
 }
 
 // startOplogReplicationLegacy starts replication using legacy GTM + mgo for old MongoDB versions
@@ -443,7 +445,7 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 	replicator.SetDLQ(dlqInterface)
 
 	// Start legacy oplog replication
-	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m)
+	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m.CdcStartTime, m)
 }
 
 // getCollectionsToProcess determines which collections to process

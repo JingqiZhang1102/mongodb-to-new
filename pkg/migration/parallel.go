@@ -37,7 +37,7 @@ type EventDistributor struct {
 	retryManager              *RetryManager // Retry manager for transient errors
 
 	// Statistics tracking
-	statsManager  *StatsManager // Manager for statistics and replication lag
+	statsManager *StatsManager // Manager for statistics and replication lag
 }
 
 // NewEventDistributor creates a new event distributor
@@ -73,7 +73,7 @@ func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 		retryManager:              retryMgr,
 
 		// Initialize statistics tracking
-		statsManager:  NewStatsManager(log, statsInterval),
+		statsManager: NewStatsManager(log, statsInterval),
 	}
 }
 
@@ -168,6 +168,9 @@ func (d *EventDistributor) Start() error {
 								worker.id, worker.currentGroup.Namespace, worker.currentGroup.OpType,
 								len(worker.currentGroup.Operations))
 
+							if d.statsManager != nil {
+								d.statsManager.IncrementTimeoutFlushes()
+							}
 							worker.flushCurrentGroup()
 						}
 					}
@@ -178,8 +181,6 @@ func (d *EventDistributor) Start() error {
 			}
 		}
 	}()
-
-
 
 	// Main loop to read from change stream and distribute events
 	var changeCount int
@@ -244,7 +245,6 @@ func (d *EventDistributor) Start() error {
 
 		// Send event to appropriate worker
 		d.workers[workerIndex].ProcessEvent(changeEvent)
-
 
 		// Handle resume token checkpointing
 		changeCount++
@@ -565,10 +565,13 @@ func (w *Worker) processGroup(group OperationGroup) {
 			docs = append(docs, transformed)
 		}
 
+		if w.statsManager != nil {
+			w.statsManager.RecordBulkWrite(len(docs), useOrdered)
+		}
 		if _, err := targetCollection.InsertMany(w.ctx, docs, options.InsertMany().SetOrdered(useOrdered)); err != nil {
 			bulkWriteException, ok := err.(mongo.BulkWriteException)
 			if ok {
-				w.log.Debugf("[%s.%s] Bulk insert partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
+				w.log.Errorf("[%s.%s] Bulk insert partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
 
 				// Process individual errors
 				for _, writeErr := range bulkWriteException.WriteErrors {
@@ -584,6 +587,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 						if writeErr.Index < len(group.Operations) {
 							op := group.Operations[writeErr.Index]
 							filter := bson.M{"_id": op.DocumentID}
+							if w.statsManager != nil {
+								w.statsManager.IncrementSequentialRetries(1)
+							}
 							if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
 								w.log.Debugf("[%s.%s] Upsert fallback failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
 								if w.dlq != nil {
@@ -596,6 +602,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 					} else {
 						// For non-duplicate key errors, retry with regular insert
 						if writeErr.Index < len(docs) {
+							if w.statsManager != nil {
+								w.statsManager.IncrementSequentialRetries(1)
+							}
 							if _, err := targetCollection.InsertOne(w.ctx, docs[writeErr.Index]); err != nil {
 								w.log.Errorf("[%s.%s] Retry insert failed for document _id=%v: %v", dbName, collName, failedDocID, err)
 								if w.dlq != nil {
@@ -620,6 +629,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
 						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk insert with backoff...", dbName, collName)
 						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
+							if w.statsManager != nil {
+								w.statsManager.RecordBulkWrite(len(docs), useOrdered)
+							}
 							_, retryInsertErr := targetCollection.InsertMany(w.ctx, docs, options.InsertMany().SetOrdered(useOrdered))
 							return retryInsertErr
 						})
@@ -636,9 +648,15 @@ func (w *Worker) processGroup(group OperationGroup) {
 					// Fall back to individual operations with upsert for all documents
 					for _, op := range group.Operations {
 						// Try insert first
+						if w.statsManager != nil {
+							w.statsManager.IncrementSequentialRetries(1)
+						}
 						if _, err := targetCollection.InsertOne(w.ctx, op.Document); err != nil {
 							// If insert fails, try upsert
 							filter := bson.M{"_id": op.DocumentID}
+							if w.statsManager != nil {
+								w.statsManager.IncrementSequentialRetries(1)
+							}
 							if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
 								if err == context.Canceled {
 									w.log.Debugf("[%s.%s] Upserting document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
@@ -701,6 +719,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 			}
 		}
 
+		if w.statsManager != nil {
+			w.statsManager.RecordBulkWrite(len(models), useOrdered)
+		}
 		if _, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered)); err != nil {
 			bulkWriteException, ok := err.(mongo.BulkWriteException)
 			if ok {
@@ -721,6 +742,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 
 						// Retry with the appropriate method based on operation type
 						if op.UpdateDescription != nil {
+							if w.statsManager != nil {
+								w.statsManager.IncrementSequentialRetries(1)
+							}
 							if _, err := targetCollection.UpdateOne(w.ctx, filter, op.UpdateDescription, options.Update().SetUpsert(true)); err != nil {
 								w.log.Errorf("[%s.%s] Retry modifier update failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
 								if w.dlq != nil {
@@ -728,6 +752,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 								}
 							}
 						} else if op.Document != nil {
+							if w.statsManager != nil {
+								w.statsManager.IncrementSequentialRetries(1)
+							}
 							if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
 								w.log.Errorf("[%s.%s] Retry replace update failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
 								if w.dlq != nil {
@@ -752,6 +779,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
 						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk update with backoff...", dbName, collName)
 						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
+							if w.statsManager != nil {
+								w.statsManager.RecordBulkWrite(len(models), useOrdered)
+							}
 							_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
 							return retryBulkErr
 						})
@@ -774,6 +804,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 
 					// Use the appropriate method based on operation type
 					if op.UpdateDescription != nil {
+						if w.statsManager != nil {
+							w.statsManager.IncrementSequentialRetries(1)
+						}
 						if _, err := targetCollection.UpdateOne(w.ctx, filter, op.UpdateDescription, options.Update().SetUpsert(true)); err != nil {
 							if err == context.Canceled {
 								w.log.Debugf("[%s.%s] Updating document _id=%v (modifier) canceled due to context cancellation", dbName, collName, op.DocumentID)
@@ -785,6 +818,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 							}
 						}
 					} else if op.Document != nil {
+						if w.statsManager != nil {
+							w.statsManager.IncrementSequentialRetries(1)
+						}
 						if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
 							if err == context.Canceled {
 								w.log.Debugf("[%s.%s] Replacing document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
@@ -810,6 +846,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 			models = append(models, model)
 		}
 
+		if w.statsManager != nil {
+			w.statsManager.RecordBulkWrite(len(models), useOrdered)
+		}
 		if _, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered)); err != nil {
 			bulkWriteException, ok := err.(mongo.BulkWriteException)
 			if ok {
@@ -827,6 +866,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 					if writeErr.Index < len(group.Operations) {
 						op := group.Operations[writeErr.Index]
 						filter := bson.M{"_id": op.DocumentID}
+						if w.statsManager != nil {
+							w.statsManager.IncrementSequentialRetries(1)
+						}
 						if _, err := targetCollection.DeleteOne(w.ctx, filter); err != nil {
 							w.log.Errorf("[%s.%s] Retry delete failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
 							if w.dlq != nil {
@@ -850,6 +892,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
 						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk delete with backoff...", dbName, collName)
 						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
+							if w.statsManager != nil {
+								w.statsManager.RecordBulkWrite(len(models), useOrdered)
+							}
 							_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
 							return retryBulkErr
 						})
@@ -869,6 +914,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 				// Fall back to individual deletes
 				for _, op := range group.Operations {
 					filter := bson.M{"_id": op.DocumentID}
+					if w.statsManager != nil {
+						w.statsManager.IncrementSequentialRetries(1)
+					}
 					if _, err := targetCollection.DeleteOne(w.ctx, filter); err != nil {
 						if err == context.Canceled {
 							w.log.Debugf("[%s.%s] Deleting document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
@@ -904,6 +952,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 			models = append(models, model)
 		}
 
+		if w.statsManager != nil {
+			w.statsManager.RecordBulkWrite(len(models), useOrdered)
+		}
 		if _, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered)); err != nil {
 			bulkWriteException, ok := err.(mongo.BulkWriteException)
 			if ok {
@@ -921,6 +972,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 					if writeErr.Index < len(group.Operations) {
 						op := group.Operations[writeErr.Index]
 						filter := bson.M{"_id": op.DocumentID}
+						if w.statsManager != nil {
+							w.statsManager.IncrementSequentialRetries(1)
+						}
 						if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
 							w.log.Errorf("[%s.%s] Retry replace failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
 							if w.dlq != nil {
@@ -944,6 +998,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
 						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk replace with backoff...", dbName, collName)
 						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
+							if w.statsManager != nil {
+								w.statsManager.RecordBulkWrite(len(models), useOrdered)
+							}
 							_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
 							return retryBulkErr
 						})
@@ -963,6 +1020,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 				// Fall back to individual replaces
 				for _, op := range group.Operations {
 					filter := bson.M{"_id": op.DocumentID}
+					if w.statsManager != nil {
+						w.statsManager.IncrementSequentialRetries(1)
+					}
 					if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
 						if err == context.Canceled {
 							w.log.Debugf("[%s.%s] Replacing document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)

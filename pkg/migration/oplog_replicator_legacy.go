@@ -98,7 +98,7 @@ func (r *OplogReplicatorLegacy) getCurrentOplogTimestamp() (*primitive.Timestamp
 }
 
 // StartReplication starts the oplog-based replication using GTM legacy
-func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTimestamp interface{}, timestampPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, liveOnly bool, migrator *Migrator) error {
+func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTimestamp interface{}, timestampPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, liveOnly bool, cdcStartTime *primitive.Timestamp, migrator *Migrator) error {
 	// Abort if the initial migration state was completed with failures, or if DLQ has entries
 	if initialMigrationState != nil && initialMigrationState.Status == StatusCompletedWithFailures {
 		return fmt.Errorf("cannot start replication: initial migration completed with failures in a previous run")
@@ -112,13 +112,19 @@ func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTime
 	}
 
 	// Enforce safety invariants between Initial Migration State and Oplog Timestamp Checkpoint
-	if initialMigrationState == nil {
-		if globalTimestamp != nil {
-			return fmt.Errorf("safety violation: initial migration state file does not exist, but a global oplog timestamp checkpoint exists. Clean up checkpoint file or ensure state is in sync before proceeding")
-		}
-	} else if initialMigrationState.Status == StatusCompleted || initialMigrationState.Status == StatusSkipped {
-		if globalTimestamp == nil {
-			return fmt.Errorf("safety violation: initial migration state is marked as %s, but no global oplog timestamp checkpoint was found. Clean up state file or restore checkpoint before proceeding", initialMigrationState.Status)
+	if cdcStartTime != nil && globalTimestamp != nil {
+		return fmt.Errorf("safety violation: a custom cdc-start-timestamp is specified, but a global oplog timestamp checkpoint already exists. Clean up checkpoint file or omit cdc-start-timestamp to resume from the last checkpoint")
+	}
+
+	if cdcStartTime == nil {
+		if initialMigrationState == nil {
+			if globalTimestamp != nil {
+				return fmt.Errorf("safety violation: initial migration state file does not exist, but a global oplog timestamp checkpoint exists. Clean up checkpoint file or ensure state is in sync before proceeding")
+			}
+		} else if initialMigrationState.Status == StatusCompleted || initialMigrationState.Status == StatusSkipped {
+			if globalTimestamp == nil {
+				return fmt.Errorf("safety violation: initial migration state is marked as %s, but no global oplog timestamp checkpoint was found. Clean up state file or restore checkpoint before proceeding", initialMigrationState.Status)
+			}
 		}
 	}
 
@@ -155,36 +161,49 @@ func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTime
 		}
 	}
 
+	// If no saved legacy timestamp checkpoint is found on disk:
+	// - If a custom cdcStartTime was supplied, initialize the legacy Tail afterTimestamp
+	//   by shifting the seconds (T) 32 bits to the left and bitwise-ORing with the increment (I).
+	// - Otherwise, fallback to fetching the current oplog timestamp from the source DB.
 	if savedTimestamp == nil {
-		if liveOnly {
-			r.log.Info("No oplog timestamp found in live-only mode. Obtaining current oplog position to start incremental replication.")
+		if cdcStartTime != nil {
+			r.log.Infof("Using user-provided cdcStartTime: %s", time.Unix(int64(cdcStartTime.T), 0).UTC().Format(time.RFC3339))
+			initialOplogTimestamp := &primitive.Timestamp{T: cdcStartTime.T, I: cdcStartTime.I}
+			savedTimestamp = &OplogTimestamp{Timestamp: *initialOplogTimestamp}
+			// Legacy bson.MongoTimestamp is represented as a 64-bit int where the upper 32 bits
+			// are the Unix epoch seconds and the lower 32 bits are the increment counter.
+			afterTimestamp = bson.MongoTimestamp((int64(cdcStartTime.T) << 32) | int64(cdcStartTime.I))
 		} else {
-			r.log.Info("No oplog timestamp found. Will get current oplog position.")
-		}
+			if liveOnly {
+				r.log.Info("No oplog timestamp found in live-only mode. Obtaining current oplog position to start incremental replication.")
+			} else {
+				r.log.Info("No oplog timestamp found. Will get current oplog position.")
+			}
 
-		// Get current oplog timestamp BEFORE initial migration to prevent data loss
-		// This follows the same pattern as change stream mode
-		currentOplogTimestamp, err := r.getCurrentOplogTimestamp()
-		if err != nil {
-			return fmt.Errorf("failed to get current oplog timestamp: %w", err)
-		}
+			// Get current oplog timestamp BEFORE initial migration to prevent data loss
+			// This follows the same pattern as change stream mode
+			currentOplogTimestamp, err := r.getCurrentOplogTimestamp()
+			if err != nil {
+				return fmt.Errorf("failed to get current oplog timestamp: %w", err)
+			}
 
-		r.log.Infof("Obtained current oplog timestamp before migration: T=%d, I=%d",
-			currentOplogTimestamp.T, currentOplogTimestamp.I)
+			r.log.Infof("Obtained current oplog timestamp before migration: T=%d, I=%d",
+				currentOplogTimestamp.T, currentOplogTimestamp.I)
 
-		// Save this timestamp BEFORE performing initial migration
-		initialTimestamp := OplogTimestamp{
-			Timestamp: *currentOplogTimestamp,
-		}
-		if err := SaveOplogTimestamp(timestampPath, initialTimestamp); err != nil {
-			r.log.Errorf("Error saving initial oplog timestamp: %v", err)
-		} else {
-			r.log.Info("Saved initial oplog timestamp before migration")
-		}
+			// Save this timestamp BEFORE performing initial migration
+			initialTimestamp := OplogTimestamp{
+				Timestamp: *currentOplogTimestamp,
+			}
+			if err := SaveOplogTimestamp(timestampPath, initialTimestamp); err != nil {
+				r.log.Errorf("Error saving initial oplog timestamp: %v", err)
+			} else {
+				r.log.Info("Saved initial oplog timestamp before migration")
+			}
 
-		// Convert timestamp to bson.MongoTimestamp for GTM
-		// MongoTimestamp is int64 where high 32 bits are T (seconds), low 32 bits are I (increment)
-		afterTimestamp = bson.MongoTimestamp((int64(currentOplogTimestamp.T) << 32) | int64(currentOplogTimestamp.I))
+			// Convert timestamp to bson.MongoTimestamp for GTM
+			// MongoTimestamp is int64 where high 32 bits are T (seconds), low 32 bits are I (increment)
+			afterTimestamp = bson.MongoTimestamp((int64(currentOplogTimestamp.T) << 32) | int64(currentOplogTimestamp.I))
+		}
 	} else {
 		// Use saved timestamp - properly combine T and I components
 		afterTimestamp = bson.MongoTimestamp((int64(savedTimestamp.Timestamp.T) << 32) | int64(savedTimestamp.Timestamp.I))

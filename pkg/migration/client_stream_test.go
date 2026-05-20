@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/gsbingo17/mongodb-migration/pkg/config"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 func TestStartReplicationSafetyInvariants(t *testing.T) {
@@ -15,7 +16,7 @@ func TestStartReplicationSafetyInvariants(t *testing.T) {
 	ctx := context.TODO()
 
 	// Case 1: initialMigrationState is nil, but globalResumeToken is NOT nil (fresh run violation)
-	err := r.StartReplication(ctx, "some-resume-token", "path", nil, "state-path", config.DatabasePair{}, false, nil)
+	err := r.StartReplication(ctx, "some-resume-token", "path", nil, "state-path", config.DatabasePair{}, false, nil, nil)
 	if err == nil {
 		t.Errorf("expected error when state is nil but resume token exists")
 	} else if !strings.Contains(err.Error(), "safety violation: initial migration state file does not exist") {
@@ -24,7 +25,7 @@ func TestStartReplicationSafetyInvariants(t *testing.T) {
 
 	// Case 2: initialMigrationState is Completed, but globalResumeToken is nil (resumption violation)
 	completedState := &InitialMigrationState{Status: StatusCompleted}
-	err = r.StartReplication(ctx, nil, "path", completedState, "state-path", config.DatabasePair{}, false, nil)
+	err = r.StartReplication(ctx, nil, "path", completedState, "state-path", config.DatabasePair{}, false, nil, nil)
 	if err == nil {
 		t.Errorf("expected error when state is completed but resume token is nil")
 	} else if !strings.Contains(err.Error(), "safety violation: initial migration state is marked as completed") {
@@ -33,7 +34,7 @@ func TestStartReplicationSafetyInvariants(t *testing.T) {
 
 	// Case 3: initialMigrationState is CompletedWithFailures (abort run)
 	failedState := &InitialMigrationState{Status: StatusCompletedWithFailures}
-	err = r.StartReplication(ctx, "some-resume-token", "path", failedState, "state-path", config.DatabasePair{}, false, nil)
+	err = r.StartReplication(ctx, "some-resume-token", "path", failedState, "state-path", config.DatabasePair{}, false, nil, nil)
 	if err == nil {
 		t.Errorf("expected error when state is CompletedWithFailures")
 	} else if !strings.Contains(err.Error(), "cannot start replication: initial migration completed with failures in a previous run") {
@@ -42,10 +43,19 @@ func TestStartReplicationSafetyInvariants(t *testing.T) {
 
 	// Case 4: initialMigrationState is Skipped, but globalResumeToken is nil (resumption violation for live-only)
 	skippedState := &InitialMigrationState{Status: StatusSkipped}
-	err = r.StartReplication(ctx, nil, "path", skippedState, "state-path", config.DatabasePair{}, true, nil)
+	err = r.StartReplication(ctx, nil, "path", skippedState, "state-path", config.DatabasePair{}, true, nil, nil)
 	if err == nil {
 		t.Errorf("expected error when state is skipped but resume token is nil")
 	} else if !strings.Contains(err.Error(), "safety violation: initial migration state is marked as skipped") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+
+	// Case 5: custom cdcStartTime is specified, but globalResumeToken is NOT nil (reject combination)
+	customStartTime := &primitive.Timestamp{T: 1716234000, I: 1}
+	err = r.StartReplication(ctx, "some-resume-token", "path", nil, "state-path", config.DatabasePair{}, true, customStartTime, nil)
+	if err == nil {
+		t.Errorf("expected error when cdcStartTime is specified and globalResumeToken is not nil")
+	} else if !strings.Contains(err.Error(), "safety violation: a custom cdc-start-timestamp is specified, but a global resume token checkpoint already exists") {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }

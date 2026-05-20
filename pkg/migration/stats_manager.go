@@ -17,6 +17,14 @@ type StatsManager struct {
 	log                            *logger.Logger
 	statsInterval                  time.Duration
 	updateDocMissingSinceLastStats int
+	sequentialRetriesSinceLastStats int
+	orderedBulkWritesSinceLastStats     int
+	orderedBulkWritesSizeSinceLastStats int
+	orderedSizesHistogram               []int
+	unorderedBulkWritesSinceLastStats   int
+	unorderedBulkWritesSizeSinceLastStats int
+	unorderedSizesHistogram             []int
+	timeoutFlushesSinceLastStats        int
 
 	// Maps for Received, Processed, and Failed counts by operationType string
 	receivedSinceLastStats  map[string]int
@@ -34,6 +42,8 @@ func NewStatsManager(log *logger.Logger, interval time.Duration) *StatsManager {
 		receivedSinceLastStats:  make(map[string]int),
 		processedSinceLastStats: make(map[string]int),
 		failedSinceLastStats:    make(map[string]int),
+		orderedSizesHistogram:   make([]int, 4096),
+		unorderedSizesHistogram: make([]int, 4096),
 	}
 }
 
@@ -76,6 +86,115 @@ func (sm *StatsManager) IncrementUpdateDocMissing() {
 	sm.updateDocMissingSinceLastStats++
 }
 
+// IncrementSequentialRetries increments the count of sequential retries thread-safely
+func (sm *StatsManager) IncrementSequentialRetries(count int) {
+	if sm == nil {
+		return
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.sequentialRetriesSinceLastStats += count
+}
+
+
+
+// GetSequentialRetries returns the sequential retries count thread-safely
+func (sm *StatsManager) GetSequentialRetries() int {
+	if sm == nil {
+		return 0
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	return sm.sequentialRetriesSinceLastStats
+}
+
+// GetOrderedBulkWrites returns the ordered bulk writes count thread-safely
+func (sm *StatsManager) GetOrderedBulkWrites() int {
+	if sm == nil {
+		return 0
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	return sm.orderedBulkWritesSinceLastStats
+}
+
+// GetOrderedBulkWritesSize returns the ordered bulk writes total size thread-safely
+func (sm *StatsManager) GetOrderedBulkWritesSize() int {
+	if sm == nil {
+		return 0
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	return sm.orderedBulkWritesSizeSinceLastStats
+}
+
+// GetUnorderedBulkWrites returns the unordered bulk writes count thread-safely
+func (sm *StatsManager) GetUnorderedBulkWrites() int {
+	if sm == nil {
+		return 0
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	return sm.unorderedBulkWritesSinceLastStats
+}
+
+// GetUnorderedBulkWritesSize returns the unordered bulk writes total size thread-safely
+func (sm *StatsManager) GetUnorderedBulkWritesSize() int {
+	if sm == nil {
+		return 0
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	return sm.unorderedBulkWritesSizeSinceLastStats
+}
+
+// RecordBulkWrite records a bulk write execution with the given size and ordered status thread-safely
+func (sm *StatsManager) RecordBulkWrite(size int, isOrdered bool) {
+	if sm == nil {
+		return
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Clamp size to prevent array out of bounds if write batch size is larger than 4095
+	clampedSize := size
+	if clampedSize < 0 {
+		clampedSize = 0
+	} else if clampedSize >= 4096 {
+		clampedSize = 4095
+	}
+
+	if isOrdered {
+		sm.orderedBulkWritesSinceLastStats++
+		sm.orderedBulkWritesSizeSinceLastStats += size
+		sm.orderedSizesHistogram[clampedSize]++
+	} else {
+		sm.unorderedBulkWritesSinceLastStats++
+		sm.unorderedBulkWritesSizeSinceLastStats += size
+		sm.unorderedSizesHistogram[clampedSize]++
+	}
+}
+
+// IncrementTimeoutFlushes increments the count of timeout flushes thread-safely
+func (sm *StatsManager) IncrementTimeoutFlushes() {
+	if sm == nil {
+		return
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.timeoutFlushesSinceLastStats++
+}
+
+// GetTimeoutFlushes returns the timeout flushes count thread-safely
+func (sm *StatsManager) GetTimeoutFlushes() int {
+	if sm == nil {
+		return 0
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	return sm.timeoutFlushesSinceLastStats
+}
+
 // IncrementEventsReceived increments the count of received input events by operation type thread-safely
 func (sm *StatsManager) IncrementEventsReceived(opType string) {
 	if sm == nil {
@@ -115,6 +234,14 @@ func (sm *StatsManager) ReportStats() {
 	insertsFailed, updatesFailed, deletesFailed, eventsFailed := getTypeCounts(sm.failedSinceLastStats)
 
 	updateDocMissing := sm.updateDocMissingSinceLastStats
+	sequentialRetries := sm.sequentialRetriesSinceLastStats
+	orderedWrites := sm.orderedBulkWritesSinceLastStats
+	orderedSize := sm.orderedBulkWritesSizeSinceLastStats
+	orderedSizes := sm.orderedSizesHistogram
+	unorderedWrites := sm.unorderedBulkWritesSinceLastStats
+	unorderedSize := sm.unorderedBulkWritesSizeSinceLastStats
+	unorderedSizes := sm.unorderedSizesHistogram
+	timeoutFlushes := sm.timeoutFlushesSinceLastStats
 
 	duration := time.Since(sm.lastStatsTime)
 
@@ -122,6 +249,14 @@ func (sm *StatsManager) ReportStats() {
 	sm.processedSinceLastStats = make(map[string]int)
 	sm.failedSinceLastStats = make(map[string]int)
 	sm.updateDocMissingSinceLastStats = 0
+	sm.sequentialRetriesSinceLastStats = 0
+	sm.orderedBulkWritesSinceLastStats = 0
+	sm.orderedBulkWritesSizeSinceLastStats = 0
+	sm.orderedSizesHistogram = make([]int, 4096)
+	sm.unorderedBulkWritesSinceLastStats = 0
+	sm.unorderedBulkWritesSizeSinceLastStats = 0
+	sm.unorderedSizesHistogram = make([]int, 4096)
+	sm.timeoutFlushesSinceLastStats = 0
 	sm.lastStatsTime = time.Now()
 
 	var totalLag time.Duration
@@ -143,12 +278,18 @@ func (sm *StatsManager) ReportStats() {
 	var rateInsertsReceived, rateUpdatesReceived, rateDeletesReceived float64
 	var rateInsertsProcessed, rateUpdatesProcessed, rateDeletesProcessed float64
 	var rateInsertsFailed, rateUpdatesFailed, rateDeletesFailed float64
+	var rateSequentialRetries, rateOrderedWrites, rateUnorderedWrites float64
+	var rateTimeoutFlushes float64
 
 	if duration.Seconds() > 0 {
 		rateReceived = float64(eventsReceived) / duration.Seconds()
 		rateProcessed = float64(eventsProcessed) / duration.Seconds()
 		rateFailed = float64(eventsFailed) / duration.Seconds()
 		rateUpdateDocMissing = float64(updateDocMissing) / duration.Seconds()
+		rateSequentialRetries = float64(sequentialRetries) / duration.Seconds()
+		rateOrderedWrites = float64(orderedWrites) / duration.Seconds()
+		rateUnorderedWrites = float64(unorderedWrites) / duration.Seconds()
+		rateTimeoutFlushes = float64(timeoutFlushes) / duration.Seconds()
 
 		rateInsertsReceived = float64(insertsReceived) / duration.Seconds()
 		rateUpdatesReceived = float64(updatesReceived) / duration.Seconds()
@@ -163,11 +304,27 @@ func (sm *StatsManager) ReportStats() {
 		rateDeletesFailed = float64(deletesFailed) / duration.Seconds()
 	}
 
-	msg := fmt.Sprintf("Change stream statistics: Received %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], Processed %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], Failed %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], updateDocMissing %d (%.2f events/sec)%s in the last %v",
+	var avgOrderedSizeStr string
+	if orderedWrites > 0 {
+		p50, p90, p100 := calculatePercentiles(orderedSizes)
+		avgOrderedSizeStr = fmt.Sprintf(", average ordered bulk size: %.1f ops (p50=%d, p90=%d, p100=%d)", float64(orderedSize)/float64(orderedWrites), p50, p90, p100)
+	} else {
+		avgOrderedSizeStr = ", avg ordered bulk size: N/A"
+	}
+
+	var avgUnorderedSizeStr string
+	if unorderedWrites > 0 {
+		p50, p90, p100 := calculatePercentiles(unorderedSizes)
+		avgUnorderedSizeStr = fmt.Sprintf(", average unordered bulk size: %.1f ops (p50=%d, p90=%d, p100=%d)", float64(unorderedSize)/float64(unorderedWrites), p50, p90, p100)
+	} else {
+		avgUnorderedSizeStr = ", avg unordered bulk size: N/A"
+	}
+
+	msg := fmt.Sprintf("Change stream statistics: Received %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], Processed %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], Failed %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], updateDocMissing %d (%.2f events/sec), Ordered BulkWrites %d (%.2f/sec)%s, Unordered BulkWrites %d (%.2f/sec)%s, Sequential Retries %d (%.2f/sec), Timeout Flushes %d (%.2f/sec)%s in the last %v",
 		eventsReceived, rateReceived, insertsReceived, rateInsertsReceived, updatesReceived, rateUpdatesReceived, deletesReceived, rateDeletesReceived,
 		eventsProcessed, rateProcessed, insertsProcessed, rateInsertsProcessed, updatesProcessed, rateUpdatesProcessed, deletesProcessed, rateDeletesProcessed,
 		eventsFailed, rateFailed, insertsFailed, rateInsertsFailed, updatesFailed, rateUpdatesFailed, deletesFailed, rateDeletesFailed,
-		updateDocMissing, rateUpdateDocMissing, avgLagStr, duration.Round(time.Second))
+		updateDocMissing, rateUpdateDocMissing, orderedWrites, rateOrderedWrites, avgOrderedSizeStr, unorderedWrites, rateUnorderedWrites, avgUnorderedSizeStr, sequentialRetries, rateSequentialRetries, timeoutFlushes, rateTimeoutFlushes, avgLagStr, duration.Round(time.Second))
 
 	sm.log.Info(msg)
 }
@@ -200,4 +357,42 @@ func (sm *StatsManager) GetFailedCount(opType string) int {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	return sm.failedSinceLastStats[opType]
+}
+
+// calculatePercentiles calculates the p50, p90, and p100 percentiles for a histogram slice
+func calculatePercentiles(histogram []int) (p50, p90, p100 int) {
+	total := 0
+	for _, count := range histogram {
+		total += count
+	}
+	if total == 0 {
+		return 0, 0, 0
+	}
+
+	target50 := total * 50 / 100
+	target90 := total * 90 / 100
+	target100 := total - 1
+
+	p50 = -1
+	p90 = -1
+	p100 = -1
+
+	cumulative := 0
+	for size, count := range histogram {
+		if count == 0 {
+			continue
+		}
+		cumulative += count
+		if p50 == -1 && cumulative > target50 {
+			p50 = size
+		}
+		if p90 == -1 && cumulative > target90 {
+			p90 = size
+		}
+		if cumulative > target100 {
+			p100 = size
+			break
+		}
+	}
+	return p50, p90, p100
 }

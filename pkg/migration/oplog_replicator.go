@@ -62,7 +62,7 @@ func (r *OplogReplicator) AddCollection(sourceDB, targetDB, sourceCollection, ta
 }
 
 // StartReplication starts the oplog-based replication
-func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp interface{}, timestampPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, liveOnly bool, migrator *Migrator) error {
+func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp interface{}, timestampPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, liveOnly bool, cdcStartTime *primitive.Timestamp, migrator *Migrator) error {
 	// Abort if the initial migration state was completed with failures, or if DLQ has entries
 	if initialMigrationState != nil && initialMigrationState.Status == StatusCompletedWithFailures {
 		return fmt.Errorf("cannot start replication: initial migration completed with failures in a previous run")
@@ -76,13 +76,19 @@ func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp 
 	}
 
 	// Enforce safety invariants between Initial Migration State and Oplog Timestamp Checkpoint
-	if initialMigrationState == nil {
-		if globalTimestamp != nil {
-			return fmt.Errorf("safety violation: initial migration state file does not exist, but a global oplog timestamp checkpoint exists. Clean up checkpoint file or ensure state is in sync before proceeding")
-		}
-	} else if initialMigrationState.Status == StatusCompleted || initialMigrationState.Status == StatusSkipped {
-		if globalTimestamp == nil {
-			return fmt.Errorf("safety violation: initial migration state is marked as %s, but no global oplog timestamp checkpoint was found. Clean up state file or restore checkpoint before proceeding", initialMigrationState.Status)
+	if cdcStartTime != nil && globalTimestamp != nil {
+		return fmt.Errorf("safety violation: a custom cdc-start-timestamp is specified, but a global oplog timestamp checkpoint already exists. Clean up checkpoint file or omit cdc-start-timestamp to resume from the last checkpoint")
+	}
+
+	if cdcStartTime == nil {
+		if initialMigrationState == nil {
+			if globalTimestamp != nil {
+				return fmt.Errorf("safety violation: initial migration state file does not exist, but a global oplog timestamp checkpoint exists. Clean up checkpoint file or ensure state is in sync before proceeding")
+			}
+		} else if initialMigrationState.Status == StatusCompleted || initialMigrationState.Status == StatusSkipped {
+			if globalTimestamp == nil {
+				return fmt.Errorf("safety violation: initial migration state is marked as %s, but no global oplog timestamp checkpoint was found. Clean up state file or restore checkpoint before proceeding", initialMigrationState.Status)
+			}
 		}
 	}
 
@@ -122,22 +128,30 @@ func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp 
 		}
 	}
 
-	// If no timestamp is available, get current cluster time
+	// If no saved timestamp is found in the checkpoint files, determine the starting point:
+	// - If the user passed a custom historical cdcStartTime, use that as our starting tailing position.
+	// - Otherwise, fetch the current cluster time from the primary to replicate starting from "now".
 	if savedTimestamp == nil {
-		if liveOnly {
-			r.log.Info("No oplog timestamp found in live-only mode. Obtaining current cluster time to start incremental replication.")
+		if cdcStartTime != nil {
+			r.log.Infof("Using user-provided cdcStartTime: %s", time.Unix(int64(cdcStartTime.T), 0).UTC().Format(time.RFC3339))
+			afterTimestamp = *cdcStartTime
+			savedTimestamp = &OplogTimestamp{Timestamp: *cdcStartTime}
 		} else {
-			r.log.Info("No oplog timestamp found. Capturing current cluster time.")
-		}
+			if liveOnly {
+				r.log.Info("No oplog timestamp found in live-only mode. Obtaining current cluster time to start incremental replication.")
+			} else {
+				r.log.Info("No oplog timestamp found. Capturing current cluster time.")
+			}
 
-		// Get current cluster time as starting point
-		currentTime, err := r.getCurrentClusterTime(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to get current cluster time: %w", err)
-		}
+			// Get current cluster time as starting point
+			currentTime, err := r.getCurrentClusterTime(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to get current cluster time: %w", err)
+			}
 
-		afterTimestamp = currentTime
-		savedTimestamp = &OplogTimestamp{Timestamp: currentTime}
+			afterTimestamp = currentTime
+			savedTimestamp = &OplogTimestamp{Timestamp: currentTime}
+		}
 
 		// Save this timestamp
 		if err := SaveOplogTimestamp(timestampPath, *savedTimestamp); err != nil {
