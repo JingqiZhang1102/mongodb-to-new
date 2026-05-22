@@ -655,7 +655,7 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		changeStream,
 		r.log,
 		globalResumeTokenPath,
-		time.Duration(r.config.CheckpointInterval)*time.Minute,
+		time.Duration(r.config.CheckpointIntervalMinutes)*time.Minute,
 		r.config.SaveThreshold,
 		r.config.IncrementalWorkerCount,
 		r.config.IncrementalWriteBatchSize,

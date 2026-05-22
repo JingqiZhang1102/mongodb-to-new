@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,10 +11,11 @@ import (
 // Config represents the main configuration structure
 type Config struct {
 	DatabasePairs          []DatabasePair `json:"databasePairs"`
-	SaveThreshold          int            `json:"saveThreshold"`
-	CheckpointInterval     int            `json:"checkpointInterval"`     // Checkpoint interval in minutes
+	SaveThreshold          int            `json:"saveThreshold"`          // Number of processed events before saving a resume token checkpoint
+	CheckpointIntervalMinutes int            `json:"checkpointIntervalMinutes"` // Checkpoint interval in minutes
 	ForceOrderedOperations bool           `json:"forceOrderedOperations"` // Force ordered operations for all types
 	FlushIntervalMs        int            `json:"flushIntervalMs"`        // Flush interval in milliseconds
+	TargetMaxConnIdleSeconds int            `json:"targetMaxConnIdleSeconds"` // Maximum connection idle time for target in seconds
 
 	// Parameters for initial migration
 	InitialReadBatchSize     int `json:"initialReadBatchSize"`     // Number of documents to read in a batch during initial migration
@@ -99,10 +101,12 @@ func LoadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("error reading config file: %w", err)
 	}
 
-	// Parse the config
+	// Parse the config strictly (fail on unrecognized fields)
 	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("error parsing config file: %w", err)
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&config); err != nil {
+		return nil, fmt.Errorf("error parsing config file (unrecognized configuration fields present): %w", err)
 	}
 
 	// Validate the config
@@ -115,9 +119,9 @@ func LoadConfig(configPath string) (*Config, error) {
 		config.SaveThreshold = 100
 	}
 
-	// Set default checkpoint interval if not provided
-	if config.CheckpointInterval <= 0 {
-		config.CheckpointInterval = 5 // Default to 5 minutes
+	// Set default checkpoint interval in minutes if not provided
+	if config.CheckpointIntervalMinutes <= 0 {
+		config.CheckpointIntervalMinutes = 5 // Default to 5 minutes
 	}
 
 	// Set default values for incremental replication parameters
@@ -140,6 +144,11 @@ func LoadConfig(configPath string) (*Config, error) {
 	// Set default flush interval if not provided
 	if config.FlushIntervalMs <= 0 {
 		config.FlushIntervalMs = 500 // Default to 500 milliseconds
+	}
+
+	// Set default target connection idle time in seconds if not provided
+	if config.TargetMaxConnIdleSeconds <= 0 {
+		config.TargetMaxConnIdleSeconds = 30 // Default to 30 seconds
 	}
 
 	// Set default values for initial migration parameters
@@ -249,4 +258,15 @@ func validateConfig(config *Config) error {
 	}
 
 	return nil
+}
+
+// GetMaxWorkersForLive returns the maximum concurrent workers based on the operation mode.
+// It only considers initial migration workers for 'migrate' and 'live' modes,
+// and uses strictly the incremental worker count for 'live-only' mode.
+func (c *Config) GetMaxWorkersForLive(mode string) int {
+	maxWorkers := c.IncrementalWorkerCount
+	if mode != "live-only" {
+		maxWorkers = max(maxWorkers, c.ConcurrentCollections*c.InitialMigrationWorkers)
+	}
+	return maxWorkers
 }

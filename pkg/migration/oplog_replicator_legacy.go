@@ -815,7 +815,7 @@ func (r *OplogReplicatorLegacy) tailOplog(ctx context.Context, afterTimestamp bs
 
 			// Periodic checkpoint
 			r.mu.Lock()
-			shouldCheckpoint := processedCount >= r.config.SaveThreshold || time.Since(lastCheckpoint) >= time.Duration(r.config.CheckpointInterval)*time.Minute
+			shouldCheckpoint := processedCount >= r.config.SaveThreshold || time.Since(lastCheckpoint) >= time.Duration(r.config.CheckpointIntervalMinutes)*time.Minute
 			currentProcessedCount := processedCount
 			r.mu.Unlock()
 

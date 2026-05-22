@@ -23,15 +23,22 @@ type MongoDB struct {
 	indexWg        sync.WaitGroup // tracks in-flight async index creation goroutines
 }
 
-// NewMongoDB creates a new MongoDB connection
-func NewMongoDB(connectionString, databaseName string, log *logger.Logger) (*MongoDB, error) {
+// NewMongoDB creates a new MongoDB connection with pool size and idle timeouts configured dynamically
+func NewMongoDB(connectionString, databaseName string, maxWorkers int, maxConnIdleTime time.Duration, log *logger.Logger) (*MongoDB, error) {
+	minPoolSize := uint64(maxWorkers)
+	maxPoolSize := uint64(maxWorkers * 2)
+
 	// Set client options
 	clientOptions := options.Client().
 		ApplyURI(connectionString).
-		SetMaxPoolSize(256).
-		SetMinPoolSize(128).
+		SetMaxPoolSize(maxPoolSize).
+		SetMinPoolSize(minPoolSize).
 		SetConnectTimeout(30 * time.Second).
 		SetSocketTimeout(120 * time.Second)
+
+	if maxConnIdleTime > 0 {
+		clientOptions.SetMaxConnIdleTime(maxConnIdleTime)
+	}
 
 	// Connect to MongoDB
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

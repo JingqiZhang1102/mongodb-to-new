@@ -168,15 +168,21 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 	}
 
 	// Connect to source MongoDB (modern driver)
-	m.log.Infof("Connecting to source MongoDB at %s", pair.Source.ConnectionString)
-	sourceDB, err := db.NewMongoDB(pair.Source.ConnectionString, pair.Source.Database, m.log)
+	m.log.Infof("Connecting to source MongoDB at %s (MinPoolSize: 128, MaxPoolSize: 256)", pair.Source.ConnectionString)
+	sourceDB, err := db.NewMongoDB(pair.Source.ConnectionString, pair.Source.Database, 128, 0, m.log) // Source uses static pool size (min 128, max 256)
 	if err != nil {
 		return fmt.Errorf("failed to connect to source MongoDB: %w", err)
 	}
+	
+	// Calculate the maximum concurrent workers for this pair to dynamically size the connection pool
+	maxWorkers := m.config.GetMaxWorkersForLive(mode)
+
+	// Get maximum connection idle timeout for target
+	maxConnIdleTimeTarget := time.Duration(m.config.TargetMaxConnIdleSeconds) * time.Second
 
 	// Connect to target MongoDB
-	m.log.Infof("Connecting to target MongoDB at %s", pair.Target.ConnectionString)
-	targetDB, err := db.NewMongoDB(pair.Target.ConnectionString, pair.Target.Database, m.log)
+	m.log.Infof("Connecting to target MongoDB at %s (MinPoolSize: %d, MaxPoolSize: %d, MaxIdleTime: %v)", pair.Target.ConnectionString, maxWorkers, maxWorkers*2, maxConnIdleTimeTarget)
+	targetDB, err := db.NewMongoDB(pair.Target.ConnectionString, pair.Target.Database, maxWorkers, maxConnIdleTimeTarget, m.log)
 	if err != nil {
 		return fmt.Errorf("failed to connect to target MongoDB: %w", err)
 	}
@@ -391,9 +397,19 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 	}
 	defer sourceDBLegacy.Close()
 
+	// Calculate the maximum concurrent workers for this pair to dynamically size the connection pool
+	mode := "live"
+	if liveOnly {
+		mode = "live-only"
+	}
+	maxWorkers := m.config.GetMaxWorkersForLive(mode)
+
+	// Get maximum connection idle timeout
+	maxConnIdleTime := time.Duration(m.config.TargetMaxConnIdleSeconds) * time.Second
+
 	// Connect to target MongoDB using modern driver
-	m.log.Infof("Connecting to target MongoDB (modern) at %s", pair.Target.ConnectionString)
-	targetDB, err := db.NewMongoDB(pair.Target.ConnectionString, pair.Target.Database, m.log)
+	m.log.Infof("Connecting to target MongoDB (modern) at %s (MinPoolSize: %d, MaxPoolSize: %d, MaxIdleTime: %v)", pair.Target.ConnectionString, maxWorkers, maxWorkers*2, maxConnIdleTime)
+	targetDB, err := db.NewMongoDB(pair.Target.ConnectionString, pair.Target.Database, maxWorkers, maxConnIdleTime, m.log)
 	if err != nil {
 		return fmt.Errorf("failed to connect to target MongoDB: %w", err)
 	}
