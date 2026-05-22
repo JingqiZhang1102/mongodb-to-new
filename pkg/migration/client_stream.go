@@ -235,7 +235,7 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 					targetDBCollection := r.targetDB.GetCollection(targetCollection)
 
 					// Count documents
-					count, err := sourceDBCollection.CountDocuments(ctx, bson.D{})
+					count, err := sourceDBCollection.EstimatedDocumentCount(ctx)
 					if err != nil {
 						r.log.Errorf("Error counting documents in %s.%s: %v", sourceDB, sourceCollection, err)
 						return

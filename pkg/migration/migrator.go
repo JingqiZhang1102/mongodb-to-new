@@ -502,7 +502,7 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	m.log.Infof("Migrating collection: %s.%s to %s.%s", sourceDB.GetDatabaseName(), collConfig.SourceCollection, targetDB.GetDatabaseName(), collConfig.TargetCollection)
 
 	// Get total count for progress reporting
-	totalCount, err := sourceCollection.CountDocuments(ctx, bson.D{})
+	totalCount, err := sourceCollection.EstimatedDocumentCount(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to count documents: %w", err)
 	}
