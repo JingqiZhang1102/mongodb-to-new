@@ -3,6 +3,7 @@ package migration
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -36,6 +37,7 @@ type StatsManager struct {
 	queueLatencyCount     map[string]int64
 	totalBulkWriteLatency map[string]time.Duration
 	bulkWriteLatencyCount map[string]int64
+	workerProcessedSinceLastStats map[int]int
 }
 
 // NewStatsManager creates a new StatsManager
@@ -55,6 +57,7 @@ func NewStatsManager(log *logger.Logger, interval time.Duration) *StatsManager {
 		totalBulkWriteLatency:  make(map[string]time.Duration),
 		bulkWriteLatencyCount:  make(map[string]int64),
 		groupFlushesByReason:   make(map[string]int),
+		workerProcessedSinceLastStats: make(map[int]int),
 	}
 }
 
@@ -186,8 +189,8 @@ func (sm *StatsManager) RecordBulkWrite(size int, isOrdered bool) {
 	}
 }
 
-// RecordLatency records both queue buffering and bulk write execution latency by operation type thread-safely
-func (sm *StatsManager) RecordLatency(opType string, ops []WriteOperation, issueTime time.Time, bulkOpLatency time.Duration) {
+// RecordLatency records queue latency, bulk write latency, and worker processed count thread-safely
+func (sm *StatsManager) RecordLatency(opType string, ops []WriteOperation, issueTime time.Time, bulkOpLatency time.Duration, workerID int) {
 	if sm == nil {
 		return
 	}
@@ -211,6 +214,9 @@ func (sm *StatsManager) RecordLatency(opType string, ops []WriteOperation, issue
 
 	sm.totalBulkWriteLatency[opType] += bulkOpLatency
 	sm.bulkWriteLatencyCount[opType]++
+
+	// Track successful writes processed by this worker thread-safely
+	sm.workerProcessedSinceLastStats[workerID] += len(ops)
 }
 
 // GetAvgQueueLatency returns the average queue buffering latency for a specific operation type thread-safely
@@ -281,6 +287,18 @@ func (sm *StatsManager) GetGroupFlushReasonCount(reason string) int {
 	return sm.groupFlushesByReason[reason]
 }
 
+// IncrementWorkerProcessed increments the count of successfully processed events by a specific worker thread-safely
+func (sm *StatsManager) IncrementWorkerProcessed(workerID int, count int) {
+	if sm == nil {
+		return
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.workerProcessedSinceLastStats[workerID] += count
+}
+
+
+
 // IncrementEventsReceived increments the count of received input events by operation type thread-safely
 func (sm *StatsManager) IncrementEventsReceived(opType string) {
 	if sm == nil {
@@ -336,6 +354,12 @@ func (sm *StatsManager) ReportStats() {
 	bulkWriteLatency := sm.totalBulkWriteLatency
 	bulkWriteLatencyCount := sm.bulkWriteLatencyCount
 
+	workerProcessed := make(map[int]int)
+	for k, v := range sm.workerProcessedSinceLastStats {
+		workerProcessed[k] = v
+	}
+	sm.workerProcessedSinceLastStats = make(map[int]int)
+
 	duration := time.Since(sm.lastStatsTime)
 
 	sm.receivedSinceLastStats = make(map[string]int)
@@ -367,9 +391,37 @@ func (sm *StatsManager) ReportStats() {
 	var avgLagStr string
 	if count > 0 {
 		avgLag := totalLag / time.Duration(count)
-		avgLagStr = fmt.Sprintf(", average processing lag: %v", avgLag.Round(time.Millisecond))
+		avgLagStr = fmt.Sprintf("%v", avgLag.Round(time.Millisecond))
 	} else {
-		avgLagStr = ", average processing lag: N/A"
+		avgLagStr = "N/A"
+	}
+
+	// Calculate each worker's QPS and compile a sorted slice of all workers who processed > 0 operations.
+	// Number of active workers is the number of workers with > 0 processed count.
+	var workerQPSList []float64
+	activeWorkers := 0
+	for _, processedCount := range workerProcessed {
+		if processedCount > 0 {
+			activeWorkers++
+			qps := 0.0
+			if duration.Seconds() > 0 {
+				qps = float64(processedCount) / duration.Seconds()
+			}
+			workerQPSList = append(workerQPSList, qps)
+		}
+	}
+	sort.Float64s(workerQPSList)
+
+	var wQpsP50, wQpsP70, wQpsP90, wQpsP100 float64
+	if len(workerQPSList) > 0 {
+		getPercentile := func(percentile float64) float64 {
+			index := int(float64(len(workerQPSList)-1) * percentile)
+			return workerQPSList[index]
+		}
+		wQpsP50 = getPercentile(0.50)
+		wQpsP70 = getPercentile(0.70)
+		wQpsP90 = getPercentile(0.90)
+		wQpsP100 = getPercentile(1.00)
 	}
 
 	var rateReceived, rateProcessed, rateFailed, rateUpdateDocMissing float64
@@ -441,11 +493,29 @@ func (sm *StatsManager) ReportStats() {
 	avgDeleteDb := getLatencyStr(bulkWriteLatency, bulkWriteLatencyCount, "delete")
 	avgReplaceDb := getLatencyStr(bulkWriteLatency, bulkWriteLatencyCount, "replace")
 
-	msg := fmt.Sprintf("Change stream statistics: Received %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], Processed %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], Failed %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], updateDocMissing %d (%.2f events/sec), Ordered BulkWrites %d (%.2f/sec)%s, Unordered BulkWrites %d (%.2f/sec)%s, Sequential Retries %d (%.2f/sec), Timeout Flushes %d (%.2f/sec)%s, Group Flushes [optype: %d (%.2f/sec), batchfull: %d (%.2f/sec), namespace: %d (%.2f/sec)], Queue Latency [insert: %s, update: %s, delete: %s, replace: %s], BulkWrite Execution Latency [insert: %s, update: %s, delete: %s, replace: %s] in the last %v",
+	msg := fmt.Sprintf("Change stream statistics (last %v):\n"+
+		"  - Received:  %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)]\n"+
+		"  - Processed: %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)]\n"+
+		"  - Failed:    %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)]\n"+
+		"  - updateDocMissing: %d (%.2f events/sec)\n"+
+		"  - Ordered BulkWrites: %d (%.2f/sec)%s\n"+
+		"  - Unordered BulkWrites: %d (%.2f/sec)%s\n"+
+		"  - Sequential Retries: %d (%.2f/sec)\n"+
+		"  - Timeout Flushes: %d (%.2f/sec)\n"+
+		"  - Group Flushes: [optype: %d (%.2f/sec), batchfull: %d (%.2f/sec), namespace: %d (%.2f/sec)]\n"+
+		"  - Queue Latency: [insert: %s, update: %s, delete: %s, replace: %s]\n"+
+		"  - BulkWrite Execution Latency: [insert: %s, update: %s, delete: %s, replace: %s]\n"+
+		"  - Workers: [Active: %d]\n"+
+		"  - Worker QPS: [p50: %.2f, p70: %.2f, p90: %.2f, p100: %.2f]\n"+
+		"  - Average processing lag: %s",
+		duration.Round(time.Second),
 		eventsReceived, rateReceived, insertsReceived, rateInsertsReceived, updatesReceived, rateUpdatesReceived, deletesReceived, rateDeletesReceived,
 		eventsProcessed, rateProcessed, insertsProcessed, rateInsertsProcessed, updatesProcessed, rateUpdatesProcessed, deletesProcessed, rateDeletesProcessed,
 		eventsFailed, rateFailed, insertsFailed, rateInsertsFailed, updatesFailed, rateUpdatesFailed, deletesFailed, rateDeletesFailed,
-		updateDocMissing, rateUpdateDocMissing, orderedWrites, rateOrderedWrites, avgOrderedSizeStr, unorderedWrites, rateUnorderedWrites, avgUnorderedSizeStr, sequentialRetries, rateSequentialRetries, timeoutFlushes, rateTimeoutFlushes, avgLagStr, groupFlushesOpType, rateGroupFlushesOpType, groupFlushesBatchFull, rateGroupFlushesBatchFull, groupFlushesNamespace, rateGroupFlushesNamespace, avgInsertQueue, avgUpdateQueue, avgDeleteQueue, avgReplaceQueue, avgInsertDb, avgUpdateDb, avgDeleteDb, avgReplaceDb, duration.Round(time.Second))
+		updateDocMissing, rateUpdateDocMissing, orderedWrites, rateOrderedWrites, avgOrderedSizeStr, unorderedWrites, rateUnorderedWrites, avgUnorderedSizeStr, sequentialRetries, rateSequentialRetries, timeoutFlushes, rateTimeoutFlushes, groupFlushesOpType, rateGroupFlushesOpType, groupFlushesBatchFull, rateGroupFlushesBatchFull, groupFlushesNamespace, rateGroupFlushesNamespace, avgInsertQueue, avgUpdateQueue, avgDeleteQueue, avgReplaceQueue, avgInsertDb, avgUpdateDb, avgDeleteDb, avgReplaceDb,
+		activeWorkers,
+		wQpsP50, wQpsP70, wQpsP90, wQpsP100,
+		avgLagStr)
 
 	sm.log.Info(msg)
 }

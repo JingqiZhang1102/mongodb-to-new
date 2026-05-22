@@ -284,8 +284,8 @@ func TestStatsManagerLatencies(t *testing.T) {
 		{ReceiveTime: now.Add(-150 * time.Millisecond)}, // This is newer, so -200ms is the oldest (largest delay)
 	}
 
-	sm.RecordLatency("insert", ops1, now, 50*time.Millisecond)
-	sm.RecordLatency("insert", ops2, now, 150*time.Millisecond)
+	sm.RecordLatency("insert", ops1, now, 50*time.Millisecond, 0)
+	sm.RecordLatency("insert", ops2, now, 150*time.Millisecond, 0)
 
 	avgQueueInsert := sm.GetAvgQueueLatency("insert")
 	// Expected average of max queue latencies: (100ms + 200ms) / 2 = 150ms
@@ -303,7 +303,7 @@ func TestStatsManagerLatencies(t *testing.T) {
 	ops3 := []WriteOperation{
 		{ReceiveTime: now.Add(-400 * time.Millisecond)},
 	}
-	sm.RecordLatency("update", ops3, now, 300*time.Millisecond)
+	sm.RecordLatency("update", ops3, now, 300*time.Millisecond, 0)
 
 	avgQueueUpdate := sm.GetAvgQueueLatency("update")
 	// Expected average queue latency: 400ms / 1 = 400ms

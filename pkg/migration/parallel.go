@@ -314,10 +314,7 @@ type Worker struct {
 	currentGroup *OperationGroup
 
 	// Queue of groups waiting to be processed
-	processingQueue []*OperationGroup
-
-	// Flag to indicate if processing is in progress
-	processing bool
+	processingQueue chan *OperationGroup
 
 	// Maximum group size
 	incrementalWriteBatchSize int
@@ -349,14 +346,8 @@ func (w *Worker) flushCurrentGroup() bool {
 			w.id, w.currentGroup.Namespace, w.currentGroup.OpType,
 			len(w.currentGroup.Operations))
 
-		w.processingQueue = append(w.processingQueue, w.currentGroup)
+		w.processingQueue <- w.currentGroup
 		w.currentGroup = nil
-
-		// Start processing if not already in progress
-		if !w.processing {
-			w.processing = true
-			go w.processGroups()
-		}
 		return true
 	}
 	return false
@@ -395,19 +386,24 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 		}
 	}
 
-	return &Worker{
+	w := &Worker{
 		id:                        id,
 		ctx:                       ctx,
 		log:                       log,
 		targetDB:                  targetDB,
 		collectionMap:             collectionMap,
-		processingQueue:           make([]*OperationGroup, 0),
+		processingQueue:           make(chan *OperationGroup, 4096),
 		incrementalWriteBatchSize: incrementalWriteBatchSize,
 		forceOrderedOperations:    forceOrderedOperations,
 		dlq:                       workerDLQ,
 		retryManager:              retryManager,
 		statsManager:              statsManager,
 	}
+
+	// Statically spawn the worker thread at startup
+	go w.processGroups()
+
+	return w
 }
 
 // ProcessEvent handles a single change event
@@ -475,14 +471,8 @@ func (w *Worker) ProcessEvent(event bson.M) {
 		}
 
 		// Add current group to processing queue
-		w.processingQueue = append(w.processingQueue, w.currentGroup)
+		w.processingQueue <- w.currentGroup
 		w.currentGroup = nil
-
-		// Start processing if not already in progress
-		if !w.processing {
-			w.processing = true
-			go w.processGroups()
-		}
 	}
 
 	// Create a new group if needed
@@ -503,14 +493,8 @@ func (w *Worker) ProcessEvent(event bson.M) {
 		if w.statsManager != nil {
 			w.statsManager.IncrementGroupFlushReason("batchfull")
 		}
-		w.processingQueue = append(w.processingQueue, w.currentGroup)
+		w.processingQueue <- w.currentGroup
 		w.currentGroup = nil
-
-		// Start processing if not already in progress
-		if !w.processing {
-			w.processing = true
-			go w.processGroups()
-		}
 	}
 }
 
@@ -520,27 +504,20 @@ func (w *Worker) processGroups() {
 	defer w.wg.Done()
 
 	for {
-		// Get the next group to process
-		w.mu.Lock()
-		if len(w.processingQueue) == 0 {
-			// No more groups to process
-			w.processing = false
-			w.mu.Unlock()
-
-			// If shutdown is in progress, log completion
-			if w.shutdownInProgress {
-				w.log.Debugf("Worker %d: Completed processing all groups during shutdown", w.id)
+		select {
+		case group, ok := <-w.processingQueue:
+			if !ok {
+				// Channel closed, shutdown worker
+				if w.shutdownInProgress {
+					w.log.Debugf("Worker %d: Completed processing all groups during shutdown", w.id)
+				}
+				return
 			}
+			// Process the group
+			w.processGroup(*group)
+		case <-w.ctx.Done():
 			return
 		}
-
-		// Get the first group from the queue
-		group := w.processingQueue[0]
-		w.processingQueue = w.processingQueue[1:]
-		w.mu.Unlock()
-
-		// Process the group
-		w.processGroup(*group)
 	}
 }
 
@@ -588,12 +565,25 @@ func (w *Worker) processGroup(group OperationGroup) {
 		issueTime := time.Now()
 		_, err := targetCollection.InsertMany(w.ctx, docs, options.InsertMany().SetOrdered(useOrdered))
 		if w.statsManager != nil {
-			w.statsManager.RecordLatency("insert", group.Operations, issueTime, time.Since(issueTime))
+			w.statsManager.RecordLatency("insert", group.Operations, issueTime, time.Since(issueTime), w.id)
 		}
 		if err != nil {
 			bulkWriteException, ok := err.(mongo.BulkWriteException)
-			if ok {
-				w.log.Errorf("[%s.%s] Bulk insert partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
+			if ok && w.ctx.Err() != context.Canceled {
+				// Check if all write errors are simply duplicate key errors (gracefully handled by upsert fallback)
+				hasRealErrors := false
+				// Check if it's a duplicate key error (code 11000)
+				for _, writeErr := range bulkWriteException.WriteErrors {
+					if writeErr.Code != 11000 {
+						hasRealErrors = true
+						break
+					}
+				}
+				if hasRealErrors {
+					w.log.Errorf("[%s.%s] Bulk insert partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
+				} else {
+					w.log.Debugf("[%s.%s] Bulk insert had %d duplicate key occurrences (gracefully falling back to upserts)", dbName, collName, len(bulkWriteException.WriteErrors))
+				}
 
 				// Process individual errors
 				for _, writeErr := range bulkWriteException.WriteErrors {
@@ -638,7 +628,7 @@ func (w *Worker) processGroup(group OperationGroup) {
 				}
 			} else {
 				// Handle non-bulk write errors (e.g., broken pipe, connection reset, deadline exceeded)
-				if err == context.Canceled {
+				if err == context.Canceled || w.ctx.Err() == context.Canceled {
 					w.log.Debugf("[%s.%s] Bulk insert canceled due to context cancellation", dbName, collName)
 				} else {
 					w.log.Errorf("[%s.%s] Error performing bulk insert: %v", dbName, collName, err)
@@ -741,11 +731,11 @@ func (w *Worker) processGroup(group OperationGroup) {
 		issueTime := time.Now()
 		_, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
 		if w.statsManager != nil {
-			w.statsManager.RecordLatency("update", group.Operations, issueTime, time.Since(issueTime))
+			w.statsManager.RecordLatency("update", group.Operations, issueTime, time.Since(issueTime), w.id)
 		}
 		if err != nil {
 			bulkWriteException, ok := err.(mongo.BulkWriteException)
-			if ok {
+			if ok && w.ctx.Err() != context.Canceled {
 				w.log.Errorf("[%s.%s] Bulk update partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
 
 				// Process individual errors
@@ -787,7 +777,7 @@ func (w *Worker) processGroup(group OperationGroup) {
 				}
 			} else {
 				// Handle non-bulk write errors
-				if err == context.Canceled {
+				if err == context.Canceled || w.ctx.Err() == context.Canceled {
 					w.log.Debugf("[%s.%s] Bulk update canceled due to context cancellation", dbName, collName)
 				} else {
 					w.log.Errorf("[%s.%s] Error performing bulk update: %v", dbName, collName, err)
@@ -867,11 +857,11 @@ func (w *Worker) processGroup(group OperationGroup) {
 		issueTime := time.Now()
 		_, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
 		if w.statsManager != nil {
-			w.statsManager.RecordLatency("delete", group.Operations, issueTime, time.Since(issueTime))
+			w.statsManager.RecordLatency("delete", group.Operations, issueTime, time.Since(issueTime), w.id)
 		}
 		if err != nil {
 			bulkWriteException, ok := err.(mongo.BulkWriteException)
-			if ok {
+			if ok && w.ctx.Err() != context.Canceled {
 				w.log.Errorf("[%s.%s] Bulk delete partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
 
 				// Process individual errors
@@ -899,7 +889,7 @@ func (w *Worker) processGroup(group OperationGroup) {
 				}
 			} else {
 				// Handle non-bulk write errors
-				if err == context.Canceled {
+				if err == context.Canceled || w.ctx.Err() == context.Canceled {
 					w.log.Debugf("[%s.%s] Bulk delete canceled due to context cancellation", dbName, collName)
 				} else {
 					w.log.Errorf("[%s.%s] Error performing bulk delete: %v", dbName, collName, err)
@@ -972,7 +962,7 @@ func (w *Worker) processGroup(group OperationGroup) {
 		issueTime := time.Now()
 		_, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
 		if w.statsManager != nil {
-			w.statsManager.RecordLatency("replace", group.Operations, issueTime, time.Since(issueTime))
+			w.statsManager.RecordLatency("replace", group.Operations, issueTime, time.Since(issueTime), w.id)
 		}
 		if err != nil {
 			bulkWriteException, ok := err.(mongo.BulkWriteException)
@@ -1094,6 +1084,7 @@ func (w *Worker) Shutdown() {
 		w.flushCurrentGroup()
 	}
 
+	close(w.processingQueue)
 	w.mu.Unlock()
 
 	// Wait for any ongoing processing to complete
