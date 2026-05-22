@@ -316,6 +316,20 @@ func TestStatsManagerLatencies(t *testing.T) {
 		t.Errorf("expected update bulkwrite latency 300ms, got %v", avgBulkOpUpdate)
 	}
 
+	// Test group flushes by reason metrics
+	if sm.GetGroupFlushReasonCount("optype") != 0 {
+		t.Errorf("expected initial optype flushes count to be 0, got %d", sm.GetGroupFlushReasonCount("optype"))
+	}
+	sm.IncrementGroupFlushReason("optype")
+	sm.IncrementGroupFlushReason("optype")
+	sm.IncrementGroupFlushReason("batchfull")
+	if sm.GetGroupFlushReasonCount("optype") != 2 {
+		t.Errorf("expected optype flushes count to be 2, got %d", sm.GetGroupFlushReasonCount("optype"))
+	}
+	if sm.GetGroupFlushReasonCount("batchfull") != 1 {
+		t.Errorf("expected batchfull flushes count to be 1, got %d", sm.GetGroupFlushReasonCount("batchfull"))
+	}
+
 	// Verify ReportStats resets them
 	sm.ReportStats()
 
@@ -324,6 +338,12 @@ func TestStatsManagerLatencies(t *testing.T) {
 	}
 	if sm.GetAvgBulkWriteLatency("insert") != 0 {
 		t.Errorf("expected avg insert bulkwrite latency to reset to 0, got %v", sm.GetAvgBulkWriteLatency("insert"))
+	}
+	if sm.GetGroupFlushReasonCount("optype") != 0 {
+		t.Errorf("expected optype flushes count to reset to 0, got %d", sm.GetGroupFlushReasonCount("optype"))
+	}
+	if sm.GetGroupFlushReasonCount("batchfull") != 0 {
+		t.Errorf("expected batchfull flushes count to reset to 0, got %d", sm.GetGroupFlushReasonCount("batchfull"))
 	}
 }
 

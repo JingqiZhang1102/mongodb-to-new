@@ -463,6 +463,17 @@ func (w *Worker) ProcessEvent(event bson.M) {
 		len(w.currentGroup.Operations) >= w.incrementalWriteBatchSize
 
 	if needNewGroup && w.currentGroup != nil {
+		if w.statsManager != nil {
+			// Determine the reason the group had to be flushed
+			if w.currentGroup.OpType != opType {
+				w.statsManager.IncrementGroupFlushReason("optype")
+			} else if len(w.currentGroup.Operations) >= w.incrementalWriteBatchSize {
+				w.statsManager.IncrementGroupFlushReason("batchfull")
+			} else if w.currentGroup.Namespace != namespace {
+				w.statsManager.IncrementGroupFlushReason("namespace")
+			}
+		}
+
 		// Add current group to processing queue
 		w.processingQueue = append(w.processingQueue, w.currentGroup)
 		w.currentGroup = nil
@@ -489,6 +500,9 @@ func (w *Worker) ProcessEvent(event bson.M) {
 
 	// If current group has reached max size, add it to the queue
 	if len(w.currentGroup.Operations) >= w.incrementalWriteBatchSize {
+		if w.statsManager != nil {
+			w.statsManager.IncrementGroupFlushReason("batchfull")
+		}
 		w.processingQueue = append(w.processingQueue, w.currentGroup)
 		w.currentGroup = nil
 

@@ -25,6 +25,7 @@ type StatsManager struct {
 	unorderedBulkWritesSizeSinceLastStats int
 	unorderedSizesHistogram             []int
 	timeoutFlushesSinceLastStats        int
+	groupFlushesByReason                map[string]int
 
 	// Maps for Received, Processed, and Failed counts by operationType string
 	receivedSinceLastStats  map[string]int
@@ -53,6 +54,7 @@ func NewStatsManager(log *logger.Logger, interval time.Duration) *StatsManager {
 		queueLatencyCount:      make(map[string]int64),
 		totalBulkWriteLatency:  make(map[string]time.Duration),
 		bulkWriteLatencyCount:  make(map[string]int64),
+		groupFlushesByReason:   make(map[string]int),
 	}
 }
 
@@ -259,6 +261,26 @@ func (sm *StatsManager) GetTimeoutFlushes() int {
 	return sm.timeoutFlushesSinceLastStats
 }
 
+// IncrementGroupFlushReason increments the count of group flushes by a specific reason thread-safely
+func (sm *StatsManager) IncrementGroupFlushReason(reason string) {
+	if sm == nil {
+		return
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.groupFlushesByReason[reason]++
+}
+
+// GetGroupFlushReasonCount returns the count of group flushes for a specific reason thread-safely
+func (sm *StatsManager) GetGroupFlushReasonCount(reason string) int {
+	if sm == nil {
+		return 0
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	return sm.groupFlushesByReason[reason]
+}
+
 // IncrementEventsReceived increments the count of received input events by operation type thread-safely
 func (sm *StatsManager) IncrementEventsReceived(opType string) {
 	if sm == nil {
@@ -306,6 +328,9 @@ func (sm *StatsManager) ReportStats() {
 	unorderedSize := sm.unorderedBulkWritesSizeSinceLastStats
 	unorderedSizes := sm.unorderedSizesHistogram
 	timeoutFlushes := sm.timeoutFlushesSinceLastStats
+	groupFlushesOpType := sm.groupFlushesByReason["optype"]
+	groupFlushesBatchFull := sm.groupFlushesByReason["batchfull"]
+	groupFlushesNamespace := sm.groupFlushesByReason["namespace"]
 	queueLatency := sm.totalQueueLatency
 	queueLatencyCount := sm.queueLatencyCount
 	bulkWriteLatency := sm.totalBulkWriteLatency
@@ -325,6 +350,7 @@ func (sm *StatsManager) ReportStats() {
 	sm.unorderedBulkWritesSizeSinceLastStats = 0
 	sm.unorderedSizesHistogram = make([]int, 4096)
 	sm.timeoutFlushesSinceLastStats = 0
+	sm.groupFlushesByReason = make(map[string]int)
 	sm.totalQueueLatency = make(map[string]time.Duration)
 	sm.queueLatencyCount = make(map[string]int64)
 	sm.totalBulkWriteLatency = make(map[string]time.Duration)
@@ -351,7 +377,7 @@ func (sm *StatsManager) ReportStats() {
 	var rateInsertsProcessed, rateUpdatesProcessed, rateDeletesProcessed float64
 	var rateInsertsFailed, rateUpdatesFailed, rateDeletesFailed float64
 	var rateSequentialRetries, rateOrderedWrites, rateUnorderedWrites float64
-	var rateTimeoutFlushes float64
+	var rateTimeoutFlushes, rateGroupFlushesOpType, rateGroupFlushesBatchFull, rateGroupFlushesNamespace float64
 
 	if duration.Seconds() > 0 {
 		rateReceived = float64(eventsReceived) / duration.Seconds()
@@ -362,6 +388,9 @@ func (sm *StatsManager) ReportStats() {
 		rateOrderedWrites = float64(orderedWrites) / duration.Seconds()
 		rateUnorderedWrites = float64(unorderedWrites) / duration.Seconds()
 		rateTimeoutFlushes = float64(timeoutFlushes) / duration.Seconds()
+		rateGroupFlushesOpType = float64(groupFlushesOpType) / duration.Seconds()
+		rateGroupFlushesBatchFull = float64(groupFlushesBatchFull) / duration.Seconds()
+		rateGroupFlushesNamespace = float64(groupFlushesNamespace) / duration.Seconds()
 
 		rateInsertsReceived = float64(insertsReceived) / duration.Seconds()
 		rateUpdatesReceived = float64(updatesReceived) / duration.Seconds()
@@ -412,11 +441,11 @@ func (sm *StatsManager) ReportStats() {
 	avgDeleteDb := getLatencyStr(bulkWriteLatency, bulkWriteLatencyCount, "delete")
 	avgReplaceDb := getLatencyStr(bulkWriteLatency, bulkWriteLatencyCount, "replace")
 
-	msg := fmt.Sprintf("Change stream statistics: Received %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], Processed %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], Failed %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], updateDocMissing %d (%.2f events/sec), Ordered BulkWrites %d (%.2f/sec)%s, Unordered BulkWrites %d (%.2f/sec)%s, Sequential Retries %d (%.2f/sec), Timeout Flushes %d (%.2f/sec)%s, Queue Latency [insert: %s, update: %s, delete: %s, replace: %s], BulkWrite Execution Latency [insert: %s, update: %s, delete: %s, replace: %s] in the last %v",
+	msg := fmt.Sprintf("Change stream statistics: Received %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], Processed %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], Failed %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], updateDocMissing %d (%.2f events/sec), Ordered BulkWrites %d (%.2f/sec)%s, Unordered BulkWrites %d (%.2f/sec)%s, Sequential Retries %d (%.2f/sec), Timeout Flushes %d (%.2f/sec)%s, Group Flushes [optype: %d (%.2f/sec), batchfull: %d (%.2f/sec), namespace: %d (%.2f/sec)], Queue Latency [insert: %s, update: %s, delete: %s, replace: %s], BulkWrite Execution Latency [insert: %s, update: %s, delete: %s, replace: %s] in the last %v",
 		eventsReceived, rateReceived, insertsReceived, rateInsertsReceived, updatesReceived, rateUpdatesReceived, deletesReceived, rateDeletesReceived,
 		eventsProcessed, rateProcessed, insertsProcessed, rateInsertsProcessed, updatesProcessed, rateUpdatesProcessed, deletesProcessed, rateDeletesProcessed,
 		eventsFailed, rateFailed, insertsFailed, rateInsertsFailed, updatesFailed, rateUpdatesFailed, deletesFailed, rateDeletesFailed,
-		updateDocMissing, rateUpdateDocMissing, orderedWrites, rateOrderedWrites, avgOrderedSizeStr, unorderedWrites, rateUnorderedWrites, avgUnorderedSizeStr, sequentialRetries, rateSequentialRetries, timeoutFlushes, rateTimeoutFlushes, avgLagStr, avgInsertQueue, avgUpdateQueue, avgDeleteQueue, avgReplaceQueue, avgInsertDb, avgUpdateDb, avgDeleteDb, avgReplaceDb, duration.Round(time.Second))
+		updateDocMissing, rateUpdateDocMissing, orderedWrites, rateOrderedWrites, avgOrderedSizeStr, unorderedWrites, rateUnorderedWrites, avgUnorderedSizeStr, sequentialRetries, rateSequentialRetries, timeoutFlushes, rateTimeoutFlushes, avgLagStr, groupFlushesOpType, rateGroupFlushesOpType, groupFlushesBatchFull, rateGroupFlushesBatchFull, groupFlushesNamespace, rateGroupFlushesNamespace, avgInsertQueue, avgUpdateQueue, avgDeleteQueue, avgReplaceQueue, avgInsertDb, avgUpdateDb, avgDeleteDb, avgReplaceDb, duration.Round(time.Second))
 
 	sm.log.Info(msg)
 }
