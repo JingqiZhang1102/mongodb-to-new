@@ -290,6 +290,7 @@ type WriteOperation struct {
 	Namespace         string
 	OpType            string
 	EventTime         time.Time
+	ReceiveTime       time.Time
 }
 
 // OperationGroup represents a group of operations of the same type and namespace
@@ -452,6 +453,7 @@ func (w *Worker) ProcessEvent(event bson.M) {
 		Namespace:         namespace,
 		OpType:            opType,
 		EventTime:         eventTime,
+		ReceiveTime:       time.Now(),
 	}
 
 	// Check if we need to create a new group
@@ -548,6 +550,10 @@ func (w *Worker) processGroup(group OperationGroup) {
 	// Determine if we should use ordered operations
 	useOrdered := group.OpType == "update" || group.OpType == "replace" || w.forceOrderedOperations
 
+	if w.statsManager != nil {
+		w.statsManager.RecordBulkWrite(len(group.Operations), useOrdered)
+	}
+
 	// Process based on operation type
 	switch group.OpType {
 	case "insert":
@@ -565,10 +571,12 @@ func (w *Worker) processGroup(group OperationGroup) {
 			docs = append(docs, transformed)
 		}
 
+		issueTime := time.Now()
+		_, err := targetCollection.InsertMany(w.ctx, docs, options.InsertMany().SetOrdered(useOrdered))
 		if w.statsManager != nil {
-			w.statsManager.RecordBulkWrite(len(docs), useOrdered)
+			w.statsManager.RecordLatency("insert", group.Operations, issueTime, time.Since(issueTime))
 		}
-		if _, err := targetCollection.InsertMany(w.ctx, docs, options.InsertMany().SetOrdered(useOrdered)); err != nil {
+		if err != nil {
 			bulkWriteException, ok := err.(mongo.BulkWriteException)
 			if ok {
 				w.log.Errorf("[%s.%s] Bulk insert partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
@@ -629,9 +637,6 @@ func (w *Worker) processGroup(group OperationGroup) {
 					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
 						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk insert with backoff...", dbName, collName)
 						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
-							if w.statsManager != nil {
-								w.statsManager.RecordBulkWrite(len(docs), useOrdered)
-							}
 							_, retryInsertErr := targetCollection.InsertMany(w.ctx, docs, options.InsertMany().SetOrdered(useOrdered))
 							return retryInsertErr
 						})
@@ -719,10 +724,12 @@ func (w *Worker) processGroup(group OperationGroup) {
 			}
 		}
 
+		issueTime := time.Now()
+		_, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
 		if w.statsManager != nil {
-			w.statsManager.RecordBulkWrite(len(models), useOrdered)
+			w.statsManager.RecordLatency("update", group.Operations, issueTime, time.Since(issueTime))
 		}
-		if _, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered)); err != nil {
+		if err != nil {
 			bulkWriteException, ok := err.(mongo.BulkWriteException)
 			if ok {
 				w.log.Errorf("[%s.%s] Bulk update partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
@@ -779,9 +786,6 @@ func (w *Worker) processGroup(group OperationGroup) {
 					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
 						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk update with backoff...", dbName, collName)
 						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
-							if w.statsManager != nil {
-								w.statsManager.RecordBulkWrite(len(models), useOrdered)
-							}
 							_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
 							return retryBulkErr
 						})
@@ -846,10 +850,12 @@ func (w *Worker) processGroup(group OperationGroup) {
 			models = append(models, model)
 		}
 
+		issueTime := time.Now()
+		_, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
 		if w.statsManager != nil {
-			w.statsManager.RecordBulkWrite(len(models), useOrdered)
+			w.statsManager.RecordLatency("delete", group.Operations, issueTime, time.Since(issueTime))
 		}
-		if _, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered)); err != nil {
+		if err != nil {
 			bulkWriteException, ok := err.(mongo.BulkWriteException)
 			if ok {
 				w.log.Errorf("[%s.%s] Bulk delete partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
@@ -892,9 +898,6 @@ func (w *Worker) processGroup(group OperationGroup) {
 					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
 						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk delete with backoff...", dbName, collName)
 						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
-							if w.statsManager != nil {
-								w.statsManager.RecordBulkWrite(len(models), useOrdered)
-							}
 							_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
 							return retryBulkErr
 						})
@@ -952,10 +955,12 @@ func (w *Worker) processGroup(group OperationGroup) {
 			models = append(models, model)
 		}
 
+		issueTime := time.Now()
+		_, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
 		if w.statsManager != nil {
-			w.statsManager.RecordBulkWrite(len(models), useOrdered)
+			w.statsManager.RecordLatency("replace", group.Operations, issueTime, time.Since(issueTime))
 		}
-		if _, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered)); err != nil {
+		if err != nil {
 			bulkWriteException, ok := err.(mongo.BulkWriteException)
 			if ok {
 				w.log.Errorf("[%s.%s] Bulk replace partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
@@ -998,9 +1003,6 @@ func (w *Worker) processGroup(group OperationGroup) {
 					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
 						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk replace with backoff...", dbName, collName)
 						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
-							if w.statsManager != nil {
-								w.statsManager.RecordBulkWrite(len(models), useOrdered)
-							}
 							_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
 							return retryBulkErr
 						})

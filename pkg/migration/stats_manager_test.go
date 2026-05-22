@@ -268,3 +268,62 @@ func TestStatsManagerMetrics(t *testing.T) {
 		t.Errorf("expected failed counters to reset to 0")
 	}
 }
+
+func TestStatsManagerLatencies(t *testing.T) {
+	log := logger.New()
+	sm := NewStatsManager(log, 5*time.Minute)
+
+	// Test RecordLatency for insert
+	now := time.Now()
+	ops1 := []WriteOperation{
+		{ReceiveTime: now.Add(-100 * time.Millisecond)},
+		{ReceiveTime: now.Add(-50 * time.Millisecond)}, // This is newer, so -100ms is the oldest (largest delay)
+	}
+	ops2 := []WriteOperation{
+		{ReceiveTime: now.Add(-200 * time.Millisecond)},
+		{ReceiveTime: now.Add(-150 * time.Millisecond)}, // This is newer, so -200ms is the oldest (largest delay)
+	}
+
+	sm.RecordLatency("insert", ops1, now, 50*time.Millisecond)
+	sm.RecordLatency("insert", ops2, now, 150*time.Millisecond)
+
+	avgQueueInsert := sm.GetAvgQueueLatency("insert")
+	// Expected average of max queue latencies: (100ms + 200ms) / 2 = 150ms
+	if avgQueueInsert < 140*time.Millisecond || avgQueueInsert > 160*time.Millisecond {
+		t.Errorf("expected average queue latency around 150ms, got %v", avgQueueInsert)
+	}
+
+	avgBulkOpInsert := sm.GetAvgBulkWriteLatency("insert")
+	// Expected average bulk op latency: (50ms + 150ms) / 2 = 100ms
+	if avgBulkOpInsert < 90*time.Millisecond || avgBulkOpInsert > 110*time.Millisecond {
+		t.Errorf("expected average insert bulkwrite latency around 100ms, got %v", avgBulkOpInsert)
+	}
+
+	// Test RecordLatency for update
+	ops3 := []WriteOperation{
+		{ReceiveTime: now.Add(-400 * time.Millisecond)},
+	}
+	sm.RecordLatency("update", ops3, now, 300*time.Millisecond)
+
+	avgQueueUpdate := sm.GetAvgQueueLatency("update")
+	// Expected average queue latency: 400ms / 1 = 400ms
+	if avgQueueUpdate != 400*time.Millisecond {
+		t.Errorf("expected update queue latency 400ms, got %v", avgQueueUpdate)
+	}
+
+	avgBulkOpUpdate := sm.GetAvgBulkWriteLatency("update")
+	if avgBulkOpUpdate != 300*time.Millisecond {
+		t.Errorf("expected update bulkwrite latency 300ms, got %v", avgBulkOpUpdate)
+	}
+
+	// Verify ReportStats resets them
+	sm.ReportStats()
+
+	if sm.GetAvgQueueLatency("insert") != 0 {
+		t.Errorf("expected avg queue latency to reset to 0, got %v", sm.GetAvgQueueLatency("insert"))
+	}
+	if sm.GetAvgBulkWriteLatency("insert") != 0 {
+		t.Errorf("expected avg insert bulkwrite latency to reset to 0, got %v", sm.GetAvgBulkWriteLatency("insert"))
+	}
+}
+

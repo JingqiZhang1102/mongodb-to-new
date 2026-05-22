@@ -30,6 +30,11 @@ type StatsManager struct {
 	receivedSinceLastStats  map[string]int
 	processedSinceLastStats map[string]int
 	failedSinceLastStats    map[string]int
+
+	totalQueueLatency     map[string]time.Duration
+	queueLatencyCount     map[string]int64
+	totalBulkWriteLatency map[string]time.Duration
+	bulkWriteLatencyCount map[string]int64
 }
 
 // NewStatsManager creates a new StatsManager
@@ -44,6 +49,10 @@ func NewStatsManager(log *logger.Logger, interval time.Duration) *StatsManager {
 		failedSinceLastStats:    make(map[string]int),
 		orderedSizesHistogram:   make([]int, 4096),
 		unorderedSizesHistogram: make([]int, 4096),
+		totalQueueLatency:      make(map[string]time.Duration),
+		queueLatencyCount:      make(map[string]int64),
+		totalBulkWriteLatency:  make(map[string]time.Duration),
+		bulkWriteLatencyCount:  make(map[string]int64),
 	}
 }
 
@@ -175,6 +184,61 @@ func (sm *StatsManager) RecordBulkWrite(size int, isOrdered bool) {
 	}
 }
 
+// RecordLatency records both queue buffering and bulk write execution latency by operation type thread-safely
+func (sm *StatsManager) RecordLatency(opType string, ops []WriteOperation, issueTime time.Time, bulkOpLatency time.Duration) {
+	if sm == nil {
+		return
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	var oldestReceiveTime time.Time
+	for _, op := range ops {
+		if op.ReceiveTime.IsZero() {
+			continue
+		}
+		if oldestReceiveTime.IsZero() || op.ReceiveTime.Before(oldestReceiveTime) {
+			oldestReceiveTime = op.ReceiveTime
+		}
+	}
+
+	if !oldestReceiveTime.IsZero() {
+		sm.totalQueueLatency[opType] += issueTime.Sub(oldestReceiveTime)
+		sm.queueLatencyCount[opType]++
+	}
+
+	sm.totalBulkWriteLatency[opType] += bulkOpLatency
+	sm.bulkWriteLatencyCount[opType]++
+}
+
+// GetAvgQueueLatency returns the average queue buffering latency for a specific operation type thread-safely
+func (sm *StatsManager) GetAvgQueueLatency(opType string) time.Duration {
+	if sm == nil {
+		return 0
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	count := sm.queueLatencyCount[opType]
+	if count == 0 {
+		return 0
+	}
+	return sm.totalQueueLatency[opType] / time.Duration(count)
+}
+
+// GetAvgBulkWriteLatency returns the average bulk write execution latency for a specific operation type thread-safely
+func (sm *StatsManager) GetAvgBulkWriteLatency(opType string) time.Duration {
+	if sm == nil {
+		return 0
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	count := sm.bulkWriteLatencyCount[opType]
+	if count == 0 {
+		return 0
+	}
+	return sm.totalBulkWriteLatency[opType] / time.Duration(count)
+}
+
 // IncrementTimeoutFlushes increments the count of timeout flushes thread-safely
 func (sm *StatsManager) IncrementTimeoutFlushes() {
 	if sm == nil {
@@ -242,6 +306,10 @@ func (sm *StatsManager) ReportStats() {
 	unorderedSize := sm.unorderedBulkWritesSizeSinceLastStats
 	unorderedSizes := sm.unorderedSizesHistogram
 	timeoutFlushes := sm.timeoutFlushesSinceLastStats
+	queueLatency := sm.totalQueueLatency
+	queueLatencyCount := sm.queueLatencyCount
+	bulkWriteLatency := sm.totalBulkWriteLatency
+	bulkWriteLatencyCount := sm.bulkWriteLatencyCount
 
 	duration := time.Since(sm.lastStatsTime)
 
@@ -257,6 +325,10 @@ func (sm *StatsManager) ReportStats() {
 	sm.unorderedBulkWritesSizeSinceLastStats = 0
 	sm.unorderedSizesHistogram = make([]int, 4096)
 	sm.timeoutFlushesSinceLastStats = 0
+	sm.totalQueueLatency = make(map[string]time.Duration)
+	sm.queueLatencyCount = make(map[string]int64)
+	sm.totalBulkWriteLatency = make(map[string]time.Duration)
+	sm.bulkWriteLatencyCount = make(map[string]int64)
 	sm.lastStatsTime = time.Now()
 
 	var totalLag time.Duration
@@ -320,11 +392,31 @@ func (sm *StatsManager) ReportStats() {
 		avgUnorderedSizeStr = ", avg unordered bulk size: N/A"
 	}
 
-	msg := fmt.Sprintf("Change stream statistics: Received %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], Processed %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], Failed %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], updateDocMissing %d (%.2f events/sec), Ordered BulkWrites %d (%.2f/sec)%s, Unordered BulkWrites %d (%.2f/sec)%s, Sequential Retries %d (%.2f/sec), Timeout Flushes %d (%.2f/sec)%s in the last %v",
+	getLatencyStr := func(latencyMap map[string]time.Duration, countMap map[string]int64, opType string) string {
+		total := latencyMap[opType]
+		count := countMap[opType]
+		if count > 0 {
+			avg := total / time.Duration(count)
+			return avg.Round(time.Millisecond).String()
+		}
+		return "N/A"
+	}
+
+	avgInsertQueue := getLatencyStr(queueLatency, queueLatencyCount, "insert")
+	avgUpdateQueue := getLatencyStr(queueLatency, queueLatencyCount, "update")
+	avgDeleteQueue := getLatencyStr(queueLatency, queueLatencyCount, "delete")
+	avgReplaceQueue := getLatencyStr(queueLatency, queueLatencyCount, "replace")
+
+	avgInsertDb := getLatencyStr(bulkWriteLatency, bulkWriteLatencyCount, "insert")
+	avgUpdateDb := getLatencyStr(bulkWriteLatency, bulkWriteLatencyCount, "update")
+	avgDeleteDb := getLatencyStr(bulkWriteLatency, bulkWriteLatencyCount, "delete")
+	avgReplaceDb := getLatencyStr(bulkWriteLatency, bulkWriteLatencyCount, "replace")
+
+	msg := fmt.Sprintf("Change stream statistics: Received %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], Processed %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], Failed %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)], updateDocMissing %d (%.2f events/sec), Ordered BulkWrites %d (%.2f/sec)%s, Unordered BulkWrites %d (%.2f/sec)%s, Sequential Retries %d (%.2f/sec), Timeout Flushes %d (%.2f/sec)%s, Queue Latency [insert: %s, update: %s, delete: %s, replace: %s], BulkWrite Execution Latency [insert: %s, update: %s, delete: %s, replace: %s] in the last %v",
 		eventsReceived, rateReceived, insertsReceived, rateInsertsReceived, updatesReceived, rateUpdatesReceived, deletesReceived, rateDeletesReceived,
 		eventsProcessed, rateProcessed, insertsProcessed, rateInsertsProcessed, updatesProcessed, rateUpdatesProcessed, deletesProcessed, rateDeletesProcessed,
 		eventsFailed, rateFailed, insertsFailed, rateInsertsFailed, updatesFailed, rateUpdatesFailed, deletesFailed, rateDeletesFailed,
-		updateDocMissing, rateUpdateDocMissing, orderedWrites, rateOrderedWrites, avgOrderedSizeStr, unorderedWrites, rateUnorderedWrites, avgUnorderedSizeStr, sequentialRetries, rateSequentialRetries, timeoutFlushes, rateTimeoutFlushes, avgLagStr, duration.Round(time.Second))
+		updateDocMissing, rateUpdateDocMissing, orderedWrites, rateOrderedWrites, avgOrderedSizeStr, unorderedWrites, rateUnorderedWrites, avgUnorderedSizeStr, sequentialRetries, rateSequentialRetries, timeoutFlushes, rateTimeoutFlushes, avgLagStr, avgInsertQueue, avgUpdateQueue, avgDeleteQueue, avgReplaceQueue, avgInsertDb, avgUpdateDb, avgDeleteDb, avgReplaceDb, duration.Round(time.Second))
 
 	sm.log.Info(msg)
 }
