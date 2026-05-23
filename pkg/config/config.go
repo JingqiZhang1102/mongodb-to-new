@@ -32,6 +32,8 @@ type Config struct {
 	IncrementalWorkerCount    int `json:"incrementalWorkerCount"`    // Number of worker goroutines
 	StatsIntervalMinutes      int `json:"statsIntervalMinutes"`      // Interval for reporting change stream statistics in minutes
 	GroupOpsByDistinctId      bool `json:"groupOpsByDistinctId"`      // Enable key-collision grouping instead of optype grouping
+	IncrementalIncomingQueueSize  int `json:"incrementalIncomingQueueSize"`  // Buffer size of workers' raw events queue
+	IncrementalProcessingQueueSize int `json:"incrementalProcessingQueueSize"` // Buffer size of workers' writing batches queue
 
 	// Parallel read configuration for large collections
 	ParallelReadsEnabled    bool `json:"parallelReadsEnabled"`    // Enable parallel reads for large collections
@@ -138,6 +140,14 @@ func LoadConfig(configPath string) (*Config, error) {
 
 	if config.IncrementalWorkerCount <= 0 {
 		config.IncrementalWorkerCount = runtime.NumCPU() // Default to number of CPU cores
+	}
+
+	if config.IncrementalIncomingQueueSize <= 0 {
+		config.IncrementalIncomingQueueSize = 8192 // Default to 8192 change events
+	}
+
+	if config.IncrementalProcessingQueueSize <= 0 {
+		config.IncrementalProcessingQueueSize = 4096 // Default to 4096 groups
 	}
 
 	if config.StatsIntervalMinutes <= 0 {

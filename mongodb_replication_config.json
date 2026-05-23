@@ -38,6 +38,8 @@
   "incrementalWriteBatchSize": 256,
   "incrementalWorkerCount": 32,
   "groupOpsByDistinctId": true,
+  "incrementalIncomingQueueSize": 8192,
+  "incrementalProcessingQueueSize": 2,
   "statsIntervalMinutes": 1,
   
   "parallelReadsEnabled": true,

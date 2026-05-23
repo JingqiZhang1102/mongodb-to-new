@@ -27,6 +27,8 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndDescription(t *testing.T
 		nil,                                 // statsManager
 		false,                               // groupOpsByDistinctID
 		5*time.Minute,                       // flushInterval
+		8192,                                // incomingQueueSize
+		2,                                   // processingQueueSize
 	)
 
 	// Create an update event where both fullDocument and updateDescription are nil/null
@@ -92,6 +94,8 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndStatsManager(t *testing.
 		statsMgr,                            // statsManager
 		false,                               // groupOpsByDistinctID
 		5*time.Minute,                       // flushInterval
+		8192,                                // incomingQueueSize
+		2,                                   // processingQueueSize
 	)
 
 	// Create an update event where fullDocument is nil

@@ -142,7 +142,7 @@ func (d *EventDistributor) Start() error {
 
 	// Initialize workers with retry manager and stats manager
 	for i := 0; i < d.incrementalWorkerCount; i++ {
-		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.statsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval)
+		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.statsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval, d.cfg.IncrementalIncomingQueueSize, d.cfg.IncrementalProcessingQueueSize)
 	}
 
 	// Set up context cancellation handling
@@ -377,7 +377,8 @@ func (s *statsTrackingDLQ) Close() {
 // NewWorker creates a new worker
 func NewWorker(id int, ctx context.Context, log *logger.Logger,
 	targetDB *db.MongoDB, collectionMap map[string]map[string]string,
-	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager, statsManager *StatsManager, groupOpsByDistinctId bool, flushInterval time.Duration) *Worker {
+	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager, statsManager *StatsManager, groupOpsByDistinctId bool, flushInterval time.Duration,
+	incomingQueueSize int, processingQueueSize int) *Worker {
 
 	var workerDLQ DLQ = dlq
 	if dlq != nil && statsManager != nil {
@@ -393,8 +394,8 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 		log:                       log,
 		targetDB:                  targetDB,
 		collectionMap:             collectionMap,
-		incomingQueue:             make(chan interface{}, 8192),
-		processingQueue:           make(chan *OperationGroup, 4096),
+		incomingQueue:             make(chan interface{}, incomingQueueSize),
+		processingQueue:           make(chan *OperationGroup, processingQueueSize),
 		incrementalWriteBatchSize: incrementalWriteBatchSize,
 		forceOrderedOperations:    forceOrderedOperations,
 		dlq:                       workerDLQ,
