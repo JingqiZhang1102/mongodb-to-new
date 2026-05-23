@@ -24,10 +24,7 @@ type MongoDB struct {
 }
 
 // NewMongoDB creates a new MongoDB connection with pool size and idle timeouts configured dynamically
-func NewMongoDB(connectionString, databaseName string, maxWorkers int, maxConnIdleTime time.Duration, log *logger.Logger) (*MongoDB, error) {
-	minPoolSize := uint64(maxWorkers)
-	maxPoolSize := uint64(maxWorkers * 2)
-
+func NewMongoDB(connectionString, databaseName string, minPoolSize, maxPoolSize uint64, maxConnIdleTime time.Duration, log *logger.Logger) (*MongoDB, error) {
 	// Set client options
 	clientOptions := options.Client().
 		ApplyURI(connectionString).

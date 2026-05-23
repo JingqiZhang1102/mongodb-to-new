@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -52,6 +54,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
+
+	// Display and log the loaded configuration with sensitive values masked
+	log.Infof("Active Configuration:\n%s", getSanitizedConfigJSON(cfg))
+
+
 
 	// Validate mode
 	if *mode != "migrate" && *mode != "live" && *mode != "live-only" {
@@ -181,4 +188,58 @@ func parseStartTimestamp(s string) (*primitive.Timestamp, error) {
 		return nil, fmt.Errorf("invalid timestamp format, must be Unix epoch seconds or RFC3339 (e.g. 2026-05-20T21:00:00Z): %w", err)
 	}
 	return &primitive.Timestamp{T: uint32(t.Unix()), I: 1}, nil
+}
+
+// sanitizeConnectionString masks sensitive user credentials in MongoDB URIs.
+func sanitizeConnectionString(uri string) string {
+	if uri == "" {
+		return ""
+	}
+	var prefix string
+	if strings.HasPrefix(uri, "mongodb://") {
+		prefix = "mongodb://"
+	} else if strings.HasPrefix(uri, "mongodb+srv://") {
+		prefix = "mongodb+srv://"
+	} else {
+		return uri
+	}
+
+	remaining := uri[len(prefix):]
+	atIndex := strings.LastIndex(remaining, "@")
+	if atIndex == -1 {
+		return uri
+	}
+
+	credentials := remaining[:atIndex]
+	hostAndParams := remaining[atIndex:]
+
+	colonIndex := strings.Index(credentials, ":")
+	if colonIndex == -1 {
+		return prefix + credentials + hostAndParams
+	}
+
+	username := credentials[:colonIndex]
+	return prefix + username + ":*****" + hostAndParams
+}
+
+// getSanitizedConfigJSON generates an indented JSON string representation of Config with credentials masked.
+func getSanitizedConfigJSON(cfg *config.Config) string {
+	if cfg == nil {
+		return "{}"
+	}
+
+	sanitizedCfg := *cfg
+	sanitizedCfg.DatabasePairs = make([]config.DatabasePair, len(cfg.DatabasePairs))
+	for i, pair := range cfg.DatabasePairs {
+		sanitizedPair := pair
+		sanitizedPair.Source.ConnectionString = sanitizeConnectionString(pair.Source.ConnectionString)
+		sanitizedPair.Target.ConnectionString = sanitizeConnectionString(pair.Target.ConnectionString)
+		sanitizedCfg.DatabasePairs[i] = sanitizedPair
+	}
+
+	data, err := json.MarshalIndent(sanitizedCfg, "", "  ")
+	if err != nil {
+		return fmt.Sprintf("error marshalling config: %v", err)
+	}
+	return string(data)
 }

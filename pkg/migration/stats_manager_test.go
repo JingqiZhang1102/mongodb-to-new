@@ -147,7 +147,7 @@ func TestStatsManagerMetrics(t *testing.T) {
 	sm := NewStatsManager(log, 5*time.Minute)
 
 	// Test single increment for all three
-	sm.IncrementUpdateDocMissing()
+	sm.IncrementUpdatedThenDeleted(0)
 	sm.IncrementEventsReceived("insert")
 	sm.IncrementEventsFailed("insert")
 	sm.IncrementSequentialRetries(3)
@@ -155,9 +155,7 @@ func TestStatsManagerMetrics(t *testing.T) {
 	sm.RecordBulkWrite(10, false)
 	sm.IncrementTimeoutFlushes()
 
-	sm.mu.Lock()
-	missingCount := sm.updateDocMissingSinceLastStats
-	sm.mu.Unlock()
+	missingCount := sm.GetUpdatedThenDeleted()
 	inputCount := sm.GetReceivedCount("insert")
 	failedCount := sm.GetFailedCount("insert")
 	seqRetriesCount := sm.GetSequentialRetries()
@@ -168,7 +166,7 @@ func TestStatsManagerMetrics(t *testing.T) {
 	timeoutFlushesCount := sm.GetTimeoutFlushes()
 
 	if missingCount != 1 {
-		t.Errorf("expected updateDocMissingSinceLastStats 1, got %d", missingCount)
+		t.Errorf("expected updatedThenDeletedSinceLastStats 1, got %d", missingCount)
 	}
 	if inputCount != 1 {
 		t.Errorf("expected insertsReceivedSinceLastStats 1, got %d", inputCount)
@@ -204,7 +202,7 @@ func TestStatsManagerMetrics(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
-				sm.IncrementUpdateDocMissing()
+				sm.IncrementUpdatedThenDeleted(0)
 				sm.IncrementEventsReceived("insert")
 				sm.IncrementEventsFailed("insert")
 			}
@@ -212,15 +210,13 @@ func TestStatsManagerMetrics(t *testing.T) {
 	}
 	wg.Wait()
 
-	sm.mu.Lock()
-	missingCount = sm.updateDocMissingSinceLastStats
-	sm.mu.Unlock()
+	missingCount = sm.GetUpdatedThenDeleted()
 	inputCount = sm.GetReceivedCount("insert")
 	failedCount = sm.GetFailedCount("insert")
 
 	expectedCount := 1 + workersCount*iterations
 	if missingCount != expectedCount {
-		t.Errorf("expected updateDocMissingSinceLastStats %d, got %d", expectedCount, missingCount)
+		t.Errorf("expected updatedThenDeletedSinceLastStats %d, got %d", expectedCount, missingCount)
 	}
 	if inputCount != expectedCount {
 		t.Errorf("expected insertsReceivedSinceLastStats %d, got %d", expectedCount, inputCount)
@@ -233,12 +229,10 @@ func TestStatsManagerMetrics(t *testing.T) {
 	sm.ReportStats()
 
 	// Counters should reset after ReportStats
-	sm.mu.Lock()
-	missingCountAfter := sm.updateDocMissingSinceLastStats
-	sm.mu.Unlock()
+	missingCountAfter := sm.GetUpdatedThenDeleted()
 
 	if missingCountAfter != 0 {
-		t.Errorf("expected updateDocMissingSinceLastStats to reset to 0, got %d", missingCountAfter)
+		t.Errorf("expected updatedThenDeletedSinceLastStats to reset to 0, got %d", missingCountAfter)
 	}
 	if sm.GetSequentialRetries() != 0 {
 		t.Errorf("expected sequential retries to reset to 0, got %d", sm.GetSequentialRetries())
@@ -345,5 +339,37 @@ func TestStatsManagerLatencies(t *testing.T) {
 	if sm.GetGroupFlushReasonCount("batchfull") != 0 {
 		t.Errorf("expected batchfull flushes count to reset to 0, got %d", sm.GetGroupFlushReasonCount("batchfull"))
 	}
+}
+
+// BenchmarkStatsManagerRecordLatency measures stats gathering hot-path latency under high concurrent load
+func BenchmarkStatsManagerRecordLatency(b *testing.B) {
+	log := logger.New()
+	log.SetLevel("error")
+	sm := NewStatsManager(log, 5*time.Minute)
+	now := time.Now()
+	ops := []WriteOperation{{ReceiveTime: now.Add(-10 * time.Millisecond), OpType: "mixed"}}
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			sm.RecordLatency("mixed", ops, now, 5*time.Millisecond, i%8)
+			i++
+		}
+	})
+}
+
+// BenchmarkStatsManagerIncrementReceived measures simple counter increment performance under high concurrent load
+func BenchmarkStatsManagerIncrementReceived(b *testing.B) {
+	log := logger.New()
+	log.SetLevel("error")
+	sm := NewStatsManager(log, 5*time.Minute)
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			sm.IncrementEventsReceived("insert")
+		}
+	})
 }
 

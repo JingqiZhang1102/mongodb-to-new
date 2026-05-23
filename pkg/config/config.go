@@ -16,6 +16,8 @@ type Config struct {
 	ForceOrderedOperations bool           `json:"forceOrderedOperations"` // Force ordered operations for all types
 	FlushIntervalMs        int            `json:"flushIntervalMs"`        // Flush interval in milliseconds
 	TargetMaxConnIdleSeconds int            `json:"targetMaxConnIdleSeconds"` // Maximum connection idle time for target in seconds
+	TargetMinPoolSize        int            `json:"targetMinPoolSize"`        // Minimum connection pool size for target
+	TargetMaxPoolSize        int            `json:"targetMaxPoolSize"`        // Maximum connection pool size for target
 
 	// Parameters for initial migration
 	InitialReadBatchSize     int `json:"initialReadBatchSize"`     // Number of documents to read in a batch during initial migration
@@ -29,6 +31,7 @@ type Config struct {
 	IncrementalWriteBatchSize int `json:"incrementalWriteBatchSize"` // Maximum size of operation groups
 	IncrementalWorkerCount    int `json:"incrementalWorkerCount"`    // Number of worker goroutines
 	StatsIntervalMinutes      int `json:"statsIntervalMinutes"`      // Interval for reporting change stream statistics in minutes
+	GroupOpsByDistinctId      bool `json:"groupOpsByDistinctId"`      // Enable key-collision grouping instead of optype grouping
 
 	// Parallel read configuration for large collections
 	ParallelReadsEnabled    bool `json:"parallelReadsEnabled"`    // Enable parallel reads for large collections
@@ -146,9 +149,18 @@ func LoadConfig(configPath string) (*Config, error) {
 		config.FlushIntervalMs = 500 // Default to 500 milliseconds
 	}
 
-	// Set default target connection idle time in seconds if not provided
-	if config.TargetMaxConnIdleSeconds <= 0 {
-		config.TargetMaxConnIdleSeconds = 30 // Default to 30 seconds
+
+
+	// Set default min and max pool size if not provided
+	if config.TargetMinPoolSize <= 0 {
+		config.TargetMinPoolSize = 128
+	}
+	if config.TargetMaxPoolSize <= 0 {
+		config.TargetMaxPoolSize = 256
+	}
+	// Ensure max pool size is >= min pool size
+	if config.TargetMaxPoolSize < config.TargetMinPoolSize {
+		config.TargetMaxPoolSize = config.TargetMinPoolSize
 	}
 
 	// Set default values for initial migration parameters

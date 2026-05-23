@@ -165,7 +165,10 @@ If you want to migrate only specific collections or rename collections during mi
 - **incrementalWriteBatchSize**: Maximum size of operation groups (default: 128).
 - **incrementalWorkerCount**: Number of worker goroutines for incremental replication (default: number of CPU cores).
 - **statsIntervalMinutes**: Interval for reporting change stream statistics in minutes (default: 5).
+- **groupOpsByDistinctId**: Enable key-collision grouping in live replication instead of optype-based grouping (default: false).
 - **flushIntervalMs**: Flush interval in milliseconds for operation groups (default: 500).
+- **targetMinPoolSize**: Minimum MongoDB connection pool size for target database (default: 128).
+- **targetMaxPoolSize**: Maximum MongoDB connection pool size for target database (default: 256).
 - **forceOrderedOperations**: Whether to force ordered operations for all operation types (default: false). When false, insert and delete operations use unordered bulk writes for better performance, while update and replace operations always use ordered bulk writes to ensure consistency.
 
 #### Parallel Reads Configuration

@@ -747,7 +747,7 @@ func (r *OplogReplicator) tailOplog(ctx context.Context, afterTimestamp primitiv
 	r.log.Infof("Starting parallel oplog processing with %d workers", r.config.IncrementalWorkerCount)
 	workers := make([]*Worker, r.config.IncrementalWorkerCount)
 	for i := 0; i < r.config.IncrementalWorkerCount; i++ {
-		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionMap, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager, nil)
+		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionMap, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager, nil, r.config.GroupOpsByDistinctId)
 	}
 
 	// Set up context cancellation handling for workers

@@ -24,6 +24,7 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndDescription(t *testing.T
 		nil,                                 // dlq
 		nil,                                 // retryManager
 		nil,                                 // statsManager
+		false,                               // groupOpsByDistinctID
 	)
 
 	// Create an update event where both fullDocument and updateDescription are nil/null
@@ -87,6 +88,7 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndStatsManager(t *testing.
 		nil,                                 // dlq
 		nil,                                 // retryManager
 		statsMgr,                            // statsManager
+		false,                               // groupOpsByDistinctID
 	)
 
 	// Create an update event where fullDocument is nil
@@ -113,7 +115,7 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndStatsManager(t *testing.
 
 	// Verify that "update-doc-missing" metric was incremented
 	statsMgr.mu.Lock()
-	count := statsMgr.updateDocMissingSinceLastStats
+	count := statsMgr.updatedThenDeletedSinceLastStats
 	statsMgr.mu.Unlock()
 
 	if count != 1 {

@@ -38,6 +38,7 @@ type EventDistributor struct {
 
 	// Statistics tracking
 	statsManager *StatsManager // Manager for statistics and replication lag
+	cfg          *config.Config
 }
 
 // NewEventDistributor creates a new event distributor
@@ -71,6 +72,7 @@ func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 		flushInterval:             flushInterval,
 		dlq:                       dlq,
 		retryManager:              retryMgr,
+		cfg:                       cfg,
 
 		// Initialize statistics tracking
 		statsManager: NewStatsManager(log, statsInterval),
@@ -131,6 +133,8 @@ func (d *EventDistributor) waitForWorkersToFinish() {
 
 // Start begins the event distribution process
 func (d *EventDistributor) Start() error {
+	d.log.Infof("Starting event distributor with %d workers (GroupOpsByDistinctId: %t)", d.incrementalWorkerCount, d.cfg.GroupOpsByDistinctId)
+
 	// Start the statistics manager periodic reporting
 	if d.statsManager != nil {
 		d.statsManager.Start(d.ctx)
@@ -138,7 +142,7 @@ func (d *EventDistributor) Start() error {
 
 	// Initialize workers with retry manager and stats manager
 	for i := 0; i < d.incrementalWorkerCount; i++ {
-		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.statsManager)
+		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.statsManager, d.cfg.GroupOpsByDistinctId)
 	}
 
 	// Set up context cancellation handling
@@ -336,6 +340,10 @@ type Worker struct {
 
 	// Flag to indicate if shutdown is in progress
 	shutdownInProgress bool
+
+	// Dynamic grouping configurations
+	groupOpsByDistinctId bool
+	currentGroupIDs     map[int]bool
 }
 
 // flushCurrentGroup moves the current group to the processing queue if it exists
@@ -376,7 +384,7 @@ func (s *statsTrackingDLQ) Close() {
 // NewWorker creates a new worker
 func NewWorker(id int, ctx context.Context, log *logger.Logger,
 	targetDB *db.MongoDB, collectionMap map[string]map[string]string,
-	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager, statsManager *StatsManager) *Worker {
+	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager, statsManager *StatsManager, groupOpsByDistinctId bool) *Worker {
 
 	var workerDLQ DLQ = dlq
 	if dlq != nil && statsManager != nil {
@@ -398,6 +406,8 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 		dlq:                       workerDLQ,
 		retryManager:              retryManager,
 		statsManager:              statsManager,
+		groupOpsByDistinctId:      groupOpsByDistinctId,
+		currentGroupIDs:           make(map[int]bool),
 	}
 
 	// Statically spawn the worker thread at startup
@@ -427,7 +437,7 @@ func (w *Worker) ProcessEvent(event bson.M) {
 
 	// If this is an update operation in the change stream path and fullDocument is nil, skip it and record metric
 	if opType == "update" && fullDocument == nil && w.statsManager != nil {
-		w.statsManager.IncrementUpdateDocMissing()
+		w.statsManager.IncrementUpdatedThenDeleted(w.id)
 		return
 	}
 
@@ -452,40 +462,60 @@ func (w *Worker) ProcessEvent(event bson.M) {
 		ReceiveTime:       time.Now(),
 	}
 
+	docHash := hashDocumentID(docID)
+
 	// Check if we need to create a new group
-	needNewGroup := w.currentGroup == nil ||
-		w.currentGroup.OpType != opType ||
-		w.currentGroup.Namespace != namespace ||
-		len(w.currentGroup.Operations) >= w.incrementalWriteBatchSize
+	var needNewGroup bool
+	if w.groupOpsByDistinctId {
+		needNewGroup = w.currentGroup == nil ||
+			w.currentGroup.Namespace != namespace ||
+			len(w.currentGroup.Operations) >= w.incrementalWriteBatchSize ||
+			w.currentGroupIDs[docHash]
+	} else {
+		needNewGroup = w.currentGroup == nil ||
+			w.currentGroup.OpType != opType ||
+			w.currentGroup.Namespace != namespace ||
+			len(w.currentGroup.Operations) >= w.incrementalWriteBatchSize
+	}
 
 	if needNewGroup && w.currentGroup != nil {
 		if w.statsManager != nil {
 			// Determine the reason the group had to be flushed
-			if w.currentGroup.OpType != opType {
-				w.statsManager.IncrementGroupFlushReason("optype")
-			} else if len(w.currentGroup.Operations) >= w.incrementalWriteBatchSize {
-				w.statsManager.IncrementGroupFlushReason("batchfull")
+			if w.groupOpsByDistinctId && w.currentGroupIDs[docHash] {
+				w.statsManager.IncrementGroupFlushReason("collision")
 			} else if w.currentGroup.Namespace != namespace {
 				w.statsManager.IncrementGroupFlushReason("namespace")
+			} else if len(w.currentGroup.Operations) >= w.incrementalWriteBatchSize {
+				w.statsManager.IncrementGroupFlushReason("batchfull")
+			} else if w.currentGroup.OpType != opType {
+				w.statsManager.IncrementGroupFlushReason("optype")
 			}
 		}
 
 		// Add current group to processing queue
 		w.processingQueue <- w.currentGroup
 		w.currentGroup = nil
+		w.currentGroupIDs = make(map[int]bool)
 	}
 
 	// Create a new group if needed
 	if w.currentGroup == nil {
+		groupOpType := opType
+		if w.groupOpsByDistinctId {
+			groupOpType = "mixed"
+		}
 		w.currentGroup = &OperationGroup{
 			Namespace:  namespace,
-			OpType:     opType,
+			OpType:     groupOpType,
 			Operations: []WriteOperation{op},
 			CreatedAt:  time.Now(), // Set creation timestamp
 		}
+		w.currentGroupIDs = make(map[int]bool)
+		w.currentGroupIDs[docHash] = true
 	} else {
 		// Add to current group
 		w.currentGroup.Operations = append(w.currentGroup.Operations, op)
+		w.currentGroupIDs[docHash] = true
 	}
 
 	// If current group has reached max size, add it to the queue
@@ -547,6 +577,115 @@ func (w *Worker) processGroup(group OperationGroup) {
 
 	// Process based on operation type
 	switch group.OpType {
+	case "mixed":
+		var models []mongo.WriteModel
+		for _, op := range group.Operations {
+			switch op.OpType {
+			case "insert":
+				transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
+				if err != nil {
+					w.log.Errorf("[%s.%s] Field name transformation failed for mixed insert, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+					if w.dlq != nil {
+						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
+					}
+					continue
+				}
+				model := mongo.NewInsertOneModel().SetDocument(transformed)
+				models = append(models, model)
+
+			case "update":
+				if op.UpdateDescription != nil {
+					transformed, err := TransformFieldNames(op.UpdateDescription, w.log, dbName, collName, op.DocumentID)
+					if err != nil {
+						w.log.Errorf("[%s.%s] Field name transformation failed for mixed modifier update, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+						if w.dlq != nil {
+							w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.UpdateDescription)
+						}
+						continue
+					}
+					model := mongo.NewUpdateOneModel().
+						SetFilter(bson.M{"_id": op.DocumentID}).
+						SetUpdate(transformed).
+						SetUpsert(true)
+					models = append(models, model)
+				} else if op.Document != nil {
+					transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
+					if err != nil {
+						w.log.Errorf("[%s.%s] Field name transformation failed for mixed update replacement, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+						if w.dlq != nil {
+							w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
+						}
+						continue
+					}
+					model := mongo.NewReplaceOneModel().
+						SetFilter(bson.M{"_id": op.DocumentID}).
+						SetReplacement(transformed).
+						SetUpsert(true)
+					models = append(models, model)
+				}
+
+			case "replace":
+				transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
+				if err != nil {
+					w.log.Errorf("[%s.%s] Field name transformation failed for mixed replace, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+					if w.dlq != nil {
+						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
+					}
+					continue
+				}
+				model := mongo.NewReplaceOneModel().
+					SetFilter(bson.M{"_id": op.DocumentID}).
+					SetReplacement(transformed).
+					SetUpsert(true)
+				models = append(models, model)
+
+			case "delete":
+				model := mongo.NewDeleteOneModel().SetFilter(bson.M{"_id": op.DocumentID})
+				models = append(models, model)
+			}
+		}
+
+		if len(models) > 0 {
+			issueTime := time.Now()
+			_, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(true))
+			if w.statsManager != nil {
+				w.statsManager.RecordLatency("mixed", group.Operations, issueTime, time.Since(issueTime), w.id)
+			}
+			if err != nil {
+				bulkWriteException, ok := err.(mongo.BulkWriteException)
+				if ok && w.ctx.Err() != context.Canceled {
+					w.log.Errorf("[%s.%s] Bulk mixed operations partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
+
+					// Handle individual failures by fallback retries
+					for _, writeErr := range bulkWriteException.WriteErrors {
+						var failedDocID interface{}
+						if writeErr.Index < len(group.Operations) {
+							failedDocID = group.Operations[writeErr.Index].DocumentID
+						}
+						w.log.Errorf("[%s.%s] Mixed write error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
+
+						// Fallback retry for the single failed operation
+						if writeErr.Index < len(group.Operations) {
+							op := group.Operations[writeErr.Index]
+							w.retryIndividualOperation(targetCollection, op, dbName, collName, writeErr.Message)
+						}
+					}
+				} else {
+					if err == context.Canceled || w.ctx.Err() == context.Canceled {
+						w.log.Debugf("[%s.%s] Bulk mixed operations canceled due to context cancellation", dbName, collName)
+					} else {
+						w.log.Errorf("[%s.%s] Error performing bulk mixed operations: %v", dbName, collName, err)
+						// Write all to DLQ
+						if w.dlq != nil {
+							for _, op := range group.Operations {
+								w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", op.OpType, op.Document)
+							}
+						}
+					}
+				}
+			}
+		}
+
 	case "insert":
 		var docs []interface{}
 		for _, op := range group.Operations {
@@ -1089,4 +1228,66 @@ func (w *Worker) Shutdown() {
 
 	// Wait for any ongoing processing to complete
 	w.WaitForCompletion()
+}
+
+
+
+// retryIndividualOperation retries a single failed write operation of a batch using fallback execution.
+func (w *Worker) retryIndividualOperation(targetCollection *mongo.Collection, op WriteOperation, dbName, collName string, originalErrorMsg string) {
+	filter := bson.M{"_id": op.DocumentID}
+	if w.statsManager != nil {
+		w.statsManager.IncrementSequentialRetries(1)
+	}
+
+	switch op.OpType {
+	case "insert":
+		transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
+		if err == nil {
+			if _, err := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
+				w.log.Errorf("[%s.%s] Fallback upsert failed for insert document _id=%v: %v", dbName, collName, op.DocumentID, err)
+				if w.dlq != nil {
+					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
+				}
+			}
+		}
+	case "update":
+		if op.UpdateDescription != nil {
+			transformed, err := TransformFieldNames(op.UpdateDescription, w.log, dbName, collName, op.DocumentID)
+			if err == nil {
+				if _, err := targetCollection.UpdateOne(w.ctx, filter, transformed, options.Update().SetUpsert(true)); err != nil {
+					w.log.Errorf("[%s.%s] Fallback modifier update failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
+					if w.dlq != nil {
+						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.UpdateDescription)
+					}
+				}
+			}
+		} else if op.Document != nil {
+			transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
+			if err == nil {
+				if _, err := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
+					w.log.Errorf("[%s.%s] Fallback replace update failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
+					if w.dlq != nil {
+						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
+					}
+				}
+			}
+		}
+	case "replace":
+		transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
+		if err == nil {
+			if _, err := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
+				w.log.Errorf("[%s.%s] Fallback replace failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
+				if w.dlq != nil {
+					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
+				}
+			}
+		}
+	case "delete":
+		if _, err := targetCollection.DeleteOne(w.ctx, filter); err != nil {
+			w.log.Errorf("[%s.%s] Fallback delete failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
+			if w.dlq != nil {
+				w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "delete", nil)
+			}
+		}
+	}
 }
