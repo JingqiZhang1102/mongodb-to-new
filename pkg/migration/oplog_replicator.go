@@ -993,6 +993,8 @@ func (r *OplogReplicator) distributeOplogEvent(ctx context.Context, op *gtm.Op, 
 		workerIndex = -workerIndex
 	}
 
+	changeEvent["readTime"] = time.Now()
+
 	// Send raw event to appropriate worker concurrently
 	workers[workerIndex].incomingQueue <- changeEvent
 }

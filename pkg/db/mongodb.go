@@ -10,6 +10,7 @@ import (
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/event"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -24,7 +25,7 @@ type MongoDB struct {
 }
 
 // NewMongoDB creates a new MongoDB connection with pool size and idle timeouts configured dynamically
-func NewMongoDB(connectionString, databaseName string, minPoolSize, maxPoolSize uint64, maxConnIdleTime time.Duration, log *logger.Logger) (*MongoDB, error) {
+func NewMongoDB(connectionString, databaseName string, minPoolSize, maxPoolSize uint64, maxConnIdleTime time.Duration, poolMonitor *event.PoolMonitor, log *logger.Logger) (*MongoDB, error) {
 	// Set client options
 	clientOptions := options.Client().
 		ApplyURI(connectionString).
@@ -35,6 +36,10 @@ func NewMongoDB(connectionString, databaseName string, minPoolSize, maxPoolSize 
 
 	if maxConnIdleTime > 0 {
 		clientOptions.SetMaxConnIdleTime(maxConnIdleTime)
+	}
+
+	if poolMonitor != nil {
+		clientOptions.SetPoolMonitor(poolMonitor)
 	}
 
 	// Connect to MongoDB

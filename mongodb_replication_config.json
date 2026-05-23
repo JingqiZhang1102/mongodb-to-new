@@ -21,25 +21,25 @@
       }
     }
   ],
-  "saveThreshold": 1000,
-  "checkpointInterval": 5,
+  "saveThreshold": 100000,
+  "checkpointIntervalMinutes": 5,
   "forceOrderedOperations": false,
-  "flushIntervalMs": 250,
-  "targetMinPoolSize": 32,
-  "targetMaxPoolSize": 64,
-  
-  "initialReadBatchSize": 8192,
+  "flushIntervalMs": 31,
+  "targetMinPoolSize": 1024,
+  "targetMaxPoolSize": 1024,
+
+  "initialReadBatchSize": 12000,
   "initialWriteBatchSize": 100,
   "initialChannelBufferSize": 10,
   "initialMigrationWorkers": 8,
   "concurrentCollections": 4,
   
   "incrementalReadBatchSize": 8192,
-  "incrementalWriteBatchSize": 256,
-  "incrementalWorkerCount": 32,
+  "incrementalWriteBatchSize": 16,
+  "incrementalWorkerCount": 1024,
   "groupOpsByDistinctId": true,
   "incrementalIncomingQueueSize": 8192,
-  "incrementalProcessingQueueSize": 2,
+  "incrementalProcessingQueueSize": 4096,
   "statsIntervalMinutes": 1,
   
   "parallelReadsEnabled": true,

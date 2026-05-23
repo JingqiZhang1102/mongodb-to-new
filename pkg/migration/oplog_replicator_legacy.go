@@ -980,6 +980,8 @@ func (r *OplogReplicatorLegacy) distributeOplogEvent(ctx context.Context, op *gt
 		workerIndex = -workerIndex
 	}
 
+	changeEvent["readTime"] = time.Now()
+
 	// Send raw event to appropriate worker concurrently
 	workers[workerIndex].incomingQueue <- changeEvent
 }

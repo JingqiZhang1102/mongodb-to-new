@@ -25,6 +25,7 @@ type ClientLevelReplicator struct {
 	collectionMap map[string]map[string]string // Map of database -> source collection -> target collection
 	mu            sync.Mutex                   // Mutex for thread-safe operations
 	dlq           DLQ                          // Dead Letter Queue for failed documents
+	statsManager  *StatsManager                // Statistics manager
 }
 
 // NewClientLevelReplicator creates a new client-level replicator
@@ -36,6 +37,11 @@ func NewClientLevelReplicator(sourceDB, targetDB *db.MongoDB, cfg *config.Config
 		log:           log,
 		collectionMap: make(map[string]map[string]string),
 	}
+}
+
+// SetStatsManager sets the stats manager for this replicator
+func (r *ClientLevelReplicator) SetStatsManager(sm *StatsManager) {
+	r.statsManager = sm
 }
 
 // SetDLQ sets the Dead Letter Queue writer for this replicator
@@ -663,6 +669,7 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		time.Duration(r.config.FlushIntervalMs)*time.Millisecond,
 		r.config,
 		r.dlq,
+		r.statsManager,
 	)
 
 	// Start event distribution

@@ -2,11 +2,13 @@ package migration
 
 import (
 	"context"
+	"hash/fnv"
 	"testing"
 	"time"
 
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 func TestWorkerProcessEventUpdateWithNullFullDocumentAndDescription(t *testing.T) {
@@ -127,5 +129,32 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndStatsManager(t *testing.
 
 	if count != 1 {
 		t.Errorf("expected update-doc-missing metric count to be 1, got %v", count)
+	}
+}
+
+// BenchmarkOldHashing measures the old way of hashing ObjectID
+func BenchmarkOldHashing(b *testing.B) {
+	id := primitive.NewObjectID()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		bytes := []byte(id.Hex())
+		h := fnv.New32a()
+		h.Write(bytes)
+		_ = int(h.Sum32())
+	}
+}
+
+// BenchmarkNewHashing measures the new way of hashing ObjectID
+func BenchmarkNewHashing(b *testing.B) {
+	id := primitive.NewObjectID()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		bytes := id[:]
+		hash := uint32(2166136261)
+		for _, v := range bytes {
+			hash ^= uint32(v)
+			hash *= 16777619
+		}
+		_ = int(hash)
 	}
 }
