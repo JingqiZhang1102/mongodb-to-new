@@ -747,7 +747,7 @@ func (r *OplogReplicator) tailOplog(ctx context.Context, afterTimestamp primitiv
 	r.log.Infof("Starting parallel oplog processing with %d workers", r.config.IncrementalWorkerCount)
 	workers := make([]*Worker, r.config.IncrementalWorkerCount)
 	for i := 0; i < r.config.IncrementalWorkerCount; i++ {
-		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionMap, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager, nil, r.config.GroupOpsByDistinctId)
+		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionMap, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager, nil, r.config.GroupOpsByDistinctId, time.Duration(r.config.FlushIntervalMs)*time.Millisecond)
 	}
 
 	// Set up context cancellation handling for workers
@@ -993,6 +993,6 @@ func (r *OplogReplicator) distributeOplogEvent(ctx context.Context, op *gtm.Op, 
 		workerIndex = -workerIndex
 	}
 
-	// Send event to appropriate worker
-	workers[workerIndex].ProcessEvent(changeEvent)
+	// Send raw event to appropriate worker concurrently
+	workers[workerIndex].incomingQueue <- changeEvent
 }

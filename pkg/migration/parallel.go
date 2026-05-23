@@ -142,7 +142,7 @@ func (d *EventDistributor) Start() error {
 
 	// Initialize workers with retry manager and stats manager
 	for i := 0; i < d.incrementalWorkerCount; i++ {
-		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.statsManager, d.cfg.GroupOpsByDistinctId)
+		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.statsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval)
 	}
 
 	// Set up context cancellation handling
@@ -151,38 +151,6 @@ func (d *EventDistributor) Start() error {
 		d.log.Info("Context canceled. Shutting down workers...")
 		for _, worker := range d.workers {
 			worker.Shutdown()
-		}
-	}()
-
-	// Set up periodic flushing
-	flushTicker := time.NewTicker(d.flushInterval)
-	defer flushTicker.Stop()
-
-	go func() {
-		for {
-			select {
-			case <-flushTicker.C:
-				// Check all workers for groups that need flushing
-				for _, worker := range d.workers {
-					worker.mu.Lock()
-					if worker.currentGroup != nil && len(worker.currentGroup.Operations) > 0 {
-						// If the group has been waiting for more than the flush interval
-						if time.Since(worker.currentGroup.CreatedAt) >= d.flushInterval {
-							d.log.Debugf("Flushing group in worker %d due to timeout: %s.%s with %d operations",
-								worker.id, worker.currentGroup.Namespace, worker.currentGroup.OpType,
-								len(worker.currentGroup.Operations))
-
-							if d.statsManager != nil {
-								d.statsManager.IncrementTimeoutFlushes()
-							}
-							worker.flushCurrentGroup()
-						}
-					}
-					worker.mu.Unlock()
-				}
-			case <-d.ctx.Done():
-				return
-			}
 		}
 	}()
 
@@ -247,8 +215,12 @@ func (d *EventDistributor) Start() error {
 		// Determine worker based on hash modulo worker count
 		workerIndex := d.getWorkerIndex(docID)
 
-		// Send event to appropriate worker
-		d.workers[workerIndex].ProcessEvent(changeEvent)
+		// Send raw event to appropriate worker concurrently
+		select {
+		case d.workers[workerIndex].incomingQueue <- changeEvent:
+		case <-d.ctx.Done():
+			return nil
+		}
 
 		// Handle resume token checkpointing
 		changeCount++
@@ -314,6 +286,9 @@ type Worker struct {
 	collectionMap map[string]map[string]string
 	statsManager  *StatsManager
 
+	// Queue of raw change events waiting to be partitioned and batched concurrently
+	incomingQueue chan bson.M
+
 	// Current group being built
 	currentGroup *OperationGroup
 
@@ -344,6 +319,7 @@ type Worker struct {
 	// Dynamic grouping configurations
 	groupOpsByDistinctId bool
 	currentGroupIDs     map[int]bool
+	flushInterval       time.Duration
 }
 
 // flushCurrentGroup moves the current group to the processing queue if it exists
@@ -384,7 +360,7 @@ func (s *statsTrackingDLQ) Close() {
 // NewWorker creates a new worker
 func NewWorker(id int, ctx context.Context, log *logger.Logger,
 	targetDB *db.MongoDB, collectionMap map[string]map[string]string,
-	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager, statsManager *StatsManager, groupOpsByDistinctId bool) *Worker {
+	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager, statsManager *StatsManager, groupOpsByDistinctId bool, flushInterval time.Duration) *Worker {
 
 	var workerDLQ DLQ = dlq
 	if dlq != nil && statsManager != nil {
@@ -400,6 +376,7 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 		log:                       log,
 		targetDB:                  targetDB,
 		collectionMap:             collectionMap,
+		incomingQueue:             make(chan bson.M, 8192),
 		processingQueue:           make(chan *OperationGroup, 4096),
 		incrementalWriteBatchSize: incrementalWriteBatchSize,
 		forceOrderedOperations:    forceOrderedOperations,
@@ -408,12 +385,59 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 		statsManager:              statsManager,
 		groupOpsByDistinctId:      groupOpsByDistinctId,
 		currentGroupIDs:           make(map[int]bool),
+		flushInterval:             flushInterval,
 	}
 
-	// Statically spawn the worker thread at startup
+	// Statically spawn the worker and eventLoop threads at startup
 	go w.processGroups()
+	go w.eventLoop()
 
 	return w
+}
+
+// eventLoop concurrently drains raw change events from the incomingQueue, partitioning and batching them lock-freely
+func (w *Worker) eventLoop() {
+	w.wg.Add(1)
+	defer w.wg.Done()
+
+	// Local worker-level ticker to flush groups that time out
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case event, ok := <-w.incomingQueue:
+			if !ok {
+				// Queue closed, flush any remaining operations
+				w.mu.Lock()
+				w.flushCurrentGroup()
+				close(w.processingQueue) // Signal processGroups to drain and exit
+				w.mu.Unlock()
+				return
+			}
+			w.ProcessEvent(event)
+
+		case <-ticker.C:
+			w.mu.Lock()
+			if w.currentGroup != nil && len(w.currentGroup.Operations) > 0 {
+				if time.Since(w.currentGroup.CreatedAt) >= w.flushInterval {
+					if w.statsManager != nil {
+						w.statsManager.IncrementTimeoutFlushes()
+					}
+					w.flushCurrentGroup()
+				}
+			}
+			w.mu.Unlock()
+
+		case <-w.ctx.Done():
+			// Context canceled, flush remaining and shut down
+			w.mu.Lock()
+			w.flushCurrentGroup()
+			close(w.processingQueue)
+			w.mu.Unlock()
+			return
+		}
+	}
 }
 
 // ProcessEvent handles a single change event
@@ -675,10 +699,33 @@ func (w *Worker) processGroup(group OperationGroup) {
 						w.log.Debugf("[%s.%s] Bulk mixed operations canceled due to context cancellation", dbName, collName)
 					} else {
 						w.log.Errorf("[%s.%s] Error performing bulk mixed operations: %v", dbName, collName, err)
-						// Write all to DLQ
-						if w.dlq != nil {
-							for _, op := range group.Operations {
-								w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", op.OpType, op.Document)
+
+						// For transient errors, retry the bulk operation with backoff before falling back to DLQ
+						bulkRetrySucceeded := false
+						if w.retryManager != nil {
+							errType := w.retryManager.ClassifyError(err)
+							if errType == ErrorTypeConnection || errType == ErrorTypeContention {
+								w.log.Infof("[%s.%s] Transient error detected. Retrying bulk mixed operations with backoff...", dbName, collName)
+								retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
+									_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(true))
+									return retryBulkErr
+								})
+								if retryErr == nil {
+									w.log.Infof("[%s.%s] Bulk mixed operations succeeded after retry", dbName, collName)
+									bulkRetrySucceeded = true
+								} else {
+									w.log.Warnf("[%s.%s] Bulk mixed operations still failed after retries: %v. Routing to DLQ.", dbName, collName, retryErr)
+									err = retryErr
+								}
+							}
+						}
+
+						if !bulkRetrySucceeded {
+							// Write all to DLQ
+							if w.dlq != nil {
+								for _, op := range group.Operations {
+									w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", op.OpType, op.Document)
+								}
 							}
 						}
 					}
@@ -1214,19 +1261,12 @@ func (w *Worker) WaitForCompletion() {
 func (w *Worker) Shutdown() {
 	w.mu.Lock()
 	w.shutdownInProgress = true
-
-	// Add current group to processing queue if it exists
-	if w.currentGroup != nil && len(w.currentGroup.Operations) > 0 {
-		w.log.Debugf("Worker %d: Flushing current group during shutdown: %s.%s with %d operations",
-			w.id, w.currentGroup.Namespace, w.currentGroup.OpType, len(w.currentGroup.Operations))
-
-		w.flushCurrentGroup()
-	}
-
-	close(w.processingQueue)
 	w.mu.Unlock()
 
-	// Wait for any ongoing processing to complete
+	// Close raw incoming queue to signal eventLoop to drain and close processingQueue
+	close(w.incomingQueue)
+
+	// Wait for both eventLoop and processGroups goroutines to complete
 	w.WaitForCompletion()
 }
 

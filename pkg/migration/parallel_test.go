@@ -3,6 +3,7 @@ package migration
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"go.mongodb.org/mongo-driver/bson"
@@ -25,6 +26,7 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndDescription(t *testing.T
 		nil,                                 // retryManager
 		nil,                                 // statsManager
 		false,                               // groupOpsByDistinctID
+		5*time.Minute,                       // flushInterval
 	)
 
 	// Create an update event where both fullDocument and updateDescription are nil/null
@@ -89,6 +91,7 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndStatsManager(t *testing.
 		nil,                                 // retryManager
 		statsMgr,                            // statsManager
 		false,                               // groupOpsByDistinctID
+		5*time.Minute,                       // flushInterval
 	)
 
 	// Create an update event where fullDocument is nil
