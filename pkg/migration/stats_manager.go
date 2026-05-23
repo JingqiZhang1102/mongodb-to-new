@@ -13,15 +13,20 @@ import (
 
 // StatsManager coordinates statistics and replication lag tracking thread-safely
 type StatsManager struct {
-	mu            sync.Mutex
-	lastStatsTime time.Time
-	lagTracker    *LagTracker
-	log           *logger.Logger
-	statsInterval time.Duration
+	mu                   sync.Mutex
+	lastStatsTime        time.Time
+	lagTracker           *LagTracker
+	log                  *logger.Logger
+	statsInterval        time.Duration
+	groupOpsByDistinctId bool
 
 	// Scalar counters updated lock-freely via atomic package
 	updatedThenDeletedSinceLastStats     int64
 	sequentialRetriesSinceLastStats      int64
+	sequentialRetriesInsertsSinceLastStats int64
+	sequentialRetriesUpdatesSinceLastStats int64
+	sequentialRetriesDeletesSinceLastStats int64
+	sequentialRetriesReplacesSinceLastStats int64
 	orderedBulkWritesSinceLastStats      int64
 	orderedBulkWritesSizeSinceLastStats int64
 	unorderedBulkWritesSinceLastStats    int64
@@ -89,12 +94,17 @@ type StatsManager struct {
 }
 
 // NewStatsManager creates a new StatsManager
-func NewStatsManager(log *logger.Logger, interval time.Duration) *StatsManager {
+func NewStatsManager(log *logger.Logger, interval time.Duration, groupOpsByDistinctId ...bool) *StatsManager {
+	distinctId := false
+	if len(groupOpsByDistinctId) > 0 {
+		distinctId = groupOpsByDistinctId[0]
+	}
 	return &StatsManager{
 		lastStatsTime:                 time.Now(),
 		lagTracker:                    NewLagTracker(),
 		log:                           log,
 		statsInterval:                 interval,
+		groupOpsByDistinctId:          distinctId,
 		workerProcessedSinceLastStats: make(map[int]int64),
 	}
 }
@@ -171,11 +181,22 @@ func (sm *StatsManager) GetGroupFlushReasonCount(reason string) int {
 }
 
 // IncrementSequentialRetries increments the count of sequential retries thread-safely and lock-freely
-func (sm *StatsManager) IncrementSequentialRetries(count int) {
+func (sm *StatsManager) IncrementSequentialRetries(opType string, count int) {
 	if sm == nil {
 		return
 	}
 	atomic.AddInt64(&sm.sequentialRetriesSinceLastStats, int64(count))
+
+	switch opType {
+	case "insert":
+		atomic.AddInt64(&sm.sequentialRetriesInsertsSinceLastStats, int64(count))
+	case "update":
+		atomic.AddInt64(&sm.sequentialRetriesUpdatesSinceLastStats, int64(count))
+	case "delete":
+		atomic.AddInt64(&sm.sequentialRetriesDeletesSinceLastStats, int64(count))
+	case "replace":
+		atomic.AddInt64(&sm.sequentialRetriesReplacesSinceLastStats, int64(count))
+	}
 }
 
 // GetSequentialRetries returns the sequential retries count thread-safely and lock-freely
@@ -257,42 +278,52 @@ func (sm *StatsManager) RecordLatency(opType string, ops []WriteOperation, issue
 
 	if !oldestReceiveTime.IsZero() {
 		qLatency := int64(issueTime.Sub(oldestReceiveTime))
-		switch opType {
-		case "insert":
-			atomic.AddInt64(&sm.totalQueueLatencyInserts, qLatency)
-			atomic.AddInt64(&sm.queueLatencyCountInserts, 1)
-		case "update":
-			atomic.AddInt64(&sm.totalQueueLatencyUpdates, qLatency)
-			atomic.AddInt64(&sm.queueLatencyCountUpdates, 1)
-		case "delete":
-			atomic.AddInt64(&sm.totalQueueLatencyDeletes, qLatency)
-			atomic.AddInt64(&sm.queueLatencyCountDeletes, 1)
-		case "replace":
-			atomic.AddInt64(&sm.totalQueueLatencyReplaces, qLatency)
-			atomic.AddInt64(&sm.queueLatencyCountReplaces, 1)
-		case "mixed":
+		if sm.groupOpsByDistinctId {
 			atomic.AddInt64(&sm.totalQueueLatencyMixed, qLatency)
 			atomic.AddInt64(&sm.queueLatencyCountMixed, 1)
+		} else {
+			switch opType {
+			case "insert":
+				atomic.AddInt64(&sm.totalQueueLatencyInserts, qLatency)
+				atomic.AddInt64(&sm.queueLatencyCountInserts, 1)
+			case "update":
+				atomic.AddInt64(&sm.totalQueueLatencyUpdates, qLatency)
+				atomic.AddInt64(&sm.queueLatencyCountUpdates, 1)
+			case "delete":
+				atomic.AddInt64(&sm.totalQueueLatencyDeletes, qLatency)
+				atomic.AddInt64(&sm.queueLatencyCountDeletes, 1)
+			case "replace":
+				atomic.AddInt64(&sm.totalQueueLatencyReplaces, qLatency)
+				atomic.AddInt64(&sm.queueLatencyCountReplaces, 1)
+			case "mixed":
+				atomic.AddInt64(&sm.totalQueueLatencyMixed, qLatency)
+				atomic.AddInt64(&sm.queueLatencyCountMixed, 1)
+			}
 		}
 	}
 
 	dbLatency := int64(bulkOpLatency)
-	switch opType {
-	case "insert":
-		atomic.AddInt64(&sm.totalBulkWriteLatencyInserts, dbLatency)
-		atomic.AddInt64(&sm.bulkWriteLatencyCountInserts, 1)
-	case "update":
-		atomic.AddInt64(&sm.totalBulkWriteLatencyUpdates, dbLatency)
-		atomic.AddInt64(&sm.bulkWriteLatencyCountUpdates, 1)
-	case "delete":
-		atomic.AddInt64(&sm.totalBulkWriteLatencyDeletes, dbLatency)
-		atomic.AddInt64(&sm.bulkWriteLatencyCountDeletes, 1)
-	case "replace":
-		atomic.AddInt64(&sm.totalBulkWriteLatencyReplaces, dbLatency)
-		atomic.AddInt64(&sm.bulkWriteLatencyCountReplaces, 1)
-	case "mixed":
+	if sm.groupOpsByDistinctId {
 		atomic.AddInt64(&sm.totalBulkWriteLatencyMixed, dbLatency)
 		atomic.AddInt64(&sm.bulkWriteLatencyCountMixed, 1)
+	} else {
+		switch opType {
+		case "insert":
+			atomic.AddInt64(&sm.totalBulkWriteLatencyInserts, dbLatency)
+			atomic.AddInt64(&sm.bulkWriteLatencyCountInserts, 1)
+		case "update":
+			atomic.AddInt64(&sm.totalBulkWriteLatencyUpdates, dbLatency)
+			atomic.AddInt64(&sm.bulkWriteLatencyCountUpdates, 1)
+		case "delete":
+			atomic.AddInt64(&sm.totalBulkWriteLatencyDeletes, dbLatency)
+			atomic.AddInt64(&sm.bulkWriteLatencyCountDeletes, 1)
+		case "replace":
+			atomic.AddInt64(&sm.totalBulkWriteLatencyReplaces, dbLatency)
+			atomic.AddInt64(&sm.bulkWriteLatencyCountReplaces, 1)
+		case "mixed":
+			atomic.AddInt64(&sm.totalBulkWriteLatencyMixed, dbLatency)
+			atomic.AddInt64(&sm.bulkWriteLatencyCountMixed, 1)
+		}
 	}
 
 	// Track successful writes processed by this worker thread-safely
@@ -464,6 +495,10 @@ func (sm *StatsManager) ReportStats() {
 	// Reset and load atomic counters atomically using atomic.SwapInt64
 	updatedThenDeleted := atomic.SwapInt64(&sm.updatedThenDeletedSinceLastStats, 0)
 	sequentialRetries := atomic.SwapInt64(&sm.sequentialRetriesSinceLastStats, 0)
+	sequentialRetriesInserts := atomic.SwapInt64(&sm.sequentialRetriesInsertsSinceLastStats, 0)
+	sequentialRetriesUpdates := atomic.SwapInt64(&sm.sequentialRetriesUpdatesSinceLastStats, 0)
+	sequentialRetriesDeletes := atomic.SwapInt64(&sm.sequentialRetriesDeletesSinceLastStats, 0)
+	sequentialRetriesReplaces := atomic.SwapInt64(&sm.sequentialRetriesReplacesSinceLastStats, 0)
 	orderedWrites := atomic.SwapInt64(&sm.orderedBulkWritesSinceLastStats, 0)
 	orderedWritesSize := atomic.SwapInt64(&sm.orderedBulkWritesSizeSinceLastStats, 0)
 	unorderedWrites := atomic.SwapInt64(&sm.unorderedBulkWritesSinceLastStats, 0)
@@ -622,17 +657,23 @@ func (sm *StatsManager) ReportStats() {
 		return "N/A"
 	}
 
-	avgInsertQueue := getLatencyStr(totalQueueLatencyInserts, queueLatencyCountInserts)
-	avgUpdateQueue := getLatencyStr(totalQueueLatencyUpdates, queueLatencyCountUpdates)
-	avgDeleteQueue := getLatencyStr(totalQueueLatencyDeletes, queueLatencyCountDeletes)
-	avgReplaceQueue := getLatencyStr(totalQueueLatencyReplaces, queueLatencyCountReplaces)
-	avgMixedQueue := getLatencyStr(totalQueueLatencyMixed, queueLatencyCountMixed)
+	var avgInsertQueue, avgUpdateQueue, avgDeleteQueue, avgReplaceQueue, avgMixedQueue string
+	var avgInsertDb, avgUpdateDb, avgDeleteDb, avgReplaceDb, avgMixedDb string
 
-	avgInsertDb := getLatencyStr(totalBulkWriteLatencyInserts, bulkWriteLatencyCountInserts)
-	avgUpdateDb := getLatencyStr(totalBulkWriteLatencyUpdates, bulkWriteLatencyCountUpdates)
-	avgDeleteDb := getLatencyStr(totalBulkWriteLatencyDeletes, bulkWriteLatencyCountDeletes)
-	avgReplaceDb := getLatencyStr(totalBulkWriteLatencyReplaces, bulkWriteLatencyCountReplaces)
-	avgMixedDb := getLatencyStr(totalBulkWriteLatencyMixed, bulkWriteLatencyCountMixed)
+	avgMixedQueue = getLatencyStr(totalQueueLatencyMixed, queueLatencyCountMixed)
+	avgMixedDb = getLatencyStr(totalBulkWriteLatencyMixed, bulkWriteLatencyCountMixed)
+
+	if !sm.groupOpsByDistinctId {
+		avgInsertQueue = getLatencyStr(totalQueueLatencyInserts, queueLatencyCountInserts)
+		avgUpdateQueue = getLatencyStr(totalQueueLatencyUpdates, queueLatencyCountUpdates)
+		avgDeleteQueue = getLatencyStr(totalQueueLatencyDeletes, queueLatencyCountDeletes)
+		avgReplaceQueue = getLatencyStr(totalQueueLatencyReplaces, queueLatencyCountReplaces)
+
+		avgInsertDb = getLatencyStr(totalBulkWriteLatencyInserts, bulkWriteLatencyCountInserts)
+		avgUpdateDb = getLatencyStr(totalBulkWriteLatencyUpdates, bulkWriteLatencyCountUpdates)
+		avgDeleteDb = getLatencyStr(totalBulkWriteLatencyDeletes, bulkWriteLatencyCountDeletes)
+		avgReplaceDb = getLatencyStr(totalBulkWriteLatencyReplaces, bulkWriteLatencyCountReplaces)
+	}
 
 	// Calculate active workers and percentiles
 	var workerQps []float64
@@ -658,6 +699,23 @@ func (sm *StatsManager) ReportStats() {
 		avgLagStr = avgLag.Round(time.Millisecond).String()
 	}
 
+	var queueLatencyMsg, dbLatencyMsg string
+	if sm.groupOpsByDistinctId {
+		queueLatencyMsg = avgMixedQueue
+		dbLatencyMsg = avgMixedDb
+	} else {
+		queueLatencyMsg = fmt.Sprintf("[insert: %s, update: %s, delete: %s, replace: %s, mixed: %s]",
+			avgInsertQueue, avgUpdateQueue, avgDeleteQueue, avgReplaceQueue, avgMixedQueue)
+		dbLatencyMsg = fmt.Sprintf("[insert: %s, update: %s, delete: %s, replace: %s, mixed: %s]",
+			avgInsertDb, avgUpdateDb, avgDeleteDb, avgReplaceDb, avgMixedDb)
+	}
+
+	sequentialRetriesBreakdown := ""
+	if sequentialRetries > 0 {
+		sequentialRetriesBreakdown = fmt.Sprintf(" [Inserts: %d, Updates: %d, Deletes: %d, Replaces: %d]",
+			sequentialRetriesInserts, sequentialRetriesUpdates, sequentialRetriesDeletes, sequentialRetriesReplaces)
+	}
+
 	msg := fmt.Sprintf("Change stream statistics (last %v):\n"+
 		"  - Received:  %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)]\n"+
 		"  - Processed: %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Updates: %d (%.2f/sec), Deletes: %d (%.2f/sec)]\n"+
@@ -665,11 +723,11 @@ func (sm *StatsManager) ReportStats() {
 		"  - updatedThenDeleted: %d (%.2f events/sec)\n"+
 		"  - Ordered BulkWrites: %d (%.2f/sec)%s\n"+
 		"  - Unordered BulkWrites: %d (%.2f/sec)%s\n"+
-		"  - Sequential Retries: %d (%.2f/sec)\n"+
+		"  - Sequential Retries: %d (%.2f/sec)%s\n"+
 		"  - Timeout Flushes: %d (%.2f/sec)\n"+
 		"  - Group Flushes: [optype: %d (%.2f/sec), batchfull: %d (%.2f/sec), namespace: %d (%.2f/sec), collision: %d (%.2f/sec)]\n"+
-		"  - Queue Latency: [insert: %s, update: %s, delete: %s, replace: %s, mixed: %s]\n"+
-		"  - BulkWrite Execution Latency: [insert: %s, update: %s, delete: %s, replace: %s, mixed: %s]\n"+
+		"  - Queue Latency: %s\n"+
+		"  - BulkWrite Execution Latency: %s\n"+
 		"  - Workers: [Active: %d]\n"+
 		"  - Worker QPS: [p50: %.2f, p70: %.2f, p90: %.2f, p100: %.2f]\n"+
 		"  - Average processing lag: %s",
@@ -677,7 +735,7 @@ func (sm *StatsManager) ReportStats() {
 		eventsReceived, rateReceived, insertsReceived, rateInsertsReceived, updatesReceived, rateUpdatesReceived, deletesReceived, rateDeletesReceived,
 		eventsProcessed, rateProcessed, insertsProcessed, rateInsertsProcessed, updatesProcessed, rateUpdatesProcessed, deletesProcessed, rateDeletesProcessed,
 		eventsFailed, rateFailed, insertsFailed, rateInsertsFailed, updatesFailed, rateUpdatesFailed, deletesFailed, rateDeletesFailed,
-		updatedThenDeleted, rateUpdatedThenDeleted, orderedWrites, rateOrderedWrites, avgOrderedSizeStr, unorderedWrites, rateUnorderedWrites, avgUnorderedSizeStr, sequentialRetries, rateSequentialRetries, timeoutFlushes, rateTimeoutFlushes, groupFlushesOpType, rateGroupFlushesOpType, groupFlushesBatchFull, rateGroupFlushesBatchFull, groupFlushesNamespace, rateGroupFlushesNamespace, groupFlushesCollision, rateGroupFlushesCollision, avgInsertQueue, avgUpdateQueue, avgDeleteQueue, avgReplaceQueue, avgMixedQueue, avgInsertDb, avgUpdateDb, avgDeleteDb, avgReplaceDb, avgMixedDb,
+		updatedThenDeleted, rateUpdatedThenDeleted, orderedWrites, rateOrderedWrites, avgOrderedSizeStr, unorderedWrites, rateUnorderedWrites, avgUnorderedSizeStr, sequentialRetries, rateSequentialRetries, sequentialRetriesBreakdown, timeoutFlushes, rateTimeoutFlushes, groupFlushesOpType, rateGroupFlushesOpType, groupFlushesBatchFull, rateGroupFlushesBatchFull, groupFlushesNamespace, rateGroupFlushesNamespace, groupFlushesCollision, rateGroupFlushesCollision, queueLatencyMsg, dbLatencyMsg,
 		activeWorkers,
 		wQpsP50, wQpsP70, wQpsP90, wQpsP100,
 		avgLagStr)

@@ -75,7 +75,7 @@ func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 		cfg:                       cfg,
 
 		// Initialize statistics tracking
-		statsManager: NewStatsManager(log, statsInterval),
+		statsManager: NewStatsManager(log, statsInterval, cfg.GroupOpsByDistinctId),
 	}
 }
 
@@ -618,21 +618,7 @@ func (w *Worker) processGroup(group OperationGroup) {
 				models = append(models, model)
 
 			case "update":
-				if op.UpdateDescription != nil {
-					transformed, err := TransformFieldNames(op.UpdateDescription, w.log, dbName, collName, op.DocumentID)
-					if err != nil {
-						w.log.Errorf("[%s.%s] Field name transformation failed for mixed modifier update, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-						if w.dlq != nil {
-							w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.UpdateDescription)
-						}
-						continue
-					}
-					model := mongo.NewUpdateOneModel().
-						SetFilter(bson.M{"_id": op.DocumentID}).
-						SetUpdate(transformed).
-						SetUpsert(true)
-					models = append(models, model)
-				} else if op.Document != nil {
+				if op.Document != nil {
 					transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
 					if err != nil {
 						w.log.Errorf("[%s.%s] Field name transformation failed for mixed update replacement, document _id=%v: %v", dbName, collName, op.DocumentID, err)
@@ -646,6 +632,8 @@ func (w *Worker) processGroup(group OperationGroup) {
 						SetReplacement(transformed).
 						SetUpsert(true)
 					models = append(models, model)
+				} else {
+					w.log.Errorf("[%s.%s] Mixed update failed: document payload is nil for _id=%v", dbName, collName, op.DocumentID)
 				}
 
 			case "replace":
@@ -683,14 +671,21 @@ func (w *Worker) processGroup(group OperationGroup) {
 					// Handle individual failures by fallback retries
 					for _, writeErr := range bulkWriteException.WriteErrors {
 						var failedDocID interface{}
+						var op WriteOperation
 						if writeErr.Index < len(group.Operations) {
-							failedDocID = group.Operations[writeErr.Index].DocumentID
+							op = group.Operations[writeErr.Index]
+							failedDocID = op.DocumentID
 						}
-						w.log.Errorf("[%s.%s] Mixed write error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
+
+						isDupInsert := op.OpType == "insert" && isDuplicateKeyError(writeErr.Code, writeErr.Message)
+						if isDupInsert {
+							w.log.Debugf("[%s.%s] Mixed insert had duplicate key occurrence for _id=%v, gracefully falling back to upsert", dbName, collName, failedDocID)
+						} else {
+							w.log.Errorf("[%s.%s] Mixed write error at index %d (opType=%s), _id=%v: %v", dbName, collName, writeErr.Index, op.OpType, failedDocID, writeErr.Message)
+						}
 
 						// Fallback retry for the single failed operation
 						if writeErr.Index < len(group.Operations) {
-							op := group.Operations[writeErr.Index]
 							w.retryIndividualOperation(targetCollection, op, dbName, collName, writeErr.Message)
 						}
 					}
@@ -721,11 +716,10 @@ func (w *Worker) processGroup(group OperationGroup) {
 						}
 
 						if !bulkRetrySucceeded {
-							// Write all to DLQ
-							if w.dlq != nil {
-								for _, op := range group.Operations {
-									w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", op.OpType, op.Document)
-								}
+							// Fall back to individual operations one-by-one to isolate errors and prevent DLQ victim colocation!
+							w.log.Warnf("[%s.%s] Bulk mixed operations failed: %v. Falling back to individual operations one-by-one.", dbName, collName, err)
+							for _, op := range group.Operations {
+								w.retryIndividualOperation(targetCollection, op, dbName, collName, err.Error())
 							}
 						}
 					}
@@ -758,9 +752,9 @@ func (w *Worker) processGroup(group OperationGroup) {
 			if ok && w.ctx.Err() != context.Canceled {
 				// Check if all write errors are simply duplicate key errors (gracefully handled by upsert fallback)
 				hasRealErrors := false
-				// Check if it's a duplicate key error (code 11000)
+				// Check if it's a duplicate key error
 				for _, writeErr := range bulkWriteException.WriteErrors {
-					if writeErr.Code != 11000 {
+					if !isDuplicateKeyError(writeErr.Code, writeErr.Message) {
 						hasRealErrors = true
 						break
 					}
@@ -774,42 +768,15 @@ func (w *Worker) processGroup(group OperationGroup) {
 				// Process individual errors
 				for _, writeErr := range bulkWriteException.WriteErrors {
 					var failedDocID interface{}
+					var op WriteOperation
 					if writeErr.Index < len(group.Operations) {
-						failedDocID = group.Operations[writeErr.Index].DocumentID
+						op = group.Operations[writeErr.Index]
+						failedDocID = op.DocumentID
 					}
 					w.log.Debugf("[%s.%s] Insert error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
 
-					// Check if it's a duplicate key error (code 11000)
-					if writeErr.Code == 11000 {
-						// Use upsert for this document
-						if writeErr.Index < len(group.Operations) {
-							op := group.Operations[writeErr.Index]
-							filter := bson.M{"_id": op.DocumentID}
-							if w.statsManager != nil {
-								w.statsManager.IncrementSequentialRetries(1)
-							}
-							if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
-								w.log.Debugf("[%s.%s] Upsert fallback failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
-								if w.dlq != nil {
-									w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
-								}
-							} else {
-								w.log.Debugf("[%s.%s] Successfully upserted document _id=%v after duplicate key error", dbName, collName, op.DocumentID)
-							}
-						}
-					} else {
-						// For non-duplicate key errors, retry with regular insert
-						if writeErr.Index < len(docs) {
-							if w.statsManager != nil {
-								w.statsManager.IncrementSequentialRetries(1)
-							}
-							if _, err := targetCollection.InsertOne(w.ctx, docs[writeErr.Index]); err != nil {
-								w.log.Errorf("[%s.%s] Retry insert failed for document _id=%v: %v", dbName, collName, failedDocID, err)
-								if w.dlq != nil {
-									w.dlq.WriteFailed(dbName, collName, failedDocID, err, "incremental", "insert", docs[writeErr.Index])
-								}
-							}
-						}
+					if writeErr.Index < len(group.Operations) {
+						w.retryIndividualOperation(targetCollection, op, dbName, collName, writeErr.Message)
 					}
 				}
 			} else {
@@ -840,31 +807,10 @@ func (w *Worker) processGroup(group OperationGroup) {
 				}
 
 				if !bulkRetrySucceeded {
-					// Fall back to individual operations with upsert for all documents
+					// Fall back to individual operations one-by-one to isolate errors and prevent DLQ victim colocation!
+					w.log.Warnf("[%s.%s] Bulk insert failed: %v. Falling back to individual operations one-by-one.", dbName, collName, err)
 					for _, op := range group.Operations {
-						// Try insert first
-						if w.statsManager != nil {
-							w.statsManager.IncrementSequentialRetries(1)
-						}
-						if _, err := targetCollection.InsertOne(w.ctx, op.Document); err != nil {
-							// If insert fails, try upsert
-							filter := bson.M{"_id": op.DocumentID}
-							if w.statsManager != nil {
-								w.statsManager.IncrementSequentialRetries(1)
-							}
-							if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
-								if err == context.Canceled {
-									w.log.Debugf("[%s.%s] Upserting document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
-								} else {
-									w.log.Errorf("[%s.%s] Error upserting document _id=%v: %v", dbName, collName, op.DocumentID, err)
-									if w.dlq != nil {
-										w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
-									}
-								}
-							} else {
-								w.log.Debugf("[%s.%s] Successfully upserted document _id=%v after insert failed", dbName, collName, op.DocumentID)
-							}
-						}
+						w.retryIndividualOperation(targetCollection, op, dbName, collName, err.Error())
 					}
 				}
 			}
@@ -875,24 +821,8 @@ func (w *Worker) processGroup(group OperationGroup) {
 	case "update":
 		var models []mongo.WriteModel
 		for _, op := range group.Operations {
-			// Check if this is a modifier update (has updateDescription) or full replacement (has fullDocument)
-			if op.UpdateDescription != nil {
-				// Modifier update - use UpdateOne with update operators ($set, $inc, etc.)
-				// Transform __*__ field names in update description for Firestore compatibility
-				transformed, err := TransformFieldNames(op.UpdateDescription, w.log, dbName, collName, op.DocumentID)
-				if err != nil {
-					w.log.Errorf("[%s.%s] Field name transformation failed for update modifier operation, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-					if w.dlq != nil {
-						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.UpdateDescription)
-					}
-					continue
-				}
-				model := mongo.NewUpdateOneModel().
-					SetFilter(bson.M{"_id": op.DocumentID}).
-					SetUpdate(transformed).
-					SetUpsert(true)
-				models = append(models, model)
-			} else if op.Document != nil {
+			// Unify all incremental updates into full ReplaceOne replacement upserts using op.Document
+			if op.Document != nil {
 				// Full document replacement - use ReplaceOne
 				// Transform __*__ field names to _*_ for Firestore compatibility
 				transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
@@ -909,7 +839,7 @@ func (w *Worker) processGroup(group OperationGroup) {
 					SetUpsert(true)
 				models = append(models, model)
 			} else {
-				w.log.Errorf("[%s.%s] Update operation has neither updateDescription nor fullDocument for document _id=%v", dbName, collName, op.DocumentID)
+				w.log.Errorf("[%s.%s] Update operation failed: document payload is nil for _id=%v", dbName, collName, op.DocumentID)
 				continue
 			}
 		}
@@ -927,38 +857,15 @@ func (w *Worker) processGroup(group OperationGroup) {
 				// Process individual errors
 				for _, writeErr := range bulkWriteException.WriteErrors {
 					var failedDocID interface{}
+					var op WriteOperation
 					if writeErr.Index < len(group.Operations) {
-						failedDocID = group.Operations[writeErr.Index].DocumentID
+						op = group.Operations[writeErr.Index]
+						failedDocID = op.DocumentID
 					}
 					w.log.Errorf("[%s.%s] Update error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
 
-					// Retry the failed operation
 					if writeErr.Index < len(group.Operations) {
-						op := group.Operations[writeErr.Index]
-						filter := bson.M{"_id": op.DocumentID}
-
-						// Retry with the appropriate method based on operation type
-						if op.UpdateDescription != nil {
-							if w.statsManager != nil {
-								w.statsManager.IncrementSequentialRetries(1)
-							}
-							if _, err := targetCollection.UpdateOne(w.ctx, filter, op.UpdateDescription, options.Update().SetUpsert(true)); err != nil {
-								w.log.Errorf("[%s.%s] Retry modifier update failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
-								if w.dlq != nil {
-									w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.UpdateDescription)
-								}
-							}
-						} else if op.Document != nil {
-							if w.statsManager != nil {
-								w.statsManager.IncrementSequentialRetries(1)
-							}
-							if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
-								w.log.Errorf("[%s.%s] Retry replace update failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
-								if w.dlq != nil {
-									w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
-								}
-							}
-						}
+						w.retryIndividualOperation(targetCollection, op, dbName, collName, writeErr.Message)
 					}
 				}
 			} else {
@@ -994,38 +901,7 @@ func (w *Worker) processGroup(group OperationGroup) {
 
 				// Fall back to individual updates
 				for _, op := range group.Operations {
-					filter := bson.M{"_id": op.DocumentID}
-
-					// Use the appropriate method based on operation type
-					if op.UpdateDescription != nil {
-						if w.statsManager != nil {
-							w.statsManager.IncrementSequentialRetries(1)
-						}
-						if _, err := targetCollection.UpdateOne(w.ctx, filter, op.UpdateDescription, options.Update().SetUpsert(true)); err != nil {
-							if err == context.Canceled {
-								w.log.Debugf("[%s.%s] Updating document _id=%v (modifier) canceled due to context cancellation", dbName, collName, op.DocumentID)
-							} else {
-								w.log.Errorf("[%s.%s] Error updating document _id=%v (modifier): %v", dbName, collName, op.DocumentID, err)
-								if w.dlq != nil {
-									w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.UpdateDescription)
-								}
-							}
-						}
-					} else if op.Document != nil {
-						if w.statsManager != nil {
-							w.statsManager.IncrementSequentialRetries(1)
-						}
-						if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
-							if err == context.Canceled {
-								w.log.Debugf("[%s.%s] Replacing document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
-							} else {
-								w.log.Errorf("[%s.%s] Error replacing document _id=%v: %v", dbName, collName, op.DocumentID, err)
-								if w.dlq != nil {
-									w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
-								}
-							}
-						}
-					}
+					w.retryIndividualOperation(targetCollection, op, dbName, collName, err.Error())
 				}
 			}
 		} else {
@@ -1053,24 +929,15 @@ func (w *Worker) processGroup(group OperationGroup) {
 				// Process individual errors
 				for _, writeErr := range bulkWriteException.WriteErrors {
 					var failedDocID interface{}
+					var op WriteOperation
 					if writeErr.Index < len(group.Operations) {
-						failedDocID = group.Operations[writeErr.Index].DocumentID
+						op = group.Operations[writeErr.Index]
+						failedDocID = op.DocumentID
 					}
 					w.log.Errorf("[%s.%s] Delete error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
 
-					// Retry the failed operation
 					if writeErr.Index < len(group.Operations) {
-						op := group.Operations[writeErr.Index]
-						filter := bson.M{"_id": op.DocumentID}
-						if w.statsManager != nil {
-							w.statsManager.IncrementSequentialRetries(1)
-						}
-						if _, err := targetCollection.DeleteOne(w.ctx, filter); err != nil {
-							w.log.Errorf("[%s.%s] Retry delete failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
-							if w.dlq != nil {
-								w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "delete", nil)
-							}
-						}
+						w.retryIndividualOperation(targetCollection, op, dbName, collName, writeErr.Message)
 					}
 				}
 			} else {
@@ -1106,20 +973,7 @@ func (w *Worker) processGroup(group OperationGroup) {
 
 				// Fall back to individual deletes
 				for _, op := range group.Operations {
-					filter := bson.M{"_id": op.DocumentID}
-					if w.statsManager != nil {
-						w.statsManager.IncrementSequentialRetries(1)
-					}
-					if _, err := targetCollection.DeleteOne(w.ctx, filter); err != nil {
-						if err == context.Canceled {
-							w.log.Debugf("[%s.%s] Deleting document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
-						} else {
-							w.log.Errorf("[%s.%s] Error deleting document _id=%v: %v", dbName, collName, op.DocumentID, err)
-							if w.dlq != nil {
-								w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "delete", nil)
-							}
-						}
-					}
+					w.retryIndividualOperation(targetCollection, op, dbName, collName, err.Error())
 				}
 			}
 		} else {
@@ -1158,24 +1012,15 @@ func (w *Worker) processGroup(group OperationGroup) {
 				// Process individual errors
 				for _, writeErr := range bulkWriteException.WriteErrors {
 					var failedDocID interface{}
+					var op WriteOperation
 					if writeErr.Index < len(group.Operations) {
-						failedDocID = group.Operations[writeErr.Index].DocumentID
+						op = group.Operations[writeErr.Index]
+						failedDocID = op.DocumentID
 					}
 					w.log.Errorf("[%s.%s] Replace error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
 
-					// Retry the failed operation
 					if writeErr.Index < len(group.Operations) {
-						op := group.Operations[writeErr.Index]
-						filter := bson.M{"_id": op.DocumentID}
-						if w.statsManager != nil {
-							w.statsManager.IncrementSequentialRetries(1)
-						}
-						if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
-							w.log.Errorf("[%s.%s] Retry replace failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
-							if w.dlq != nil {
-								w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
-							}
-						}
+						w.retryIndividualOperation(targetCollection, op, dbName, collName, writeErr.Message)
 					}
 				}
 			} else {
@@ -1211,20 +1056,7 @@ func (w *Worker) processGroup(group OperationGroup) {
 
 				// Fall back to individual replaces
 				for _, op := range group.Operations {
-					filter := bson.M{"_id": op.DocumentID}
-					if w.statsManager != nil {
-						w.statsManager.IncrementSequentialRetries(1)
-					}
-					if _, err := targetCollection.ReplaceOne(w.ctx, filter, op.Document, options.Replace().SetUpsert(true)); err != nil {
-						if err == context.Canceled {
-							w.log.Debugf("[%s.%s] Replacing document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
-						} else {
-							w.log.Errorf("[%s.%s] Error replacing document _id=%v: %v", dbName, collName, op.DocumentID, err)
-							if w.dlq != nil {
-								w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
-							}
-						}
-					}
+					w.retryIndividualOperation(targetCollection, op, dbName, collName, err.Error())
 				}
 			}
 		} else {
@@ -1276,52 +1108,116 @@ func (w *Worker) Shutdown() {
 func (w *Worker) retryIndividualOperation(targetCollection *mongo.Collection, op WriteOperation, dbName, collName string, originalErrorMsg string) {
 	filter := bson.M{"_id": op.DocumentID}
 	if w.statsManager != nil {
-		w.statsManager.IncrementSequentialRetries(1)
+		w.statsManager.IncrementSequentialRetries(op.OpType, 1)
 	}
+
+	// Check if this error represents a duplicate key/already exists constraint failure
+	isDup := isDuplicateKeyError(0, originalErrorMsg)
 
 	switch op.OpType {
 	case "insert":
 		transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
-		if err == nil {
+		if err != nil {
+			w.log.Errorf("[%s.%s] Field name transformation failed for fallback insert, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+			if w.dlq != nil {
+				w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
+			}
+			return
+		}
+
+		if isDup {
+			// If duplicate key, retry using ReplaceOne with upsert=true to overwrite
+			w.log.Debugf("[%s.%s] Fallback upserting duplicate insert document _id=%v", dbName, collName, op.DocumentID)
 			if _, err := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
-				w.log.Errorf("[%s.%s] Fallback upsert failed for insert document _id=%v: %v", dbName, collName, op.DocumentID, err)
+				w.log.Debugf("[%s.%s] Fallback upsert failed for insert document _id=%v: %v", dbName, collName, op.DocumentID, err)
+				if w.dlq != nil {
+					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
+				}
+			} else {
+				w.log.Debugf("[%s.%s] Successfully upserted document _id=%v after duplicate key error", dbName, collName, op.DocumentID)
+			}
+		} else {
+			// For non-duplicate key errors, retry with standard InsertOne
+			if _, err := targetCollection.InsertOne(w.ctx, transformed); err != nil {
+				w.log.Errorf("[%s.%s] Fallback insert failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
 				if w.dlq != nil {
 					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
 				}
 			}
 		}
+
 	case "update":
-		if op.UpdateDescription != nil {
-			transformed, err := TransformFieldNames(op.UpdateDescription, w.log, dbName, collName, op.DocumentID)
-			if err == nil {
-				if _, err := targetCollection.UpdateOne(w.ctx, filter, transformed, options.Update().SetUpsert(true)); err != nil {
-					w.log.Errorf("[%s.%s] Fallback modifier update failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
-					if w.dlq != nil {
-						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.UpdateDescription)
-					}
-				}
-			}
-		} else if op.Document != nil {
+		if op.Document != nil {
 			transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
-			if err == nil {
-				if _, err := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
+			if err != nil {
+				w.log.Errorf("[%s.%s] Field name transformation failed for fallback replace update, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+				if w.dlq != nil {
+					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
+				}
+				return
+			}
+			if _, err := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
+				if err == context.Canceled || w.ctx.Err() == context.Canceled {
+					w.log.Debugf("[%s.%s] Fallback replace update for document _id=%v canceled", dbName, collName, op.DocumentID)
+					return
+				}
+
+				// If it failed because the document already exists (concurrent upsert collision), retry with upsert=false
+				if isDuplicateKeyError(0, err.Error()) {
+					w.log.Debugf("[%s.%s] Concurrent upsert collision detected for replace document _id=%v, retrying without upsert", dbName, collName, op.DocumentID)
+					if _, retryErr := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(false)); retryErr != nil {
+						w.log.Errorf("[%s.%s] Fallback replace update without upsert failed for document _id=%v: %v", dbName, collName, op.DocumentID, retryErr)
+						if w.dlq != nil {
+							w.dlq.WriteFailed(dbName, collName, op.DocumentID, retryErr, "incremental", "update", op.Document)
+						}
+					} else {
+						w.log.Debugf("[%s.%s] Successfully completed replace update for document _id=%v after concurrent upsert resolution", dbName, collName, op.DocumentID)
+					}
+				} else {
 					w.log.Errorf("[%s.%s] Fallback replace update failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
 					if w.dlq != nil {
 						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
 					}
 				}
 			}
+		} else {
+			w.log.Errorf("[%s.%s] Fallback update failed: document payload is nil for _id=%v", dbName, collName, op.DocumentID)
 		}
+
 	case "replace":
 		transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
-		if err == nil {
-			if _, err := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
+		if err != nil {
+			w.log.Errorf("[%s.%s] Field name transformation failed for fallback replace, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+			if w.dlq != nil {
+				w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
+			}
+			return
+		}
+		if _, err := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
+			if err == context.Canceled || w.ctx.Err() == context.Canceled {
+				w.log.Debugf("[%s.%s] Fallback replace for document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
+				return
+			}
+
+			// If it failed because the document already exists (concurrent upsert collision), retry with upsert=false
+			if isDuplicateKeyError(0, err.Error()) {
+				w.log.Debugf("[%s.%s] Concurrent upsert collision detected for replace document _id=%v, retrying without upsert", dbName, collName, op.DocumentID)
+				if _, retryErr := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(false)); retryErr != nil {
+					w.log.Errorf("[%s.%s] Fallback replace without upsert failed for document _id=%v: %v", dbName, collName, op.DocumentID, retryErr)
+					if w.dlq != nil {
+						w.dlq.WriteFailed(dbName, collName, op.DocumentID, retryErr, "incremental", "replace", op.Document)
+					}
+				} else {
+					w.log.Debugf("[%s.%s] Successfully completed replace for document _id=%v after concurrent upsert resolution", dbName, collName, op.DocumentID)
+				}
+			} else {
 				w.log.Errorf("[%s.%s] Fallback replace failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
 				if w.dlq != nil {
 					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
 				}
 			}
 		}
+
 	case "delete":
 		if _, err := targetCollection.DeleteOne(w.ctx, filter); err != nil {
 			w.log.Errorf("[%s.%s] Fallback delete failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
@@ -1330,4 +1226,11 @@ func (w *Worker) retryIndividualOperation(targetCollection *mongo.Collection, op
 			}
 		}
 	}
+}
+
+// isDuplicateKeyError checks if a write error code or message represents a duplicate key/document already exists constraint failure.
+func isDuplicateKeyError(code int, msg string) bool {
+	return code == 11000 || 
+		strings.Contains(msg, "Document already exists") || 
+		strings.Contains(msg, "E11000")
 }

@@ -150,7 +150,7 @@ func TestStatsManagerMetrics(t *testing.T) {
 	sm.IncrementUpdatedThenDeleted(0)
 	sm.IncrementEventsReceived("insert")
 	sm.IncrementEventsFailed("insert")
-	sm.IncrementSequentialRetries(3)
+	sm.IncrementSequentialRetries("insert", 3)
 	sm.RecordBulkWrite(42, true)
 	sm.RecordBulkWrite(10, false)
 	sm.IncrementTimeoutFlushes()

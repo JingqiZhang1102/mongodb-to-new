@@ -77,7 +77,7 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndDescription(t *testing.T
 func TestWorkerProcessEventUpdateWithNullFullDocumentAndStatsManager(t *testing.T) {
 	log := logger.New()
 	ctx := context.Background()
-	statsMgr := NewStatsManager(log, 0)
+	statsMgr := NewStatsManager(log, 0, false)
 
 	worker := NewWorker(
 		1,                                   // id
