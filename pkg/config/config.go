@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,10 +11,13 @@ import (
 // Config represents the main configuration structure
 type Config struct {
 	DatabasePairs          []DatabasePair `json:"databasePairs"`
-	SaveThreshold          int            `json:"saveThreshold"`
-	CheckpointInterval     int            `json:"checkpointInterval"`     // Checkpoint interval in minutes
+	SaveThreshold          int            `json:"saveThreshold"`          // Number of processed events before saving a resume token checkpoint
+	CheckpointIntervalMinutes int            `json:"checkpointIntervalMinutes"` // Checkpoint interval in minutes
 	ForceOrderedOperations bool           `json:"forceOrderedOperations"` // Force ordered operations for all types
 	FlushIntervalMs        int            `json:"flushIntervalMs"`        // Flush interval in milliseconds
+	TargetMaxConnIdleSeconds int            `json:"targetMaxConnIdleSeconds"` // Maximum connection idle time for target in seconds
+	TargetMinPoolSize        int            `json:"targetMinPoolSize"`        // Minimum connection pool size for target
+	TargetMaxPoolSize        int            `json:"targetMaxPoolSize"`        // Maximum connection pool size for target
 
 	// Parameters for initial migration
 	InitialReadBatchSize     int `json:"initialReadBatchSize"`     // Number of documents to read in a batch during initial migration
@@ -27,6 +31,9 @@ type Config struct {
 	IncrementalWriteBatchSize int `json:"incrementalWriteBatchSize"` // Maximum size of operation groups
 	IncrementalWorkerCount    int `json:"incrementalWorkerCount"`    // Number of worker goroutines
 	StatsIntervalMinutes      int `json:"statsIntervalMinutes"`      // Interval for reporting change stream statistics in minutes
+	GroupOpsByDistinctId      bool `json:"groupOpsByDistinctId"`      // Enable key-collision grouping instead of optype grouping
+	IncrementalIncomingQueueSize  int `json:"incrementalIncomingQueueSize"`  // Buffer size of workers' raw events queue
+	IncrementalProcessingQueueSize int `json:"incrementalProcessingQueueSize"` // Buffer size of workers' writing batches queue
 
 	// Parallel read configuration for large collections
 	ParallelReadsEnabled    bool `json:"parallelReadsEnabled"`    // Enable parallel reads for large collections
@@ -99,10 +106,12 @@ func LoadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("error reading config file: %w", err)
 	}
 
-	// Parse the config
+	// Parse the config strictly (fail on unrecognized fields)
 	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("error parsing config file: %w", err)
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&config); err != nil {
+		return nil, fmt.Errorf("error parsing config file (unrecognized configuration fields present): %w", err)
 	}
 
 	// Validate the config
@@ -115,9 +124,9 @@ func LoadConfig(configPath string) (*Config, error) {
 		config.SaveThreshold = 100
 	}
 
-	// Set default checkpoint interval if not provided
-	if config.CheckpointInterval <= 0 {
-		config.CheckpointInterval = 5 // Default to 5 minutes
+	// Set default checkpoint interval in minutes if not provided
+	if config.CheckpointIntervalMinutes <= 0 {
+		config.CheckpointIntervalMinutes = 5 // Default to 5 minutes
 	}
 
 	// Set default values for incremental replication parameters
@@ -133,6 +142,14 @@ func LoadConfig(configPath string) (*Config, error) {
 		config.IncrementalWorkerCount = runtime.NumCPU() // Default to number of CPU cores
 	}
 
+	if config.IncrementalIncomingQueueSize <= 0 {
+		config.IncrementalIncomingQueueSize = 8192 // Default to 8192 change events
+	}
+
+	if config.IncrementalProcessingQueueSize <= 0 {
+		config.IncrementalProcessingQueueSize = 4096 // Default to 4096 groups
+	}
+
 	if config.StatsIntervalMinutes <= 0 {
 		config.StatsIntervalMinutes = 5 // Default to 5 minutes
 	}
@@ -140,6 +157,20 @@ func LoadConfig(configPath string) (*Config, error) {
 	// Set default flush interval if not provided
 	if config.FlushIntervalMs <= 0 {
 		config.FlushIntervalMs = 500 // Default to 500 milliseconds
+	}
+
+
+
+	// Set default min and max pool size if not provided
+	if config.TargetMinPoolSize <= 0 {
+		config.TargetMinPoolSize = 128
+	}
+	if config.TargetMaxPoolSize <= 0 {
+		config.TargetMaxPoolSize = 256
+	}
+	// Ensure max pool size is >= min pool size
+	if config.TargetMaxPoolSize < config.TargetMinPoolSize {
+		config.TargetMaxPoolSize = config.TargetMinPoolSize
 	}
 
 	// Set default values for initial migration parameters
@@ -249,4 +280,15 @@ func validateConfig(config *Config) error {
 	}
 
 	return nil
+}
+
+// GetMaxWorkersForLive returns the maximum concurrent workers based on the operation mode.
+// It only considers initial migration workers for 'migrate' and 'live' modes,
+// and uses strictly the incremental worker count for 'live-only' mode.
+func (c *Config) GetMaxWorkersForLive(mode string) int {
+	maxWorkers := c.IncrementalWorkerCount
+	if mode != "live-only" {
+		maxWorkers = max(maxWorkers, c.ConcurrentCollections*c.InitialMigrationWorkers)
+	}
+	return maxWorkers
 }

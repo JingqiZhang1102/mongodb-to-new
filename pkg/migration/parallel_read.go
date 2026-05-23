@@ -41,7 +41,7 @@ func (p *CollectionPartitioner) Partition(ctx context.Context) ([]bson.D, error)
 	countCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
-	count, err := p.sourceCollection.CountDocuments(countCtx, bson.D{})
+	count, err := p.sourceCollection.EstimatedDocumentCount(countCtx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to count documents: %w", err)
 	}

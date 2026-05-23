@@ -4,6 +4,7 @@ go 1.21
 
 require (
 	github.com/globalsign/mgo v0.0.0-20181015135952-eeefdecb41b8
+	github.com/google/go-cmp v0.7.0
 	github.com/rwynn/gtm v1.0.0
 	github.com/rwynn/gtm/v2 v2.1.5
 	github.com/sirupsen/logrus v1.9.3

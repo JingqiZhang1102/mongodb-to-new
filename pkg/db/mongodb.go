@@ -9,6 +9,7 @@ import (
 
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -22,15 +23,19 @@ type MongoDB struct {
 	indexWg        sync.WaitGroup // tracks in-flight async index creation goroutines
 }
 
-// NewMongoDB creates a new MongoDB connection
-func NewMongoDB(connectionString, databaseName string, log *logger.Logger) (*MongoDB, error) {
+// NewMongoDB creates a new MongoDB connection with pool size and idle timeouts configured dynamically
+func NewMongoDB(connectionString, databaseName string, minPoolSize, maxPoolSize uint64, maxConnIdleTime time.Duration, log *logger.Logger) (*MongoDB, error) {
 	// Set client options
 	clientOptions := options.Client().
 		ApplyURI(connectionString).
-		SetMaxPoolSize(256).
-		SetMinPoolSize(128).
+		SetMaxPoolSize(maxPoolSize).
+		SetMinPoolSize(minPoolSize).
 		SetConnectTimeout(30 * time.Second).
 		SetSocketTimeout(120 * time.Second)
+
+	if maxConnIdleTime > 0 {
+		clientOptions.SetMaxConnIdleTime(maxConnIdleTime)
+	}
 
 	// Connect to MongoDB
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -116,15 +121,24 @@ func (m *MongoDB) CreateChangeStream(ctx context.Context, collectionName string,
 }
 
 // CreateClientLevelChangeStream creates a change stream at the client level
-// This watches for changes across all collections in all databases
-func (m *MongoDB) CreateClientLevelChangeStream(ctx context.Context, resumeToken interface{}, batchSize int) (*mongo.ChangeStream, error) {
+// This watches for changes across all collections in all databases.
+// It accepts both a resumeToken and a cdcStartTime:
+// - If resumeToken is provided, it takes precedence and instructs the driver to resume from a specific checkpoint.
+// - If resumeToken is nil but cdcStartTime is specified, it configures SetStartAtOperationTime to begin reading changes from that exact historical moment.
+func (m *MongoDB) CreateClientLevelChangeStream(ctx context.Context, resumeToken interface{}, cdcStartTime *primitive.Timestamp, batchSize int) (*mongo.ChangeStream, error) {
 	// Set pipeline for full document lookup on updates
 	pipeline := mongo.Pipeline{}
 
 	// Set options
 	opts := options.ChangeStream().SetFullDocument(options.UpdateLookup)
 	if resumeToken != nil {
+		// Resume replication from a previously saved checkpoint token
 		opts.SetResumeAfter(resumeToken)
+	} else if cdcStartTime != nil {
+		// If no resume token exists but the user provided a historical starting point,
+		// set the stream's start point to that specific cluster operation time.
+		opts.SetStartAtOperationTime(cdcStartTime)
+		m.log.Infof("Starting change stream at operation time: %s", time.Unix(int64(cdcStartTime.T), 0).UTC().Format(time.RFC3339))
 	}
 
 	// Set batch size if provided

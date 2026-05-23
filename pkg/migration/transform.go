@@ -2,6 +2,7 @@ package migration
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
@@ -51,9 +52,10 @@ func renameFieldName(name string) string {
 //   - Renames __*__ fields to _*_ (strip one underscore from each side)
 //   - Stringifies nested objects that contain field names exceeding maxFieldNameLength
 //
+// Returns the transformed document and an error if a field name collision is detected.
 // Supports bson.D, bson.M, map[string]interface{}, and arrays.
 // Logs transformations at Info/Warn level with db, collection, and document ID context.
-func TransformFieldNames(doc interface{}, log *logger.Logger, dbName, collName string, docID interface{}) interface{} {
+func TransformFieldNames(doc interface{}, log *logger.Logger, dbName, collName string, docID interface{}) (interface{}, error) {
 	// Root-level documents cannot be stringified (must remain documents for MongoDB insert).
 	// Warn about long keys at root level but don't stringify.
 	if doc != nil {
@@ -96,9 +98,9 @@ func warnRootLongKeys(doc interface{}, log *logger.Logger, dbName, collName stri
 // transformFieldNamesRecursive is the internal recursive implementation.
 // isRoot=true for the top-level document (skip long key stringification),
 // isRoot=false for nested objects (enable long key stringification).
-func transformFieldNamesRecursive(doc interface{}, log *logger.Logger, dbName, collName string, docID interface{}, isRoot bool) interface{} {
+func transformFieldNamesRecursive(doc interface{}, log *logger.Logger, dbName, collName string, docID interface{}, isRoot bool) (interface{}, error) {
 	if doc == nil {
-		return nil
+		return nil, nil
 	}
 
 	switch d := doc.(type) {
@@ -118,15 +120,16 @@ func transformFieldNamesRecursive(doc interface{}, log *logger.Logger, dbName, c
 							log.Errorf("Failed to stringify object with long field name [db=%s, collection=%s, _id=%v]: %v",
 								dbName, collName, docID, err)
 						}
-						// Fall through to normal processing if marshaling fails
-						break
+						return nil, fmt.Errorf("failed to stringify object with long field name: %w", err)
 					}
-					return string(jsonBytes)
+					return string(jsonBytes), nil
 				}
 			}
 		}
 
 		result := make(bson.D, 0, len(d))
+		seenKeys := make(map[string]string) // renamed key -> original key
+
 		for _, elem := range d {
 			// Remove empty field names (Firestore does not support them)
 			if elem.Key == "" {
@@ -137,16 +140,28 @@ func transformFieldNamesRecursive(doc interface{}, log *logger.Logger, dbName, c
 				continue
 			}
 			newKey := renameFieldName(elem.Key)
+			if original, exists := seenKeys[newKey]; exists {
+				return nil, fmt.Errorf("field name collision detected: key %q (from %q and %q) already exists in document [db=%s, collection=%s, _id=%v]",
+					newKey, original, elem.Key, dbName, collName, docID)
+			}
+			seenKeys[newKey] = elem.Key
+
 			if newKey != elem.Key && log != nil {
 				log.Infof("Renamed field \"%s\" to \"%s\" in document [db=%s, collection=%s, _id=%v]",
 					elem.Key, newKey, dbName, collName, docID)
 			}
+
+			transformedValue, err := transformFieldNamesRecursive(elem.Value, log, dbName, collName, docID, false)
+			if err != nil {
+				return nil, err
+			}
+
 			result = append(result, bson.E{
 				Key:   newKey,
-				Value: transformFieldNamesRecursive(elem.Value, log, dbName, collName, docID, false),
+				Value: transformedValue,
 			})
 		}
-		return result
+		return result, nil
 
 	case bson.M:
 		// For nested objects: if any immediate key exceeds maxFieldNameLength,
@@ -164,14 +179,16 @@ func transformFieldNamesRecursive(doc interface{}, log *logger.Logger, dbName, c
 							log.Errorf("Failed to stringify object with long field name [db=%s, collection=%s, _id=%v]: %v",
 								dbName, collName, docID, err)
 						}
-						break
+						return nil, fmt.Errorf("failed to stringify object with long field name: %w", err)
 					}
-					return string(jsonBytes)
+					return string(jsonBytes), nil
 				}
 			}
 		}
 
 		result := make(bson.M, len(d))
+		seenKeys := make(map[string]string) // renamed key -> original key
+
 		for k, v := range d {
 			// Remove empty field names (Firestore does not support them)
 			if k == "" {
@@ -182,13 +199,24 @@ func transformFieldNamesRecursive(doc interface{}, log *logger.Logger, dbName, c
 				continue
 			}
 			newKey := renameFieldName(k)
+			if original, exists := seenKeys[newKey]; exists {
+				return nil, fmt.Errorf("field name collision detected: key %q (from %q and %q) already exists in document [db=%s, collection=%s, _id=%v]",
+					newKey, original, k, dbName, collName, docID)
+			}
+			seenKeys[newKey] = k
+
 			if newKey != k && log != nil {
 				log.Infof("Renamed field \"%s\" to \"%s\" in document [db=%s, collection=%s, _id=%v]",
 					k, newKey, dbName, collName, docID)
 			}
-			result[newKey] = transformFieldNamesRecursive(v, log, dbName, collName, docID, false)
+
+			transformedValue, err := transformFieldNamesRecursive(v, log, dbName, collName, docID, false)
+			if err != nil {
+				return nil, err
+			}
+			result[newKey] = transformedValue
 		}
-		return result
+		return result, nil
 
 	case map[string]interface{}:
 		// For nested objects: if any immediate key exceeds maxFieldNameLength,
@@ -206,14 +234,16 @@ func transformFieldNamesRecursive(doc interface{}, log *logger.Logger, dbName, c
 							log.Errorf("Failed to stringify object with long field name [db=%s, collection=%s, _id=%v]: %v",
 								dbName, collName, docID, err)
 						}
-						break
+						return nil, fmt.Errorf("failed to stringify object with long field name: %w", err)
 					}
-					return string(jsonBytes)
+					return string(jsonBytes), nil
 				}
 			}
 		}
 
 		result := make(map[string]interface{}, len(d))
+		seenKeys := make(map[string]string) // renamed key -> original key
+
 		for k, v := range d {
 			// Remove empty field names (Firestore does not support them)
 			if k == "" {
@@ -224,31 +254,50 @@ func transformFieldNamesRecursive(doc interface{}, log *logger.Logger, dbName, c
 				continue
 			}
 			newKey := renameFieldName(k)
+			if original, exists := seenKeys[newKey]; exists {
+				return nil, fmt.Errorf("field name collision detected: key %q (from %q and %q) already exists in document [db=%s, collection=%s, _id=%v]",
+					newKey, original, k, dbName, collName, docID)
+			}
+			seenKeys[newKey] = k
+
 			if newKey != k && log != nil {
 				log.Infof("Renamed field \"%s\" to \"%s\" in document [db=%s, collection=%s, _id=%v]",
 					k, newKey, dbName, collName, docID)
 			}
-			result[newKey] = transformFieldNamesRecursive(v, log, dbName, collName, docID, false)
+
+			transformedValue, err := transformFieldNamesRecursive(v, log, dbName, collName, docID, false)
+			if err != nil {
+				return nil, err
+			}
+			result[newKey] = transformedValue
 		}
-		return result
+		return result, nil
 
 	case []interface{}:
 		result := make([]interface{}, len(d))
 		for i, item := range d {
-			result[i] = transformFieldNamesRecursive(item, log, dbName, collName, docID, false)
+			transformedValue, err := transformFieldNamesRecursive(item, log, dbName, collName, docID, false)
+			if err != nil {
+				return nil, err
+			}
+			result[i] = transformedValue
 		}
-		return result
+		return result, nil
 
 	case bson.A:
 		result := make(bson.A, len(d))
 		for i, item := range d {
-			result[i] = transformFieldNamesRecursive(item, log, dbName, collName, docID, false)
+			transformedValue, err := transformFieldNamesRecursive(item, log, dbName, collName, docID, false)
+			if err != nil {
+				return nil, err
+			}
+			result[i] = transformedValue
 		}
-		return result
+		return result, nil
 
 	default:
 		// Primitive types (string, int, float, bool, ObjectID, etc.) - return as-is
-		return doc
+		return doc, nil
 	}
 }
 
@@ -292,11 +341,15 @@ func bsonValueToInterface(v interface{}) interface{} {
 
 // TransformBatch applies TransformFieldNames to each document in a batch.
 // Extracts _id from each document for logging context.
-func TransformBatch(batch []interface{}, log *logger.Logger, dbName, collName string) []interface{} {
+func TransformBatch(batch []interface{}, log *logger.Logger, dbName, collName string) ([]interface{}, error) {
 	result := make([]interface{}, len(batch))
 	for i, doc := range batch {
 		docID := extractDocID(doc)
-		result[i] = TransformFieldNames(doc, log, dbName, collName, docID)
+		transformed, err := TransformFieldNames(doc, log, dbName, collName, docID)
+		if err != nil {
+			return nil, err
+		}
+		result[i] = transformed
 	}
-	return result
+	return result, nil
 }
