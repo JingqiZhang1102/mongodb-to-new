@@ -47,10 +47,7 @@ func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 	changeStream *mongo.ChangeStream, log *logger.Logger,
 	resumeTokenPath string, checkpointInterval time.Duration,
 	saveThreshold, incrementalWorkerCount, incrementalWriteBatchSize int,
-	forceOrderedOperations bool, flushInterval time.Duration, cfg *config.Config, dlq DLQ) *EventDistributor {
-
-	// Use stats interval from config
-	statsInterval := time.Duration(cfg.StatsIntervalMinutes) * time.Minute
+	forceOrderedOperations bool, flushInterval time.Duration, cfg *config.Config, dlq DLQ, statsManager *StatsManager) *EventDistributor {
 
 	// Create retry manager from config
 	retryMgr := NewRetryManagerFromConfig(cfg, log)
@@ -74,8 +71,8 @@ func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 		retryManager:              retryMgr,
 		cfg:                       cfg,
 
-		// Initialize statistics tracking
-		statsManager: NewStatsManager(log, statsInterval, cfg.GroupOpsByDistinctId),
+		// Use the shared statistics tracking
+		statsManager: statsManager,
 	}
 }
 
@@ -88,7 +85,7 @@ func hashDocumentID(docID interface{}) int {
 	case string:
 		bytes = []byte(id)
 	case primitive.ObjectID:
-		bytes = []byte(id.Hex())
+		bytes = id[:]
 	case int, int32, int64, float64, float32:
 		bytes = []byte(fmt.Sprintf("%v", id))
 	case bson.D:
@@ -122,15 +119,6 @@ func (d *EventDistributor) getWorkerIndex(docID interface{}) int {
 	return ((hash % d.incrementalWorkerCount) + d.incrementalWorkerCount) % d.incrementalWorkerCount
 }
 
-// waitForWorkersToFinish waits for all workers to finish processing
-func (d *EventDistributor) waitForWorkersToFinish() {
-	d.log.Info("Waiting for all workers to finish processing...")
-	for _, worker := range d.workers {
-		worker.WaitForCompletion()
-	}
-	d.log.Info("All workers have completed processing.")
-}
-
 // Start begins the event distribution process
 func (d *EventDistributor) Start() error {
 	d.log.Infof("Starting event distributor with %d workers (GroupOpsByDistinctId: %t)", d.incrementalWorkerCount, d.cfg.GroupOpsByDistinctId)
@@ -145,12 +133,13 @@ func (d *EventDistributor) Start() error {
 		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.statsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval, d.cfg.IncrementalIncomingQueueSize, d.cfg.IncrementalProcessingQueueSize)
 	}
 
-	// Set up context cancellation handling
-	go func() {
-		<-d.ctx.Done()
-		d.log.Info("Context canceled. Shutting down workers...")
+	// Ensure all workers are shut down sequentially and safely upon exit
+	defer func() {
+		d.log.Info("Shutting down workers...")
 		for _, worker := range d.workers {
-			worker.Shutdown()
+			if worker != nil {
+				worker.Shutdown()
+			}
 		}
 	}()
 
@@ -159,32 +148,18 @@ func (d *EventDistributor) Start() error {
 	lastCheckpointTime := time.Now()
 
 	for {
-		// Check for context cancellation before processing next event
-		if d.ctx.Err() != nil {
-			d.log.Info("Context canceled. Stopping event distribution...")
-			// Wait for all workers to finish processing their current operations
-			d.waitForWorkersToFinish()
-			// Return nil instead of context.Canceled to avoid error logging
-			return nil
-		}
-
 		// Try to get next change event
 		ok := d.changeStream.Next(d.ctx)
+		readTime := time.Now()
 		if !ok {
 			// Check if this is due to an error or end of stream
 			if err := d.changeStream.Err(); err != nil {
 				// Check if the error is due to context cancellation
 				if err == context.Canceled {
 					d.log.Info("Change stream interrupted due to context cancellation")
-				} else {
-					d.log.Errorf("Change stream error: %v", err)
-				}
-				// Wait for all workers to finish processing their current operations
-				d.waitForWorkersToFinish()
-				// Don't propagate context.Canceled as an error
-				if err == context.Canceled {
 					return nil
 				}
+				d.log.Errorf("Change stream error: %v", err)
 				return err
 			}
 			// End of stream, break out of the loop
@@ -219,14 +194,12 @@ func (d *EventDistributor) Start() error {
 			continue
 		}
 
-		var docID interface{}
-		if err := docIDVal.Unmarshal(&docID); err != nil {
-			d.log.Errorf("Error unmarshaling documentKey._id from raw BSON: %v", err)
-			continue
-		}
-
-		// Determine worker based on hash modulo worker count
-		workerIndex := d.getWorkerIndex(docID)
+		// Determine worker lock-freely and allocation-freely by hashing raw BSON bytes directly.
+		// By hashing the raw `_id` BSON value slice directly, we completely avoid calling Unmarshal
+		// on the single-threaded distributor loop. This shifts 100% of the CPU-heavy BSON decoding
+		// load into parallel worker goroutines, enabling linear CPU scale-out and 0 heap allocations.
+		hash := hashBytes(docIDVal.Value)
+		workerIndex := ((hash % d.incrementalWorkerCount) + d.incrementalWorkerCount) % d.incrementalWorkerCount
 
 		// Safe concurrent deep copy of raw BSON bytes to prevent mutation races
 		rawCopy := make(bson.Raw, len(rawEvent))
@@ -234,7 +207,7 @@ func (d *EventDistributor) Start() error {
 
 		// Send raw event copy to appropriate worker concurrently
 		select {
-		case d.workers[workerIndex].incomingQueue <- rawCopy:
+		case d.workers[workerIndex].incomingQueue <- QueueEvent{Event: rawCopy, ReadTime: readTime}:
 		case <-d.ctx.Done():
 			return nil
 		}
@@ -254,9 +227,6 @@ func (d *EventDistributor) Start() error {
 		}
 	}
 
-	// Wait for all workers to finish processing their current operations
-	d.waitForWorkersToFinish()
-
 	return nil
 }
 
@@ -275,6 +245,12 @@ func (d *EventDistributor) saveResumeToken(resumeToken bson.Raw) {
 	}
 }
 
+// QueueEvent wraps the raw change stream or oplog event with metadata like read time
+type QueueEvent struct {
+	Event    interface{} // bson.M or bson.Raw
+	ReadTime time.Time
+}
+
 // WriteOperation represents a single write operation
 type WriteOperation struct {
 	DocumentID        interface{}
@@ -282,8 +258,14 @@ type WriteOperation struct {
 	UpdateDescription interface{} // For modifier updates ($set, $inc, etc.)
 	Namespace         string
 	OpType            string
-	EventTime         time.Time
-	ReceiveTime       time.Time
+	// Stats
+	EventTime         time.Time // Time when the change event occurred on the source database (clusterTime or wallTime)
+	ReadTime          time.Time // Time when the event was read from the change stream/oplog by the distributor
+	WorkerReceiveTime time.Time // Time when the event was received by the worker thread goroutine
+	SuccessTime       time.Time // Set when successfully written to target DB
+	SuccessAfterRetry bool      // Set to true if the operation succeeded after a retry
+	DLQed             bool      // Track if the operation was routed to the DLQ
+	Error             error     // Track the exact write failure error
 }
 
 // OperationGroup represents a group of operations of the same type and namespace
@@ -298,7 +280,7 @@ type OperationGroup struct {
 type Worker struct {
 	id            int
 	ctx           context.Context
-	log           *logger.Logger
+	log           *workerLogger
 	targetDB      *db.MongoDB
 	collectionMap map[string]map[string]string
 	statsManager  *StatsManager
@@ -335,16 +317,16 @@ type Worker struct {
 
 	// Dynamic grouping configurations
 	groupOpsByDistinctId bool
-	currentGroupIDs     map[int]bool
-	flushInterval       time.Duration
+	currentGroupIDs      map[int]bool
+	flushInterval        time.Duration
 }
 
 // flushCurrentGroup moves the current group to the processing queue if it exists
 func (w *Worker) flushCurrentGroup() bool {
 	// Must be called with lock held
 	if w.currentGroup != nil && len(w.currentGroup.Operations) > 0 {
-		w.log.Debugf("Worker %d: Flushing group: %s.%s with %d operations",
-			w.id, w.currentGroup.Namespace, w.currentGroup.OpType,
+		w.log.Debugf("Flushing group: %s.%s with %d operations",
+			w.currentGroup.Namespace, w.currentGroup.OpType,
 			len(w.currentGroup.Operations))
 
 		w.processingQueue <- w.currentGroup
@@ -361,9 +343,7 @@ type statsTrackingDLQ struct {
 
 func (s *statsTrackingDLQ) WriteFailed(sourceDB, sourceCollection string, documentID interface{}, err error, phase, opType string, document interface{}) {
 	s.underlyingDlq.WriteFailed(sourceDB, sourceCollection, documentID, err, phase, opType, document)
-	if s.statsManager != nil {
-		s.statsManager.IncrementEventsFailed(opType)
-	}
+	// Incremented in statsManager.RecordLags to prevent double counting and maintain context
 }
 
 func (s *statsTrackingDLQ) Count() int64 {
@@ -391,7 +371,7 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 	w := &Worker{
 		id:                        id,
 		ctx:                       ctx,
-		log:                       log,
+		log:                       &workerLogger{workerID: id, logger: log},
 		targetDB:                  targetDB,
 		collectionMap:             collectionMap,
 		incomingQueue:             make(chan interface{}, incomingQueueSize),
@@ -464,17 +444,42 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 	defer w.mu.Unlock()
 
 	var event bson.M
+	var readTime time.Time
+
 	switch e := eventArg.(type) {
+	case QueueEvent:
+		readTime = e.ReadTime
+		switch inner := e.Event.(type) {
+		case bson.M:
+			event = inner
+		case bson.Raw:
+			if err := bson.Unmarshal(inner, &event); err != nil {
+				w.log.Errorf("Failed to unmarshal raw BSON change event: %v", err)
+				return
+			}
+		default:
+			w.log.Errorf("Invalid inner event type: %T", e.Event)
+			return
+		}
 	case bson.M:
 		event = e
+		if rt, exists := event["readTime"]; exists {
+			if t, ok := rt.(time.Time); ok {
+				readTime = t
+			}
+		}
 	case bson.Raw:
 		if err := bson.Unmarshal(e, &event); err != nil {
-			w.log.Errorf("Worker %d: Failed to unmarshal raw BSON change event: %v", w.id, err)
+			w.log.Errorf("Failed to unmarshal raw BSON change event: %v", err)
 			return
 		}
 	default:
-		w.log.Errorf("Worker %d: Invalid event type in ProcessEvent: %T", w.id, eventArg)
+		w.log.Errorf("Invalid event type in ProcessEvent: %T", eventArg)
 		return
+	}
+
+	if readTime.IsZero() {
+		readTime = time.Now()
 	}
 
 	// Extract operation details
@@ -504,8 +509,8 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 	eventTime := ExtractEventTime(event)
 
 	// Debug log for worker events
-	w.log.Debugf("Worker %d received event: type=%s, namespace=%s, docID=%v, hasFullDoc=%v, hasUpdateDesc=%v",
-		w.id, opType, namespace, docID, fullDocument != nil, updateDescription != nil)
+	w.log.Debugf("received event: type=%s, namespace=%s, docID=%v, hasFullDoc=%v, hasUpdateDesc=%v",
+		opType, namespace, docID, fullDocument != nil, updateDescription != nil)
 
 	// Create write operation
 	op := WriteOperation{
@@ -515,7 +520,8 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 		Namespace:         namespace,
 		OpType:            opType,
 		EventTime:         eventTime,
-		ReceiveTime:       time.Now(),
+		ReadTime:          readTime,
+		WorkerReceiveTime: time.Now(),
 	}
 
 	docHash := hashDocumentID(docID)
@@ -595,7 +601,7 @@ func (w *Worker) processGroups() {
 			if !ok {
 				// Channel closed, shutdown worker
 				if w.shutdownInProgress {
-					w.log.Debugf("Worker %d: Completed processing all groups during shutdown", w.id)
+					w.log.Debugf("Completed processing all groups during shutdown")
 				}
 				return
 			}
@@ -609,8 +615,8 @@ func (w *Worker) processGroups() {
 
 // processGroup processes a single operation group
 func (w *Worker) processGroup(group OperationGroup) {
-	w.log.Debugf("Worker %d: Processing group: %s.%s with %d operations",
-		w.id, group.Namespace, group.OpType, len(group.Operations))
+	w.log.Debugf("Processing group: %s.%s with %d operations",
+		group.Namespace, group.OpType, len(group.Operations))
 
 	// Get target collection
 	parts := strings.SplitN(group.Namespace, ".", 2)
@@ -624,6 +630,15 @@ func (w *Worker) processGroup(group OperationGroup) {
 	targetCollName := w.getTargetCollectionName(dbName, collName)
 	targetCollection := w.targetDB.GetCollection(targetCollName)
 
+	// Use a graceful shutdown context with timeout if the main context was canceled.
+	// This ensures the final queues flushed during Ctrl+C / shutdown can actually write to MongoDB.
+	writeCtx := w.ctx
+	if w.ctx.Err() != nil {
+		var cancel context.CancelFunc
+		writeCtx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+	}
+
 	// Determine if we should use ordered operations
 	useOrdered := group.OpType == "update" || group.OpType == "replace" || w.forceOrderedOperations
 
@@ -635,470 +650,204 @@ func (w *Worker) processGroup(group OperationGroup) {
 	switch group.OpType {
 	case "mixed":
 		var models []mongo.WriteModel
-		for _, op := range group.Operations {
-			switch op.OpType {
-			case "insert":
-				transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
-				if err != nil {
-					w.log.Errorf("[%s.%s] Field name transformation failed for mixed insert, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-					if w.dlq != nil {
-						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
-					}
-					continue
-				}
-				model := mongo.NewInsertOneModel().SetDocument(transformed)
-				models = append(models, model)
-
-			case "update":
-				if op.Document != nil {
-					transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
-					if err != nil {
-						w.log.Errorf("[%s.%s] Field name transformation failed for mixed update replacement, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-						if w.dlq != nil {
-							w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
-						}
-						continue
-					}
-					model := mongo.NewReplaceOneModel().
-						SetFilter(bson.M{"_id": op.DocumentID}).
-						SetReplacement(transformed).
-						SetUpsert(true)
-					models = append(models, model)
-				} else {
-					w.log.Errorf("[%s.%s] Mixed update failed: document payload is nil for _id=%v", dbName, collName, op.DocumentID)
-				}
-
-			case "replace":
-				transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
-				if err != nil {
-					w.log.Errorf("[%s.%s] Field name transformation failed for mixed replace, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-					if w.dlq != nil {
-						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
-					}
-					continue
-				}
-				model := mongo.NewReplaceOneModel().
-					SetFilter(bson.M{"_id": op.DocumentID}).
-					SetReplacement(transformed).
-					SetUpsert(true)
-				models = append(models, model)
-
-			case "delete":
-				model := mongo.NewDeleteOneModel().SetFilter(bson.M{"_id": op.DocumentID})
-				models = append(models, model)
+		for idx := range group.Operations {
+			op := &group.Operations[idx]
+			model, err := w.buildWriteModel(*op, dbName, collName)
+			if err != nil {
+				w.handleTransformationFailure(op, dbName, collName, err)
+				continue
 			}
+			models = append(models, model)
 		}
 
 		if len(models) > 0 {
-			issueTime := time.Now()
-			_, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(true))
+			startTime := time.Now()
+			_, err := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
 			if w.statsManager != nil {
-				w.statsManager.RecordLatency("mixed", group.Operations, issueTime, time.Since(issueTime), w.id)
+				w.statsManager.RecordLatency("mixed", group.Operations, time.Since(startTime), w.id, err == nil)
 			}
-			if err != nil {
-				bulkWriteException, ok := err.(mongo.BulkWriteException)
-				if ok && w.ctx.Err() != context.Canceled {
-					w.log.Errorf("[%s.%s] Bulk mixed operations partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
-
-					// Handle individual failures by fallback retries
-					for _, writeErr := range bulkWriteException.WriteErrors {
-						var failedDocID interface{}
-						var op WriteOperation
-						if writeErr.Index < len(group.Operations) {
-							op = group.Operations[writeErr.Index]
-							failedDocID = op.DocumentID
-						}
-
-						isDupInsert := op.OpType == "insert" && isDuplicateKeyError(writeErr.Code, writeErr.Message)
-						if isDupInsert {
-							w.log.Debugf("[%s.%s] Mixed insert had duplicate key occurrence for _id=%v, gracefully falling back to upsert", dbName, collName, failedDocID)
-						} else {
-							w.log.Errorf("[%s.%s] Mixed write error at index %d (opType=%s), _id=%v: %v", dbName, collName, writeErr.Index, op.OpType, failedDocID, writeErr.Message)
-						}
-
-						// Fallback retry for the single failed operation
-						if writeErr.Index < len(group.Operations) {
-							w.retryIndividualOperation(targetCollection, op, dbName, collName, writeErr.Message)
-						}
-					}
-				} else {
-					if err == context.Canceled || w.ctx.Err() == context.Canceled {
-						w.log.Debugf("[%s.%s] Bulk mixed operations canceled due to context cancellation", dbName, collName)
-					} else {
-						w.log.Errorf("[%s.%s] Error performing bulk mixed operations: %v", dbName, collName, err)
-
-						// For transient errors, retry the bulk operation with backoff before falling back to DLQ
-						bulkRetrySucceeded := false
-						if w.retryManager != nil {
-							errType := w.retryManager.ClassifyError(err)
-							if errType == ErrorTypeConnection || errType == ErrorTypeContention {
-								w.log.Infof("[%s.%s] Transient error detected. Retrying bulk mixed operations with backoff...", dbName, collName)
-								retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
-									_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(true))
-									return retryBulkErr
-								})
-								if retryErr == nil {
-									w.log.Infof("[%s.%s] Bulk mixed operations succeeded after retry", dbName, collName)
-									bulkRetrySucceeded = true
-								} else {
-									w.log.Warnf("[%s.%s] Bulk mixed operations still failed after retries: %v. Routing to DLQ.", dbName, collName, retryErr)
-									err = retryErr
-								}
-							}
-						}
-
-						if !bulkRetrySucceeded {
-							// Fall back to individual operations one-by-one to isolate errors and prevent DLQ victim colocation!
-							w.log.Warnf("[%s.%s] Bulk mixed operations failed: %v. Falling back to individual operations one-by-one.", dbName, collName, err)
-							for _, op := range group.Operations {
-								w.retryIndividualOperation(targetCollection, op, dbName, collName, err.Error())
-							}
-						}
-					}
-				}
-			}
+			w.handleBulkWriteResult(writeCtx, &group, err, targetCollection, dbName, collName, func() error {
+				_, retryBulkErr := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
+				return retryBulkErr
+			})
 		}
 
 	case "insert":
 		var docs []interface{}
-		for _, op := range group.Operations {
+		for idx := range group.Operations {
+			op := &group.Operations[idx]
 			// Transform __*__ field names to _*_ for Firestore compatibility
-			transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
+			transformed, err := TransformFieldNames(op.Document, w.log.logger, dbName, collName, op.DocumentID)
 			if err != nil {
-				w.log.Errorf("[%s.%s] Field name transformation failed for insert operation, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-				if w.dlq != nil {
-					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
-				}
+				w.handleTransformationFailure(op, dbName, collName, err)
 				continue
 			}
 			docs = append(docs, transformed)
 		}
 
-		issueTime := time.Now()
-		_, err := targetCollection.InsertMany(w.ctx, docs, options.InsertMany().SetOrdered(useOrdered))
+		startTime := time.Now()
+		_, err := targetCollection.InsertMany(writeCtx, docs, options.InsertMany().SetOrdered(useOrdered))
 		if w.statsManager != nil {
-			w.statsManager.RecordLatency("insert", group.Operations, issueTime, time.Since(issueTime), w.id)
+			w.statsManager.RecordLatency("insert", group.Operations, time.Since(startTime), w.id, err == nil)
 		}
-		if err != nil {
-			bulkWriteException, ok := err.(mongo.BulkWriteException)
-			if ok && w.ctx.Err() != context.Canceled {
-				// Check if all write errors are simply duplicate key errors (gracefully handled by upsert fallback)
-				hasRealErrors := false
-				// Check if it's a duplicate key error
-				for _, writeErr := range bulkWriteException.WriteErrors {
-					if !isDuplicateKeyError(writeErr.Code, writeErr.Message) {
-						hasRealErrors = true
-						break
-					}
-				}
-				if hasRealErrors {
-					w.log.Errorf("[%s.%s] Bulk insert partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
-				} else {
-					w.log.Debugf("[%s.%s] Bulk insert had %d duplicate key occurrences (gracefully falling back to upserts)", dbName, collName, len(bulkWriteException.WriteErrors))
-				}
-
-				// Process individual errors
-				for _, writeErr := range bulkWriteException.WriteErrors {
-					var failedDocID interface{}
-					var op WriteOperation
-					if writeErr.Index < len(group.Operations) {
-						op = group.Operations[writeErr.Index]
-						failedDocID = op.DocumentID
-					}
-					w.log.Debugf("[%s.%s] Insert error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
-
-					if writeErr.Index < len(group.Operations) {
-						w.retryIndividualOperation(targetCollection, op, dbName, collName, writeErr.Message)
-					}
-				}
-			} else {
-				// Handle non-bulk write errors (e.g., broken pipe, connection reset, deadline exceeded)
-				if err == context.Canceled || w.ctx.Err() == context.Canceled {
-					w.log.Debugf("[%s.%s] Bulk insert canceled due to context cancellation", dbName, collName)
-				} else {
-					w.log.Errorf("[%s.%s] Error performing bulk insert: %v", dbName, collName, err)
-				}
-
-				// For transient errors, retry the bulk operation with backoff before falling back
-				bulkRetrySucceeded := false
-				if w.retryManager != nil && err != context.Canceled {
-					errType := w.retryManager.ClassifyError(err)
-					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
-						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk insert with backoff...", dbName, collName)
-						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
-							_, retryInsertErr := targetCollection.InsertMany(w.ctx, docs, options.InsertMany().SetOrdered(useOrdered))
-							return retryInsertErr
-						})
-						if retryErr == nil {
-							w.log.Infof("[%s.%s] Bulk insert succeeded after retry", dbName, collName)
-							bulkRetrySucceeded = true
-						} else {
-							w.log.Warnf("[%s.%s] Bulk insert still failed after retries: %v. Falling back to individual operations.", dbName, collName, retryErr)
-						}
-					}
-				}
-
-				if !bulkRetrySucceeded {
-					// Fall back to individual operations one-by-one to isolate errors and prevent DLQ victim colocation!
-					w.log.Warnf("[%s.%s] Bulk insert failed: %v. Falling back to individual operations one-by-one.", dbName, collName, err)
-					for _, op := range group.Operations {
-						w.retryIndividualOperation(targetCollection, op, dbName, collName, err.Error())
-					}
-				}
-			}
-		} else {
-			w.log.Debugf("[%s.%s] Bulk inserted %d documents", dbName, collName, len(docs))
-		}
+		w.handleBulkWriteResult(writeCtx, &group, err, targetCollection, dbName, collName, func() error {
+			_, retryInsertErr := targetCollection.InsertMany(writeCtx, docs, options.InsertMany().SetOrdered(useOrdered))
+			return retryInsertErr
+		})
 
 	case "update":
 		var models []mongo.WriteModel
-		for _, op := range group.Operations {
-			// Unify all incremental updates into full ReplaceOne replacement upserts using op.Document
-			if op.Document != nil {
-				// Full document replacement - use ReplaceOne
-				// Transform __*__ field names to _*_ for Firestore compatibility
-				transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
-				if err != nil {
-					w.log.Errorf("[%s.%s] Field name transformation failed for update replacement operation, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-					if w.dlq != nil {
-						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
-					}
-					continue
-				}
-				model := mongo.NewReplaceOneModel().
-					SetFilter(bson.M{"_id": op.DocumentID}).
-					SetReplacement(transformed).
-					SetUpsert(true)
-				models = append(models, model)
-			} else {
-				w.log.Errorf("[%s.%s] Update operation failed: document payload is nil for _id=%v", dbName, collName, op.DocumentID)
+		for idx := range group.Operations {
+			op := &group.Operations[idx]
+			model, err := w.buildWriteModel(*op, dbName, collName)
+			if err != nil {
+				w.handleTransformationFailure(op, dbName, collName, err)
 				continue
 			}
+			models = append(models, model)
 		}
 
-		issueTime := time.Now()
-		_, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
+		startTime := time.Now()
+		_, err := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
 		if w.statsManager != nil {
-			w.statsManager.RecordLatency("update", group.Operations, issueTime, time.Since(issueTime), w.id)
+			w.statsManager.RecordLatency("update", group.Operations, time.Since(startTime), w.id, err == nil)
 		}
-		if err != nil {
-			bulkWriteException, ok := err.(mongo.BulkWriteException)
-			if ok && w.ctx.Err() != context.Canceled {
-				w.log.Errorf("[%s.%s] Bulk update partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
-
-				// Process individual errors
-				for _, writeErr := range bulkWriteException.WriteErrors {
-					var failedDocID interface{}
-					var op WriteOperation
-					if writeErr.Index < len(group.Operations) {
-						op = group.Operations[writeErr.Index]
-						failedDocID = op.DocumentID
-					}
-					w.log.Errorf("[%s.%s] Update error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
-
-					if writeErr.Index < len(group.Operations) {
-						w.retryIndividualOperation(targetCollection, op, dbName, collName, writeErr.Message)
-					}
-				}
-			} else {
-				// Handle non-bulk write errors
-				if err == context.Canceled || w.ctx.Err() == context.Canceled {
-					w.log.Debugf("[%s.%s] Bulk update canceled due to context cancellation", dbName, collName)
-				} else {
-					w.log.Errorf("[%s.%s] Error performing bulk update: %v", dbName, collName, err)
-				}
-
-				// For transient errors, retry the bulk operation with backoff before falling back
-				bulkRetrySucceeded := false
-				if w.retryManager != nil && err != context.Canceled {
-					errType := w.retryManager.ClassifyError(err)
-					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
-						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk update with backoff...", dbName, collName)
-						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
-							_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
-							return retryBulkErr
-						})
-						if retryErr == nil {
-							w.log.Infof("[%s.%s] Bulk update succeeded after retry", dbName, collName)
-							bulkRetrySucceeded = true
-						} else {
-							w.log.Warnf("[%s.%s] Bulk update still failed after retries: %v. Falling back to individual operations.", dbName, collName, retryErr)
-						}
-					}
-				}
-
-				if bulkRetrySucceeded {
-					break
-				}
-
-				// Fall back to individual updates
-				for _, op := range group.Operations {
-					w.retryIndividualOperation(targetCollection, op, dbName, collName, err.Error())
-				}
-			}
-		} else {
-			w.log.Debugf("[%s.%s] Bulk updated %d documents", dbName, collName, len(models))
-		}
+		w.handleBulkWriteResult(writeCtx, &group, err, targetCollection, dbName, collName, func() error {
+			_, retryBulkErr := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
+			return retryBulkErr
+		})
 
 	case "delete":
 		var models []mongo.WriteModel
 		for _, op := range group.Operations {
-			model := mongo.NewDeleteOneModel().
-				SetFilter(bson.M{"_id": op.DocumentID})
+			model, err := w.buildWriteModel(op, dbName, collName)
+			if err != nil {
+				continue
+			}
 			models = append(models, model)
 		}
 
-		issueTime := time.Now()
-		_, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
+		startTime := time.Now()
+		_, err := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
 		if w.statsManager != nil {
-			w.statsManager.RecordLatency("delete", group.Operations, issueTime, time.Since(issueTime), w.id)
+			w.statsManager.RecordLatency("delete", group.Operations, time.Since(startTime), w.id, err == nil)
 		}
-		if err != nil {
-			bulkWriteException, ok := err.(mongo.BulkWriteException)
-			if ok && w.ctx.Err() != context.Canceled {
-				w.log.Errorf("[%s.%s] Bulk delete partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
-
-				// Process individual errors
-				for _, writeErr := range bulkWriteException.WriteErrors {
-					var failedDocID interface{}
-					var op WriteOperation
-					if writeErr.Index < len(group.Operations) {
-						op = group.Operations[writeErr.Index]
-						failedDocID = op.DocumentID
-					}
-					w.log.Errorf("[%s.%s] Delete error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
-
-					if writeErr.Index < len(group.Operations) {
-						w.retryIndividualOperation(targetCollection, op, dbName, collName, writeErr.Message)
-					}
-				}
-			} else {
-				// Handle non-bulk write errors
-				if err == context.Canceled || w.ctx.Err() == context.Canceled {
-					w.log.Debugf("[%s.%s] Bulk delete canceled due to context cancellation", dbName, collName)
-				} else {
-					w.log.Errorf("[%s.%s] Error performing bulk delete: %v", dbName, collName, err)
-				}
-
-				// For transient errors, retry the bulk operation with backoff before falling back
-				bulkRetrySucceeded := false
-				if w.retryManager != nil && err != context.Canceled {
-					errType := w.retryManager.ClassifyError(err)
-					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
-						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk delete with backoff...", dbName, collName)
-						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
-							_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
-							return retryBulkErr
-						})
-						if retryErr == nil {
-							w.log.Infof("[%s.%s] Bulk delete succeeded after retry", dbName, collName)
-							bulkRetrySucceeded = true
-						} else {
-							w.log.Warnf("[%s.%s] Bulk delete still failed after retries: %v. Falling back to individual operations.", dbName, collName, retryErr)
-						}
-					}
-				}
-
-				if bulkRetrySucceeded {
-					break
-				}
-
-				// Fall back to individual deletes
-				for _, op := range group.Operations {
-					w.retryIndividualOperation(targetCollection, op, dbName, collName, err.Error())
-				}
-			}
-		} else {
-			w.log.Debugf("[%s.%s] Bulk deleted %d documents", dbName, collName, len(models))
-		}
+		w.handleBulkWriteResult(writeCtx, &group, err, targetCollection, dbName, collName, func() error {
+			_, retryBulkErr := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
+			return retryBulkErr
+		})
 
 	case "replace":
 		var models []mongo.WriteModel
-		for _, op := range group.Operations {
-			// Transform __*__ field names to _*_ for Firestore compatibility
-			transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
+		for idx := range group.Operations {
+			op := &group.Operations[idx]
+			model, err := w.buildWriteModel(*op, dbName, collName)
 			if err != nil {
-				w.log.Errorf("[%s.%s] Field name transformation failed for replace operation, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-				if w.dlq != nil {
-					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
-				}
+				w.handleTransformationFailure(op, dbName, collName, err)
 				continue
 			}
-			model := mongo.NewReplaceOneModel().
-				SetFilter(bson.M{"_id": op.DocumentID}).
-				SetReplacement(transformed).
-				SetUpsert(true)
 			models = append(models, model)
 		}
 
-		issueTime := time.Now()
-		_, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
+		startTime := time.Now()
+		_, err := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
 		if w.statsManager != nil {
-			w.statsManager.RecordLatency("replace", group.Operations, issueTime, time.Since(issueTime), w.id)
+			w.statsManager.RecordLatency("replace", group.Operations, time.Since(startTime), w.id, err == nil)
 		}
-		if err != nil {
-			bulkWriteException, ok := err.(mongo.BulkWriteException)
-			if ok {
-				w.log.Errorf("[%s.%s] Bulk replace partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
-
-				// Process individual errors
-				for _, writeErr := range bulkWriteException.WriteErrors {
-					var failedDocID interface{}
-					var op WriteOperation
-					if writeErr.Index < len(group.Operations) {
-						op = group.Operations[writeErr.Index]
-						failedDocID = op.DocumentID
-					}
-					w.log.Errorf("[%s.%s] Replace error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
-
-					if writeErr.Index < len(group.Operations) {
-						w.retryIndividualOperation(targetCollection, op, dbName, collName, writeErr.Message)
-					}
-				}
-			} else {
-				// Handle non-bulk write errors
-				if err == context.Canceled {
-					w.log.Debugf("[%s.%s] Bulk replace canceled due to context cancellation", dbName, collName)
-				} else {
-					w.log.Errorf("[%s.%s] Error performing bulk replace: %v", dbName, collName, err)
-				}
-
-				// For transient errors, retry the bulk operation with backoff before falling back
-				bulkRetrySucceeded := false
-				if w.retryManager != nil && err != context.Canceled {
-					errType := w.retryManager.ClassifyError(err)
-					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
-						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk replace with backoff...", dbName, collName)
-						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
-							_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
-							return retryBulkErr
-						})
-						if retryErr == nil {
-							w.log.Infof("[%s.%s] Bulk replace succeeded after retry", dbName, collName)
-							bulkRetrySucceeded = true
-						} else {
-							w.log.Warnf("[%s.%s] Bulk replace still failed after retries: %v. Falling back to individual operations.", dbName, collName, retryErr)
-						}
-					}
-				}
-
-				if bulkRetrySucceeded {
-					break
-				}
-
-				// Fall back to individual replaces
-				for _, op := range group.Operations {
-					w.retryIndividualOperation(targetCollection, op, dbName, collName, err.Error())
-				}
-			}
-		} else {
-			w.log.Debugf("[%s.%s] Bulk replaced %d documents", dbName, collName, len(models))
-		}
+		w.handleBulkWriteResult(writeCtx, &group, err, targetCollection, dbName, collName, func() error {
+			_, retryBulkErr := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
+			return retryBulkErr
+		})
 	}
 
 	// Record replication lag for successfully processed operations
 	if w.statsManager != nil {
-		w.statsManager.RecordLags(group.Operations, time.Now())
+		w.statsManager.RecordLags(group.Operations)
+	}
+}
+
+// handleBulkWriteResult processes the outcome of a bulk write operation, setting SuccessTime for succeeded operations and executing fallbacks for failed ones.
+func (w *Worker) handleBulkWriteResult(ctx context.Context, group *OperationGroup, err error, targetCollection *mongo.Collection, dbName, collName string, transientRetryFunc func() error) {
+	if err == nil {
+		now := time.Now()
+		for i := range group.Operations {
+			group.Operations[i].SuccessTime = now
+		}
+		w.log.Debugf("[%s.%s] Bulk %s operations processed successfully: %d documents", dbName, collName, group.OpType, len(group.Operations))
+		return
+	}
+
+	bulkWriteException, ok := err.(mongo.BulkWriteException)
+	if ok && ctx.Err() != context.Canceled {
+		w.log.Errorf("[%s.%s] Bulk %s operations partially failed: %d failed", dbName, collName, group.OpType, len(bulkWriteException.WriteErrors))
+
+		failedIndices := make(map[int]bool)
+		for _, writeErr := range bulkWriteException.WriteErrors {
+			failedIndices[writeErr.Index] = true
+		}
+		now := time.Now()
+		for i := range group.Operations {
+			if !failedIndices[i] {
+				group.Operations[i].SuccessTime = now
+			}
+		}
+
+		// Process individual errors
+		for _, writeErr := range bulkWriteException.WriteErrors {
+			var failedDocID interface{}
+			var op WriteOperation
+			if writeErr.Index < len(group.Operations) {
+				op = group.Operations[writeErr.Index]
+				failedDocID = op.DocumentID
+			}
+
+			isDupInsert := op.OpType == "insert" && isDuplicateKeyError(writeErr.Code, writeErr.Message)
+			if isDupInsert {
+				w.log.Debugf("[%s.%s] Mixed insert had duplicate key occurrence for _id=%v, gracefully falling back to upsert", dbName, collName, failedDocID)
+			} else {
+				w.log.Errorf("[%s.%s] Write error at index %d (opType=%s), _id=%v: %v", dbName, collName, writeErr.Index, op.OpType, failedDocID, writeErr.Message)
+			}
+
+			if writeErr.Index < len(group.Operations) {
+				w.retryIndividualOperation(ctx, targetCollection, &group.Operations[writeErr.Index], dbName, collName, writeErr.Message)
+			}
+		}
+	} else {
+		// Handle non-bulk write errors
+		if err == context.Canceled || ctx.Err() == context.Canceled {
+			w.log.Debugf("[%s.%s] Bulk %s operations canceled due to context cancellation", dbName, collName, group.OpType)
+			return
+		}
+
+		w.log.Errorf("[%s.%s] Error performing bulk %s operations: %v", dbName, collName, group.OpType, err)
+
+		// For transient errors, retry the bulk operation with backoff before falling back
+		bulkRetrySucceeded := false
+		if w.retryManager != nil && transientRetryFunc != nil {
+			errType := w.retryManager.ClassifyError(err)
+			if errType == ErrorTypeConnection || errType == ErrorTypeContention {
+				w.log.Infof("[%s.%s] Transient error detected. Retrying bulk %s operations with backoff...", dbName, collName, group.OpType)
+				retryErr := w.retryManager.RetryWithBackoff(ctx, transientRetryFunc)
+				if retryErr == nil {
+					w.log.Infof("[%s.%s] Bulk %s operations succeeded after retry", dbName, collName, group.OpType)
+					bulkRetrySucceeded = true
+					now := time.Now()
+					for i := range group.Operations {
+						group.Operations[i].SuccessTime = now
+						group.Operations[i].SuccessAfterRetry = true
+					}
+				} else {
+					w.log.Warnf("[%s.%s] Bulk %s operations still failed after retries: %v. Falling back to individual operations.", dbName, collName, group.OpType, retryErr)
+				}
+			}
+		}
+
+		if !bulkRetrySucceeded {
+			// Fall back to individual updates/deletes/replaces
+			for i := range group.Operations {
+				w.retryIndividualOperation(ctx, targetCollection, &group.Operations[i], dbName, collName, err.Error())
+			}
+		}
 	}
 }
 
@@ -1118,7 +867,7 @@ func (w *Worker) getTargetCollectionName(dbName, collName string) string {
 // WaitForCompletion waits for all processing to complete
 func (w *Worker) WaitForCompletion() {
 	w.wg.Wait()
-	w.log.Debugf("Worker %d: All operations processed successfully", w.id)
+	w.log.Debugf("All operations processed successfully")
 }
 
 // Shutdown ensures any pending operations are processed
@@ -1134,10 +883,8 @@ func (w *Worker) Shutdown() {
 	w.WaitForCompletion()
 }
 
-
-
 // retryIndividualOperation retries a single failed write operation of a batch using fallback execution.
-func (w *Worker) retryIndividualOperation(targetCollection *mongo.Collection, op WriteOperation, dbName, collName string, originalErrorMsg string) {
+func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection *mongo.Collection, op *WriteOperation, dbName, collName string, originalErrorMsg string) {
 	filter := bson.M{"_id": op.DocumentID}
 	if w.statsManager != nil {
 		w.statsManager.IncrementSequentialRetries(op.OpType, 1)
@@ -1148,48 +895,57 @@ func (w *Worker) retryIndividualOperation(targetCollection *mongo.Collection, op
 
 	switch op.OpType {
 	case "insert":
-		transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
+		transformed, err := TransformFieldNames(op.Document, w.log.logger, dbName, collName, op.DocumentID)
 		if err != nil {
 			w.log.Errorf("[%s.%s] Field name transformation failed for fallback insert, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-			if w.dlq != nil {
-				w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
-			}
+			w.markDLQ(op, dbName, collName, err)
 			return
 		}
 
 		if isDup {
 			// If duplicate key, retry using ReplaceOne with upsert=true to overwrite
 			w.log.Debugf("[%s.%s] Fallback upserting duplicate insert document _id=%v", dbName, collName, op.DocumentID)
-			if _, err := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
+			if _, err := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
 				w.log.Debugf("[%s.%s] Fallback upsert failed for insert document _id=%v: %v", dbName, collName, op.DocumentID, err)
-				if w.dlq != nil {
-					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
-				}
+				w.markDLQ(op, dbName, collName, err)
 			} else {
 				w.log.Debugf("[%s.%s] Successfully upserted document _id=%v after duplicate key error", dbName, collName, op.DocumentID)
+				op.SuccessTime = time.Now()
+				op.SuccessAfterRetry = true
 			}
 		} else {
 			// For non-duplicate key errors, retry with standard InsertOne
-			if _, err := targetCollection.InsertOne(w.ctx, transformed); err != nil {
-				w.log.Errorf("[%s.%s] Fallback insert failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
-				if w.dlq != nil {
-					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
+			if _, err := targetCollection.InsertOne(ctx, transformed); err != nil {
+				// If it actually already exists (e.g. concurrent write or socket retry pre-exist), fallback to ReplaceOne upsert
+				if isDuplicateKeyError(0, err.Error()) {
+					w.log.Debugf("[%s.%s] Fallback InsertOne got duplicate key, retrying with upsert overwrite for _id=%v", dbName, collName, op.DocumentID)
+					if _, replaceErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true)); replaceErr != nil {
+						w.log.Errorf("[%s.%s] Fallback upsert replace after duplicate insert failed for document _id=%v: %v", dbName, collName, op.DocumentID, replaceErr)
+						w.markDLQ(op, dbName, collName, replaceErr)
+					} else {
+						op.SuccessTime = time.Now()
+						op.SuccessAfterRetry = true
+					}
+				} else {
+					w.log.Errorf("[%s.%s] Fallback insert failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
+					w.markDLQ(op, dbName, collName, err)
 				}
+			} else {
+				op.SuccessTime = time.Now()
+				op.SuccessAfterRetry = true
 			}
 		}
 
 	case "update":
 		if op.Document != nil {
-			transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
+			transformed, err := TransformFieldNames(op.Document, w.log.logger, dbName, collName, op.DocumentID)
 			if err != nil {
 				w.log.Errorf("[%s.%s] Field name transformation failed for fallback replace update, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-				if w.dlq != nil {
-					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
-				}
+				w.markDLQ(op, dbName, collName, err)
 				return
 			}
-			if _, err := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
-				if err == context.Canceled || w.ctx.Err() == context.Canceled {
+			if _, err := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
+				if err == context.Canceled || ctx.Err() == context.Canceled {
 					w.log.Debugf("[%s.%s] Fallback replace update for document _id=%v canceled", dbName, collName, op.DocumentID)
 					return
 				}
@@ -1197,36 +953,35 @@ func (w *Worker) retryIndividualOperation(targetCollection *mongo.Collection, op
 				// If it failed because the document already exists (concurrent upsert collision), retry with upsert=false
 				if isDuplicateKeyError(0, err.Error()) {
 					w.log.Debugf("[%s.%s] Concurrent upsert collision detected for replace document _id=%v, retrying without upsert", dbName, collName, op.DocumentID)
-					if _, retryErr := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(false)); retryErr != nil {
+					if _, retryErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(false)); retryErr != nil {
 						w.log.Errorf("[%s.%s] Fallback replace update without upsert failed for document _id=%v: %v", dbName, collName, op.DocumentID, retryErr)
-						if w.dlq != nil {
-							w.dlq.WriteFailed(dbName, collName, op.DocumentID, retryErr, "incremental", "update", op.Document)
-						}
+						w.markDLQ(op, dbName, collName, retryErr)
 					} else {
 						w.log.Debugf("[%s.%s] Successfully completed replace update for document _id=%v after concurrent upsert resolution", dbName, collName, op.DocumentID)
+						op.SuccessTime = time.Now()
+						op.SuccessAfterRetry = true
 					}
 				} else {
 					w.log.Errorf("[%s.%s] Fallback replace update failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
-					if w.dlq != nil {
-						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
-					}
+					w.markDLQ(op, dbName, collName, err)
 				}
+			} else {
+				op.SuccessTime = time.Now()
+				op.SuccessAfterRetry = true
 			}
 		} else {
 			w.log.Errorf("[%s.%s] Fallback update failed: document payload is nil for _id=%v", dbName, collName, op.DocumentID)
 		}
 
 	case "replace":
-		transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
+		transformed, err := TransformFieldNames(op.Document, w.log.logger, dbName, collName, op.DocumentID)
 		if err != nil {
 			w.log.Errorf("[%s.%s] Field name transformation failed for fallback replace, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-			if w.dlq != nil {
-				w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
-			}
+			w.markDLQ(op, dbName, collName, err)
 			return
 		}
-		if _, err := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
-			if err == context.Canceled || w.ctx.Err() == context.Canceled {
+		if _, err := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
+			if err == context.Canceled || ctx.Err() == context.Canceled {
 				w.log.Debugf("[%s.%s] Fallback replace for document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
 				return
 			}
@@ -1234,35 +989,144 @@ func (w *Worker) retryIndividualOperation(targetCollection *mongo.Collection, op
 			// If it failed because the document already exists (concurrent upsert collision), retry with upsert=false
 			if isDuplicateKeyError(0, err.Error()) {
 				w.log.Debugf("[%s.%s] Concurrent upsert collision detected for replace document _id=%v, retrying without upsert", dbName, collName, op.DocumentID)
-				if _, retryErr := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(false)); retryErr != nil {
+				if _, retryErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(false)); retryErr != nil {
 					w.log.Errorf("[%s.%s] Fallback replace without upsert failed for document _id=%v: %v", dbName, collName, op.DocumentID, retryErr)
-					if w.dlq != nil {
-						w.dlq.WriteFailed(dbName, collName, op.DocumentID, retryErr, "incremental", "replace", op.Document)
-					}
+					w.markDLQ(op, dbName, collName, retryErr)
 				} else {
 					w.log.Debugf("[%s.%s] Successfully completed replace for document _id=%v after concurrent upsert resolution", dbName, collName, op.DocumentID)
+					op.SuccessTime = time.Now()
+					op.SuccessAfterRetry = true
 				}
 			} else {
 				w.log.Errorf("[%s.%s] Fallback replace failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
-				if w.dlq != nil {
-					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
-				}
+				w.markDLQ(op, dbName, collName, err)
 			}
+		} else {
+			op.SuccessTime = time.Now()
+			op.SuccessAfterRetry = true
 		}
 
 	case "delete":
-		if _, err := targetCollection.DeleteOne(w.ctx, filter); err != nil {
+		if _, err := targetCollection.DeleteOne(ctx, filter); err != nil {
 			w.log.Errorf("[%s.%s] Fallback delete failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
-			if w.dlq != nil {
-				w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "delete", nil)
-			}
+			w.markDLQ(op, dbName, collName, err)
+		} else {
+			op.SuccessTime = time.Now()
+			op.SuccessAfterRetry = true
 		}
 	}
 }
 
+func (w *Worker) markDLQ(op *WriteOperation, dbName, collName string, err error) {
+	if w.dlq != nil {
+		w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", op.OpType, op.Document)
+	}
+	op.DLQed = true
+	op.Error = err
+}
+
+func (w *Worker) handleTransformationFailure(op *WriteOperation, dbName, collName string, err error) {
+	w.log.Errorf("[%s.%s] Field name transformation failed for %s, document _id=%v: %v", dbName, collName, op.OpType, op.DocumentID, err)
+	w.markDLQ(op, dbName, collName, err)
+}
+
 // isDuplicateKeyError checks if a write error code or message represents a duplicate key/document already exists constraint failure.
 func isDuplicateKeyError(code int, msg string) bool {
-	return code == 11000 || 
-		strings.Contains(msg, "Document already exists") || 
+	return code == 11000 ||
+		strings.Contains(msg, "Document already exists") ||
 		strings.Contains(msg, "E11000")
+}
+
+// buildWriteModel builds a single mongo.WriteModel from a WriteOperation, transforming Firestore-incompatible keys.
+func (w *Worker) buildWriteModel(op WriteOperation, dbName, collName string) (mongo.WriteModel, error) {
+	switch op.OpType {
+	case "insert":
+		transformed, err := TransformFieldNames(op.Document, w.log.logger, dbName, collName, op.DocumentID)
+		if err != nil {
+			return nil, err
+		}
+		return mongo.NewInsertOneModel().SetDocument(transformed), nil
+
+	case "update", "replace":
+		if op.Document == nil {
+			return nil, fmt.Errorf("document payload is nil for _id=%v", op.DocumentID)
+		}
+		transformed, err := TransformFieldNames(op.Document, w.log.logger, dbName, collName, op.DocumentID)
+		if err != nil {
+			return nil, err
+		}
+		return mongo.NewReplaceOneModel().
+			SetFilter(bson.M{"_id": op.DocumentID}).
+			SetReplacement(transformed).
+			SetUpsert(true), nil
+
+	case "delete":
+		return mongo.NewDeleteOneModel().SetFilter(bson.M{"_id": op.DocumentID}), nil
+	}
+	return nil, fmt.Errorf("unsupported operation type: %s", op.OpType)
+}
+
+type workerLogger struct {
+	workerID int
+	logger   *logger.Logger
+}
+
+func (wl *workerLogger) Debug(args ...interface{}) {
+	newArgs := append([]interface{}{fmt.Sprintf("Worker %d: ", wl.workerID)}, args...)
+	wl.logger.Debug(newArgs...)
+}
+
+func (wl *workerLogger) Debugf(format string, args ...interface{}) {
+	newArgs := make([]interface{}, 1+len(args))
+	newArgs[0] = wl.workerID
+	copy(newArgs[1:], args)
+	wl.logger.Debugf("Worker %d: "+format, newArgs...)
+}
+
+func (wl *workerLogger) Info(args ...interface{}) {
+	newArgs := append([]interface{}{fmt.Sprintf("Worker %d: ", wl.workerID)}, args...)
+	wl.logger.Info(newArgs...)
+}
+
+func (wl *workerLogger) Infof(format string, args ...interface{}) {
+	newArgs := make([]interface{}, 1+len(args))
+	newArgs[0] = wl.workerID
+	copy(newArgs[1:], args)
+	wl.logger.Infof("Worker %d: "+format, newArgs...)
+}
+
+func (wl *workerLogger) Warn(args ...interface{}) {
+	newArgs := append([]interface{}{fmt.Sprintf("Worker %d: ", wl.workerID)}, args...)
+	wl.logger.Warn(newArgs...)
+}
+
+func (wl *workerLogger) Warnf(format string, args ...interface{}) {
+	newArgs := make([]interface{}, 1+len(args))
+	newArgs[0] = wl.workerID
+	copy(newArgs[1:], args)
+	wl.logger.Warnf("Worker %d: "+format, newArgs...)
+}
+
+func (wl *workerLogger) Error(args ...interface{}) {
+	newArgs := append([]interface{}{fmt.Sprintf("Worker %d: ", wl.workerID)}, args...)
+	wl.logger.Error(newArgs...)
+}
+
+func (wl *workerLogger) Errorf(format string, args ...interface{}) {
+	newArgs := make([]interface{}, 1+len(args))
+	newArgs[0] = wl.workerID
+	copy(newArgs[1:], args)
+	wl.logger.Errorf("Worker %d: "+format, newArgs...)
+}
+
+const fnvOffset32 = 2166136261
+const fnvPrime32 = 16777619
+
+func hashBytes(data []byte) int {
+	hash := uint32(fnvOffset32)
+	for _, b := range data {
+		hash ^= uint32(b)
+		hash *= fnvPrime32
+	}
+	return int(hash)
 }

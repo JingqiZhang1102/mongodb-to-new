@@ -38,6 +38,9 @@ func main() {
 	log := logger.New()
 	log.SetLevel(*logLevel)
 
+	// Maximize open file descriptor resource limits (ulimit -n 65536)
+	maximizeOpenFileLimit(log)
+
 	// Set up log file if specified
 	if *logFile != "" {
 		file, err := log.SetOutputFile(*logFile)
@@ -94,7 +97,9 @@ func main() {
 		log.Info("Received interrupt signal. Shutting down...")
 		cancel()
 		// Give some time for graceful shutdown
-		time.Sleep(2 * time.Second)
+
+		log.Infof("Waiting for 15 seconds for workers to finish...")
+		time.Sleep(15 * time.Second)
 		os.Exit(0)
 	}()
 
@@ -242,4 +247,30 @@ func getSanitizedConfigJSON(cfg *config.Config) string {
 		return fmt.Sprintf("error marshalling config: %v", err)
 	}
 	return string(data)
+}
+
+// maximizeOpenFileLimit programmatically adjusts the maximum open files resource limit (ulimit -n) to 65536.
+func maximizeOpenFileLimit(log *logger.Logger) {
+	var rLimit syscall.Rlimit
+	err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+	if err != nil {
+		log.Warnf("Failed to get current open file resource limit: %v", err)
+		return
+	}
+
+	targetLimit := uint64(65536)
+	if rLimit.Max < targetLimit {
+		log.Warnf("System hard limit for open file descriptors is %d, which is lower than requested 65536. Setting limit to system maximum.", rLimit.Max)
+		targetLimit = rLimit.Max
+	}
+
+	rLimit.Cur = targetLimit
+	rLimit.Max = targetLimit
+
+	err = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+	if err != nil {
+		log.Warnf("Failed to set open file resource limit (ulimit) to %d: %v", targetLimit, err)
+	} else {
+		log.Infof("Successfully adjusted open file descriptor resource limit (ulimit) to %d", targetLimit)
+	}
 }

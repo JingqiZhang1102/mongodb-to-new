@@ -136,6 +136,10 @@ func (m *Migrator) getInitialMigrationStatePath(pairIndex int) string {
 func (m *Migrator) processDatabasePair(ctx context.Context, pair config.DatabasePair, pairIndex int, mode string) error {
 	liveOnly := mode == "live-only"
 
+	// Initialize shared stats tracking for this database pair
+	statsInterval := time.Duration(m.config.StatsIntervalMinutes) * time.Minute
+	statsManager := NewStatsManager(m.log, statsInterval, m.config.GroupOpsByDistinctId)
+
 	// Check if this is legacy mode - if so, handle it separately
 	if (mode == "live" || mode == "live-only") && pair.Source.ReplicationMethod == "oplog-legacy" {
 		// For legacy mode, don't connect here - let startOplogReplicationLegacy handle it
@@ -169,7 +173,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 
 	// Connect to source MongoDB (modern driver)
 	m.log.Infof("Connecting to source MongoDB at %s (MinPoolSize: 128, MaxPoolSize: 256)", pair.Source.ConnectionString)
-	sourceDB, err := db.NewMongoDB(pair.Source.ConnectionString, pair.Source.Database, 128, 256, 0, m.log) // Source uses static pool size (min 128, max 256)
+	sourceDB, err := db.NewMongoDB(pair.Source.ConnectionString, pair.Source.Database, 128, 256, 0, statsManager.GetPoolMonitor(), m.log) // Source uses static pool size (min 128, max 256)
 	if err != nil {
 		return fmt.Errorf("failed to connect to source MongoDB: %w", err)
 	}
@@ -179,7 +183,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 
 	// Connect to target MongoDB
 	m.log.Infof("Connecting to target MongoDB at %s (MinPoolSize: %d, MaxPoolSize: %d, MaxIdleTime: %v)", pair.Target.ConnectionString, m.config.TargetMinPoolSize, m.config.TargetMaxPoolSize, maxConnIdleTimeTarget)
-	targetDB, err := db.NewMongoDB(pair.Target.ConnectionString, pair.Target.Database, uint64(m.config.TargetMinPoolSize), uint64(m.config.TargetMaxPoolSize), maxConnIdleTimeTarget, m.log)
+	targetDB, err := db.NewMongoDB(pair.Target.ConnectionString, pair.Target.Database, uint64(m.config.TargetMinPoolSize), uint64(m.config.TargetMaxPoolSize), maxConnIdleTimeTarget, statsManager.GetPoolMonitor(), m.log)
 	if err != nil {
 		return fmt.Errorf("failed to connect to target MongoDB: %w", err)
 	}
@@ -243,7 +247,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 		wg.Wait()
 	} else if mode == "live" || mode == "live-only" {
 		// Use client-level change stream for live replication
-		if err := m.startClientLevelReplication(ctx, sourceDB, targetDB, pair.Source.Database, pair.Target.Database, collections, pair, pairIndex, liveOnly); err != nil {
+		if err := m.startClientLevelReplication(ctx, sourceDB, targetDB, pair.Source.Database, pair.Target.Database, collections, pair, pairIndex, liveOnly, statsManager); err != nil {
 			// We don't need to check for context.Canceled here anymore as it's handled in the lower layers
 			return fmt.Errorf("error starting client-level replication: %w", err)
 		}
@@ -263,7 +267,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 }
 
 // startClientLevelReplication starts replication using either change streams or oplog
-func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool) error {
+func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool, statsManager *StatsManager) error {
 	// Determine replication method
 	replicationMethod := pair.Source.ReplicationMethod
 	if replicationMethod == "" {
@@ -277,16 +281,17 @@ func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, ta
 		return m.startOplogReplication(ctx, sourceDB, targetDB, sourceDBName, targetDBName, collections, pair, pairIndex, liveOnly)
 	} else {
 		// Use change stream-based replication (default)
-		return m.startChangeStreamReplication(ctx, sourceDB, targetDB, sourceDBName, targetDBName, collections, pair, pairIndex, liveOnly)
+		return m.startChangeStreamReplication(ctx, sourceDB, targetDB, sourceDBName, targetDBName, collections, pair, pairIndex, liveOnly, statsManager)
 	}
 }
 
 // startChangeStreamReplication starts replication using change streams
-func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool) error {
+func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool, statsManager *StatsManager) error {
 	m.log.Info("Starting change stream-based replication for all collections")
 
 	// Create client-level replicator
 	replicator := NewClientLevelReplicator(sourceDB, targetDB, m.config, m.log)
+	replicator.SetStatsManager(statsManager)
 
 	// Add all collections to the replicator
 	for _, collConfig := range collections {
@@ -401,7 +406,7 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 
 	// Connect to target MongoDB using modern driver
 	m.log.Infof("Connecting to target MongoDB (modern) at %s (MinPoolSize: %d, MaxPoolSize: %d, MaxIdleTime: %v)", pair.Target.ConnectionString, m.config.TargetMinPoolSize, m.config.TargetMaxPoolSize, maxConnIdleTime)
-	targetDB, err := db.NewMongoDB(pair.Target.ConnectionString, pair.Target.Database, uint64(m.config.TargetMinPoolSize), uint64(m.config.TargetMaxPoolSize), maxConnIdleTime, m.log)
+	targetDB, err := db.NewMongoDB(pair.Target.ConnectionString, pair.Target.Database, uint64(m.config.TargetMinPoolSize), uint64(m.config.TargetMaxPoolSize), maxConnIdleTime, nil, m.log)
 	if err != nil {
 		return fmt.Errorf("failed to connect to target MongoDB: %w", err)
 	}

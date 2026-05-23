@@ -2,6 +2,7 @@ package migration
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -15,15 +16,15 @@ func TestStatsManagerEventCounting(t *testing.T) {
 
 	now := time.Now()
 
-	// Record batch of 5 operations of different types
+	// Record batch of 5 operations of different types (SuccessTime must be set to count them as processed)
 	ops5 := []WriteOperation{
-		{OpType: "insert"},
-		{OpType: "update"},
-		{OpType: "delete"},
-		{OpType: "replace"},
-		{OpType: "insert"},
+		{OpType: "insert", SuccessTime: now},
+		{OpType: "update", SuccessTime: now},
+		{OpType: "delete", SuccessTime: now},
+		{OpType: "replace", SuccessTime: now},
+		{OpType: "insert", SuccessTime: now},
 	}
-	sm.RecordLags(ops5, now)
+	sm.RecordLags(ops5)
 	
 	totalProcessed5 := sm.GetProcessedCount("insert") + sm.GetProcessedCount("update") + sm.GetProcessedCount("replace") + sm.GetProcessedCount("delete")
 	if totalProcessed5 != 5 {
@@ -43,8 +44,9 @@ func TestStatsManagerEventCounting(t *testing.T) {
 	ops10 := make([]WriteOperation, 10)
 	for i := range ops10 {
 		ops10[i].OpType = "insert"
+		ops10[i].SuccessTime = now
 	}
-	sm.RecordLags(ops10, now)
+	sm.RecordLags(ops10)
 	
 	totalProcessed15 := sm.GetProcessedCount("insert") + sm.GetProcessedCount("update") + sm.GetProcessedCount("replace") + sm.GetProcessedCount("delete")
 	if totalProcessed15 != 15 {
@@ -61,9 +63,9 @@ func TestStatsManagerReportStats(t *testing.T) {
 
 	now := time.Now()
 	ops := []WriteOperation{
-		{EventTime: now.Add(-250 * time.Millisecond), OpType: "insert"},
+		{EventTime: now.Add(-250 * time.Millisecond), OpType: "insert", SuccessTime: now},
 	}
-	sm.RecordLags(ops, now)
+	sm.RecordLags(ops)
 
 	// Call ReportStats
 	sm.ReportStats()
@@ -72,8 +74,10 @@ func TestStatsManagerReportStats(t *testing.T) {
 	if sm.GetProcessedCount("insert") != 0 {
 		t.Errorf("expected inserts processed count to reset to 0, got %d", sm.GetProcessedCount("insert"))
 	}
-	if sm.lagTracker.count != 0 {
-		t.Errorf("expected lagTracker count to reset to 0, got %d", sm.lagTracker.count)
+	
+	res := sm.lagTracker.Flush()
+	if res.SuccessTimeToEventTimeLag != 0 {
+		t.Errorf("expected lagTracker metrics to reset to 0, got %v", res.SuccessTimeToEventTimeLag)
 	}
 }
 
@@ -89,23 +93,23 @@ func TestStatsManagerRecordLagsAndStart(t *testing.T) {
 
 	now := time.Now()
 	ops := []WriteOperation{
-		{EventTime: now.Add(-100 * time.Millisecond)},
-		{EventTime: now.Add(-200 * time.Millisecond)},
+		{EventTime: now.Add(-100 * time.Millisecond), SuccessTime: now},
+		{EventTime: now.Add(-200 * time.Millisecond), SuccessTime: now},
 	}
 
 	// Call RecordLags on StatsManager
-	sm.RecordLags(ops, now)
+	sm.RecordLags(ops)
 
 	// Wait for periodic ticker to fire
 	time.Sleep(25 * time.Millisecond)
 
 	// The counters should have been flushed/reset to 0 by ReportStats inside the ticker goroutine
 	sm.mu.Lock()
-	lagCount := sm.lagTracker.count
+	res := sm.lagTracker.Flush()
 	sm.mu.Unlock()
 
-	if lagCount != 0 {
-		t.Errorf("expected lag count to reset to 0 after periodic ticker, got %d", lagCount)
+	if res.SuccessTimeToEventTimeLag != 0 {
+		t.Errorf("expected lag count to reset to 0 after periodic ticker, got %v", res.SuccessTimeToEventTimeLag)
 	}
 }
 
@@ -124,8 +128,8 @@ func TestStatsManagerConcurrency(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
 				sm.RecordLags([]WriteOperation{
-					{EventTime: now.Add(-1 * time.Millisecond), OpType: "insert"},
-				}, now)
+					{EventTime: now.Add(-1 * time.Millisecond), OpType: "insert", SuccessTime: now},
+				})
 			}
 		}()
 	}
@@ -137,8 +141,15 @@ func TestStatsManagerConcurrency(t *testing.T) {
 	if processedEvents != expectedEvents {
 		t.Errorf("expected %d events, got %d", expectedEvents, processedEvents)
 	}
-	if sm.lagTracker.count != int64(expectedEvents) {
-		t.Errorf("expected %d lag records, got %d", expectedEvents, sm.lagTracker.count)
+	
+	res := sm.lagTracker.Flush()
+	if res.SuccessTimeToEventTimeLag != 1*time.Millisecond {
+		t.Errorf("expected SuccessTimeToEventTimeLag 1ms, got %v", res.SuccessTimeToEventTimeLag)
+	}
+
+	res2 := sm.lagTracker.Flush()
+	if res2.SuccessTimeToEventTimeLag != 0 {
+		t.Errorf("expected lagTracker to reset to 0, got %v", res2.SuccessTimeToEventTimeLag)
 	}
 }
 
@@ -149,7 +160,7 @@ func TestStatsManagerMetrics(t *testing.T) {
 	// Test single increment for all three
 	sm.IncrementUpdatedThenDeleted(0)
 	sm.IncrementEventsReceived("insert")
-	sm.IncrementEventsFailed("insert")
+	sm.IncrementEventsFailed("insert", false, nil)
 	sm.IncrementSequentialRetries("insert", 3)
 	sm.RecordBulkWrite(42, true)
 	sm.RecordBulkWrite(10, false)
@@ -204,7 +215,7 @@ func TestStatsManagerMetrics(t *testing.T) {
 			for j := 0; j < iterations; j++ {
 				sm.IncrementUpdatedThenDeleted(0)
 				sm.IncrementEventsReceived("insert")
-				sm.IncrementEventsFailed("insert")
+				sm.IncrementEventsFailed("insert", false, nil)
 			}
 		}()
 	}
@@ -269,22 +280,33 @@ func TestStatsManagerLatencies(t *testing.T) {
 
 	// Test RecordLatency for insert
 	now := time.Now()
+	// For ops1: ReadTime = now - 150ms, WorkerReceiveTime = now - 100ms (transit lag: 50ms, buffering lag: 100ms)
 	ops1 := []WriteOperation{
-		{ReceiveTime: now.Add(-100 * time.Millisecond)},
-		{ReceiveTime: now.Add(-50 * time.Millisecond)}, // This is newer, so -100ms is the oldest (largest delay)
+		{ReadTime: now.Add(-150 * time.Millisecond), WorkerReceiveTime: now.Add(-100 * time.Millisecond), SuccessTime: now},
+		{ReadTime: now.Add(-120 * time.Millisecond), WorkerReceiveTime: now.Add(-50 * time.Millisecond), SuccessTime: now},
 	}
+	// For ops2: ReadTime = now - 350ms, WorkerReceiveTime = now - 200ms (transit lag: 150ms, buffering lag: 200ms)
 	ops2 := []WriteOperation{
-		{ReceiveTime: now.Add(-200 * time.Millisecond)},
-		{ReceiveTime: now.Add(-150 * time.Millisecond)}, // This is newer, so -200ms is the oldest (largest delay)
+		{ReadTime: now.Add(-350 * time.Millisecond), WorkerReceiveTime: now.Add(-200 * time.Millisecond), SuccessTime: now},
+		{ReadTime: now.Add(-300 * time.Millisecond), WorkerReceiveTime: now.Add(-150 * time.Millisecond), SuccessTime: now},
 	}
 
-	sm.RecordLatency("insert", ops1, now, 50*time.Millisecond, 0)
-	sm.RecordLatency("insert", ops2, now, 150*time.Millisecond, 0)
+	sm.RecordLatency("insert", ops1, 50*time.Millisecond, 0, true)
+	sm.RecordLatency("insert", ops2, 150*time.Millisecond, 0, true)
+	
+	sm.RecordLags(ops1)
+	sm.RecordLags(ops2)
 
-	avgQueueInsert := sm.GetAvgQueueLatency("insert")
-	// Expected average of max queue latencies: (100ms + 200ms) / 2 = 150ms
-	if avgQueueInsert < 140*time.Millisecond || avgQueueInsert > 160*time.Millisecond {
-		t.Errorf("expected average queue latency around 150ms, got %v", avgQueueInsert)
+	lagRes := sm.lagTracker.Flush()
+
+	// Expected average transit: (50ms + 150ms) / 2 = 100ms
+	if lagRes.WorkerReceivedToReadTimeLag < 90*time.Millisecond || lagRes.WorkerReceivedToReadTimeLag > 110*time.Millisecond {
+		t.Errorf("expected average transit latency around 100ms, got %v", lagRes.WorkerReceivedToReadTimeLag)
+	}
+
+	// Expected average buffering: (100ms + 50ms + 200ms + 150ms) / 4 = 125ms
+	if lagRes.SuccessTimeToWorkerReceivedLag < 115*time.Millisecond || lagRes.SuccessTimeToWorkerReceivedLag > 135*time.Millisecond {
+		t.Errorf("expected average buffering latency around 125ms, got %v", lagRes.SuccessTimeToWorkerReceivedLag)
 	}
 
 	avgBulkOpInsert := sm.GetAvgBulkWriteLatency("insert")
@@ -295,14 +317,19 @@ func TestStatsManagerLatencies(t *testing.T) {
 
 	// Test RecordLatency for update
 	ops3 := []WriteOperation{
-		{ReceiveTime: now.Add(-400 * time.Millisecond)},
+		{ReadTime: now.Add(-500 * time.Millisecond), WorkerReceiveTime: now.Add(-400 * time.Millisecond), SuccessTime: now},
 	}
-	sm.RecordLatency("update", ops3, now, 300*time.Millisecond, 0)
+	sm.RecordLatency("update", ops3, 300*time.Millisecond, 0, true)
+	sm.RecordLags(ops3)
 
-	avgQueueUpdate := sm.GetAvgQueueLatency("update")
-	// Expected average queue latency: 400ms / 1 = 400ms
-	if avgQueueUpdate != 400*time.Millisecond {
-		t.Errorf("expected update queue latency 400ms, got %v", avgQueueUpdate)
+	lagResUpdate := sm.lagTracker.Flush()
+
+	if lagResUpdate.WorkerReceivedToReadTimeLag != 100*time.Millisecond {
+		t.Errorf("expected update transit latency 100ms, got %v", lagResUpdate.WorkerReceivedToReadTimeLag)
+	}
+
+	if lagResUpdate.SuccessTimeToWorkerReceivedLag != 400*time.Millisecond {
+		t.Errorf("expected update buffering latency 400ms, got %v", lagResUpdate.SuccessTimeToWorkerReceivedLag)
 	}
 
 	avgBulkOpUpdate := sm.GetAvgBulkWriteLatency("update")
@@ -327,9 +354,6 @@ func TestStatsManagerLatencies(t *testing.T) {
 	// Verify ReportStats resets them
 	sm.ReportStats()
 
-	if sm.GetAvgQueueLatency("insert") != 0 {
-		t.Errorf("expected avg queue latency to reset to 0, got %v", sm.GetAvgQueueLatency("insert"))
-	}
 	if sm.GetAvgBulkWriteLatency("insert") != 0 {
 		t.Errorf("expected avg insert bulkwrite latency to reset to 0, got %v", sm.GetAvgBulkWriteLatency("insert"))
 	}
@@ -347,13 +371,13 @@ func BenchmarkStatsManagerRecordLatency(b *testing.B) {
 	log.SetLevel("error")
 	sm := NewStatsManager(log, 5*time.Minute)
 	now := time.Now()
-	ops := []WriteOperation{{ReceiveTime: now.Add(-10 * time.Millisecond), OpType: "mixed"}}
+	ops := []WriteOperation{{ReadTime: now.Add(-20 * time.Millisecond), WorkerReceiveTime: now.Add(-10 * time.Millisecond), OpType: "mixed"}}
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		i := 0
 		for pb.Next() {
-			sm.RecordLatency("mixed", ops, now, 5*time.Millisecond, i%8)
+			sm.RecordLatency("mixed", ops, 5*time.Millisecond, i%8, true)
 			i++
 		}
 	})
@@ -371,5 +395,50 @@ func BenchmarkStatsManagerIncrementReceived(b *testing.B) {
 			sm.IncrementEventsReceived("insert")
 		}
 	})
+}
+
+func TestStatsManagerDLQAndFailureBreakdown(t *testing.T) {
+	log := logger.New()
+	sm := NewStatsManager(log, 5*time.Minute)
+
+	err1 := fmt.Errorf("connection(5bc95d74-1eb9-46fa-9445-39e5b4514544.us-east4.firestore.goog:443[-27608]) socket was unexpectedly closed: EOF")
+	err2 := fmt.Errorf("connection(other-conn.us-east4.firestore.goog:443[-28000]) socket was unexpectedly closed: EOF")
+	err3 := fmt.Errorf("Document already exists")
+
+	// 1. Increment failed event with DLQ = true, dynamic EOF error 1
+	sm.IncrementEventsFailed("insert", true, err1)
+	// 2. Increment failed event with DLQ = true, dynamic EOF error 2 (should be normalized and grouped together!)
+	sm.IncrementEventsFailed("insert", true, err2)
+	// 3. Increment failed event with DLQ = false, standard duplicate error
+	sm.IncrementEventsFailed("update", false, err3)
+
+	sm.failureMu.Lock()
+	dlqCountInsert := sm.GetDLQCount("insert")
+	dlqCountUpdate := sm.GetDLQCount("update")
+	breakdownInsertEOF := sm.failureBreakdown["insert"]["connection(...) socket was unexpectedly closed: EOF"]
+	breakdownUpdateDup := sm.failureBreakdown["update"]["Document already exists"]
+	sm.failureMu.Unlock()
+
+	if dlqCountInsert != 2 {
+		t.Errorf("expected DLQ'ed inserts 2, got %d", dlqCountInsert)
+	}
+	if dlqCountUpdate != 0 {
+		t.Errorf("expected DLQ'ed updates 0, got %d", dlqCountUpdate)
+	}
+	if breakdownInsertEOF != 2 {
+		t.Errorf("expected normalized and grouped insert EOF count 2, got %d", breakdownInsertEOF)
+	}
+	if breakdownUpdateDup != 1 {
+		t.Errorf("expected update duplicate count 1, got %d", breakdownUpdateDup)
+	}
+
+	// Verify ReportStats clears them and prints without panic
+	sm.ReportStats()
+
+	sm.failureMu.Lock()
+	if sm.GetDLQCount("insert") != 0 || sm.GetDLQCount("update") != 0 || len(sm.failureBreakdown) != 0 {
+		t.Errorf("expected DLQ stats and failure breakdown to reset after ReportStats")
+	}
+	sm.failureMu.Unlock()
 }
 
