@@ -24,7 +24,9 @@
   "saveThreshold": 1000,
   "checkpointInterval": 5,
   "forceOrderedOperations": false,
-  "flushIntervalMs": 500,
+  "flushIntervalMs": 250,
+  "targetMinPoolSize": 32,
+  "targetMaxPoolSize": 64,
   
   "initialReadBatchSize": 8192,
   "initialWriteBatchSize": 100,
@@ -33,8 +35,9 @@
   "concurrentCollections": 4,
   
   "incrementalReadBatchSize": 8192,
-  "incrementalWriteBatchSize": 128,
-  "incrementalWorkerCount": 6,
+  "incrementalWriteBatchSize": 256,
+  "incrementalWorkerCount": 32,
+  "groupOpsByDistinctId": true,
   "statsIntervalMinutes": 1,
   
   "parallelReadsEnabled": true,

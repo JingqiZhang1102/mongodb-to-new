@@ -191,33 +191,50 @@ func (d *EventDistributor) Start() error {
 			break
 		}
 
-		// Get change event
-		var changeEvent bson.M
-		if err := d.changeStream.Decode(&changeEvent); err != nil {
-			d.log.Errorf("Error decoding change event: %v", err)
+		// Get raw change event bytes
+		rawEvent := d.changeStream.Current
+
+		// Extract operationType via fast binary lookup
+		opTypeVal, err := rawEvent.LookupErr("operationType")
+		if err != nil {
+			d.log.Errorf("Invalid raw change event: missing operationType")
 			continue
 		}
+		opType := opTypeVal.StringValue()
 
-		opType, _ := changeEvent["operationType"].(string)
 		if d.statsManager != nil {
 			d.statsManager.IncrementEventsReceived(opType)
 		}
 
-		// Extract document ID for hashing
-		documentKey, ok := changeEvent["documentKey"].(bson.M)
-		if !ok {
-			d.log.Errorf("Invalid document key in change event: %v", changeEvent)
+		// Extract documentKey._id via fast binary lookup
+		docKeyVal, err := rawEvent.LookupErr("documentKey")
+		if err != nil {
+			d.log.Errorf("Invalid raw change event: missing documentKey")
+			continue
+		}
+		docKeyRaw := docKeyVal.Document()
+		docIDVal, err := docKeyRaw.LookupErr("_id")
+		if err != nil {
+			d.log.Errorf("Invalid raw change event: missing documentKey._id")
 			continue
 		}
 
-		docID := documentKey["_id"]
+		var docID interface{}
+		if err := docIDVal.Unmarshal(&docID); err != nil {
+			d.log.Errorf("Error unmarshaling documentKey._id from raw BSON: %v", err)
+			continue
+		}
 
 		// Determine worker based on hash modulo worker count
 		workerIndex := d.getWorkerIndex(docID)
 
-		// Send raw event to appropriate worker concurrently
+		// Safe concurrent deep copy of raw BSON bytes to prevent mutation races
+		rawCopy := make(bson.Raw, len(rawEvent))
+		copy(rawCopy, rawEvent)
+
+		// Send raw event copy to appropriate worker concurrently
 		select {
-		case d.workers[workerIndex].incomingQueue <- changeEvent:
+		case d.workers[workerIndex].incomingQueue <- rawCopy:
 		case <-d.ctx.Done():
 			return nil
 		}
@@ -287,7 +304,7 @@ type Worker struct {
 	statsManager  *StatsManager
 
 	// Queue of raw change events waiting to be partitioned and batched concurrently
-	incomingQueue chan bson.M
+	incomingQueue chan interface{}
 
 	// Current group being built
 	currentGroup *OperationGroup
@@ -376,7 +393,7 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 		log:                       log,
 		targetDB:                  targetDB,
 		collectionMap:             collectionMap,
-		incomingQueue:             make(chan bson.M, 8192),
+		incomingQueue:             make(chan interface{}, 8192),
 		processingQueue:           make(chan *OperationGroup, 4096),
 		incrementalWriteBatchSize: incrementalWriteBatchSize,
 		forceOrderedOperations:    forceOrderedOperations,
@@ -440,10 +457,24 @@ func (w *Worker) eventLoop() {
 	}
 }
 
-// ProcessEvent handles a single change event
-func (w *Worker) ProcessEvent(event bson.M) {
+// ProcessEvent handles a single change event by decoding raw BSON concurrently in the worker thread
+func (w *Worker) ProcessEvent(eventArg interface{}) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	var event bson.M
+	switch e := eventArg.(type) {
+	case bson.M:
+		event = e
+	case bson.Raw:
+		if err := bson.Unmarshal(e, &event); err != nil {
+			w.log.Errorf("Worker %d: Failed to unmarshal raw BSON change event: %v", w.id, err)
+			return
+		}
+	default:
+		w.log.Errorf("Worker %d: Invalid event type in ProcessEvent: %T", w.id, eventArg)
+		return
+	}
 
 	// Extract operation details
 	opType, _ := event["operationType"].(string)
