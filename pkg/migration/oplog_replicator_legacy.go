@@ -721,11 +721,16 @@ func (r *OplogReplicatorLegacy) tailOplog(ctx context.Context, afterTimestamp bs
 
 	r.log.Info("GTM oplog tailing started successfully")
 
+	// Initialize StatsManager for comprehensive worker-level telemetry
+	statsInterval := time.Duration(r.config.StatsIntervalMinutes) * time.Minute
+	statsManager := NewStatsManager(r.log, statsInterval, r.config.GroupOpsByDistinctId)
+	statsManager.Start(ctx)
+
 	// Initialize parallel workers
 	r.log.Infof("Starting parallel oplog processing with %d workers", r.config.IncrementalWorkerCount)
 	workers := make([]*Worker, r.config.IncrementalWorkerCount)
 	for i := 0; i < r.config.IncrementalWorkerCount; i++ {
-		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionMap, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager, nil, r.config.GroupOpsByDistinctId, time.Duration(r.config.FlushIntervalMs)*time.Millisecond, r.config.IncrementalIncomingQueueSize, r.config.IncrementalProcessingQueueSize)
+		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionMap, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager, statsManager, r.config.GroupOpsByDistinctId, time.Duration(r.config.FlushIntervalMs)*time.Millisecond, r.config.IncrementalIncomingQueueSize, r.config.IncrementalProcessingQueueSize)
 	}
 
 	// Set up context cancellation handling for workers
@@ -772,7 +777,6 @@ func (r *OplogReplicatorLegacy) tailOplog(ctx context.Context, afterTimestamp bs
 	var lastCheckpoint time.Time = time.Now()
 	var eventsSinceLastStats int
 	var lastStatsTime time.Time = time.Now()
-	statsInterval := time.Duration(r.config.StatsIntervalMinutes) * time.Minute
 
 	// Track latest oplog timestamp for checkpoint saving
 	var latestOplogTimestamp primitive.Timestamp
@@ -829,6 +833,16 @@ func (r *OplogReplicatorLegacy) tailOplog(ctx context.Context, afterTimestamp bs
 
 			// Convert oplog event to worker event format and distribute to workers
 			r.distributeOplogEvent(ctx, op, workers)
+
+			// Track received event by operation type for StatsManager telemetry
+			switch op.Operation {
+			case "i":
+				statsManager.IncrementEventsReceived("insert")
+			case "u":
+				statsManager.IncrementEventsReceived("update")
+			case "d":
+				statsManager.IncrementEventsReceived("delete")
+			}
 
 			r.mu.Lock()
 			processedCount++
