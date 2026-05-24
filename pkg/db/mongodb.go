@@ -14,6 +14,13 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
+// FailedIndex records an index that failed to be created on the target.
+type FailedIndex struct {
+	Collection string // Target collection name
+	IndexName  string // Index name from the source definition
+	Error      error  // The error that caused the failure
+}
+
 // MongoDB represents a MongoDB connection
 type MongoDB struct {
 	client         *mongo.Client
@@ -21,6 +28,8 @@ type MongoDB struct {
 	log            *logger.Logger
 	indexSemaphore chan struct{}  // limits concurrent async index builds to prevent Firestore cross-transaction contention
 	indexWg        sync.WaitGroup // tracks in-flight async index creation goroutines
+	failedIndexes  []FailedIndex  // indexes that failed to be created (populated by async builds)
+	failedIndexMu  sync.Mutex     // protects failedIndexes
 }
 
 // NewMongoDB creates a new MongoDB connection with pool size and idle timeouts configured dynamically
@@ -63,10 +72,43 @@ func NewMongoDB(connectionString, databaseName string, minPoolSize, maxPoolSize 
 	}, nil
 }
 
+// SetIndexConcurrency replaces the index build semaphore with one of the given capacity.
+// Use n=1 (default) for Firestore targets to serialize builds and avoid cross-transaction
+// contention. Use a higher value (e.g. 4) for regular MongoDB targets.
+// Must be called before any async index builds are launched.
+func (m *MongoDB) SetIndexConcurrency(n int) {
+	if n <= 0 {
+		n = 1
+	}
+	m.indexSemaphore = make(chan struct{}, n)
+	m.log.Infof("Index build concurrency set to %d", n)
+}
+
 // WaitForIndexCreation blocks until all async index creation goroutines have finished.
 // Used by index-only mode to ensure the process doesn't exit before indexes are created.
 func (m *MongoDB) WaitForIndexCreation() {
 	m.indexWg.Wait()
+}
+
+// GetFailedIndexes returns a copy of the failed index list.
+// Call this after WaitForIndexCreation() to inspect which indexes could not be created.
+func (m *MongoDB) GetFailedIndexes() []FailedIndex {
+	m.failedIndexMu.Lock()
+	defer m.failedIndexMu.Unlock()
+	result := make([]FailedIndex, len(m.failedIndexes))
+	copy(result, m.failedIndexes)
+	return result
+}
+
+// recordFailedIndex appends a failed index entry (thread-safe).
+func (m *MongoDB) recordFailedIndex(collection, indexName string, err error) {
+	m.failedIndexMu.Lock()
+	defer m.failedIndexMu.Unlock()
+	m.failedIndexes = append(m.failedIndexes, FailedIndex{
+		Collection: collection,
+		IndexName:  indexName,
+		Error:      err,
+	})
 }
 
 // Close closes the MongoDB connection
@@ -157,7 +199,9 @@ func (m *MongoDB) CreateClientLevelChangeStream(ctx context.Context, resumeToken
 	return changeStream, nil
 }
 
-// ListIndexes returns all indexes for a collection
+// ListIndexes returns all indexes for a collection.
+// The "key" field in each returned bson.M is guaranteed to be a bson.D (ordered)
+// so that compound index field order is preserved correctly.
 func (m *MongoDB) ListIndexes(ctx context.Context, collectionName string) ([]bson.M, error) {
 	collection := m.GetCollection(collectionName)
 	cursor, err := collection.Indexes().List(ctx)
@@ -167,102 +211,33 @@ func (m *MongoDB) ListIndexes(ctx context.Context, collectionName string) ([]bso
 	defer cursor.Close(ctx)
 
 	var indexes []bson.M
-	if err = cursor.All(ctx, &indexes); err != nil {
-		return nil, fmt.Errorf("failed to decode indexes: %w", err)
+	for cursor.Next(ctx) {
+		// Decode the full document as bson.M for general field access
+		var indexDoc bson.M
+		if err := cursor.Decode(&indexDoc); err != nil {
+			return nil, fmt.Errorf("failed to decode index: %w", err)
+		}
+
+		// Extract the "key" field from the raw BSON as bson.D to preserve field order.
+		// bson.M (map) does not guarantee iteration order, which matters for compound indexes
+		// where {a:1, b:1} is different from {b:1, a:1}.
+		rawDoc := cursor.Current
+		keyVal, err := rawDoc.LookupErr("key")
+		if err == nil {
+			var orderedKeys bson.D
+			if unmarshalErr := keyVal.Unmarshal(&orderedKeys); unmarshalErr == nil {
+				indexDoc["key"] = orderedKeys
+			}
+		}
+
+		indexes = append(indexes, indexDoc)
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate indexes: %w", err)
 	}
 
 	return indexes, nil
-}
-
-// CreateIndexFromDefinition creates an index on a collection using an index definition
-func (m *MongoDB) CreateIndexFromDefinition(ctx context.Context, collectionName string, indexDef bson.M) error {
-	collection := m.GetCollection(collectionName)
-
-	// Extract index name
-	indexName, ok := indexDef["name"].(string)
-	if !ok {
-		return fmt.Errorf("index definition missing 'name' field")
-	}
-
-	// Extract index keys and ensure they're in ordered format
-	keysRaw, ok := indexDef["key"]
-	if !ok {
-		return fmt.Errorf("index definition missing 'key' field")
-	}
-
-	// Convert keys to bson.D (ordered) format to preserve field order
-	// Note: bson.D is an alias for primitive.D, and bson.M is an alias for primitive.M
-	var keys bson.D
-	switch k := keysRaw.(type) {
-	case bson.D:
-		// bson.D and primitive.D are the same type
-		keys = k
-	case bson.M:
-		// bson.M and primitive.M are the same type
-		// Convert bson.M to bson.D
-		// Note: Map iteration order is preserved in Go 1.12+ for unmodified maps
-		for key, value := range k {
-			keys = append(keys, bson.E{Key: key, Value: value})
-		}
-	default:
-		return fmt.Errorf("unexpected type for index keys: %T", keysRaw)
-	}
-
-	// Build index model
-	indexModel := mongo.IndexModel{
-		Keys: keys,
-	}
-
-	// Build index options
-	opts := options.Index().SetName(indexName)
-
-	// Add unique constraint if present
-	if unique, ok := indexDef["unique"].(bool); ok && unique {
-		opts.SetUnique(true)
-	}
-
-	// Add sparse option if present
-	if sparse, ok := indexDef["sparse"].(bool); ok && sparse {
-		opts.SetSparse(true)
-	}
-
-	// Add TTL (expireAfterSeconds) if present
-	if expireAfter, ok := indexDef["expireAfterSeconds"].(int32); ok {
-		opts.SetExpireAfterSeconds(expireAfter)
-	}
-
-	// Add partial filter expression if present
-	if partialFilter, ok := indexDef["partialFilterExpression"]; ok {
-		opts.SetPartialFilterExpression(partialFilter)
-	}
-
-	// Add text index options if present
-	if defaultLanguage, ok := indexDef["default_language"].(string); ok {
-		opts.SetDefaultLanguage(defaultLanguage)
-	}
-	if languageOverride, ok := indexDef["language_override"].(string); ok {
-		opts.SetLanguageOverride(languageOverride)
-	}
-
-	// Add text index weights if present
-	if weights, ok := indexDef["weights"]; ok {
-		opts.SetWeights(weights)
-	}
-
-	// Always build indexes in the background to avoid blocking and timeouts.
-	// On MongoDB < 4.2: the server returns immediately, index builds asynchronously.
-	// On MongoDB 4.2+: this option is deprecated and ignored (all builds are hybrid/non-blocking).
-	opts.SetBackground(true)
-
-	indexModel.Options = opts
-
-	// Create the index
-	_, err := collection.Indexes().CreateOne(ctx, indexModel)
-	if err != nil {
-		return fmt.Errorf("failed to create index '%s' on collection %s: %w", indexName, collectionName, err)
-	}
-
-	return nil
 }
 
 // isContentionError checks if an error is a Firestore cross-transaction contention error.
@@ -272,7 +247,7 @@ func isContentionError(err error) bool {
 	}
 	errStr := err.Error()
 	return strings.Contains(errStr, "cross-transaction contention") ||
-		strings.Contains(errStr, "Aborted") && strings.Contains(errStr, "contention") ||
+		(strings.Contains(errStr, "Aborted") && strings.Contains(errStr, "contention")) ||
 		strings.Contains(errStr, "too much contention")
 }
 
@@ -280,13 +255,15 @@ func isContentionError(err error) bool {
 // It uses a dedicated MongoDB client with no socket timeout so index builds can run
 // as long as needed without being killed by the main client's 120-second socket timeout.
 //
-// Throttling: A semaphore (capacity=1) serializes index builds to prevent Firestore
-// cross-transaction contention. Goroutines queue up and execute one at a time.
+// Throttling: A semaphore serializes index builds to prevent Firestore
+// cross-transaction contention. Goroutines queue up and execute according to the
+// configured concurrency (default 1 = fully serialized).
 //
 // Retry: If a contention error still occurs (e.g., from an external process), the
 // operation retries up to 3 times with 30s/60s/120s delays.
 //
-// The goroutine logs success or failure — the caller does not wait.
+// Failed indexes are recorded and can be retrieved via GetFailedIndexes() after
+// WaitForIndexCreation() completes.
 func (m *MongoDB) CreateIndexFromDefinitionAsync(connectionString, collectionName string, indexDef bson.M) {
 	// Extract index name for logging
 	indexName, _ := indexDef["name"].(string)
@@ -320,6 +297,7 @@ func (m *MongoDB) CreateIndexFromDefinitionAsync(connectionString, collectionNam
 		client, err := mongo.Connect(ctx, clientOptions)
 		if err != nil {
 			m.log.Errorf("[async] Failed to connect for index '%s' on '%s': %v", indexName, collectionName, err)
+			m.recordFailedIndex(collectionName, indexName, fmt.Errorf("connection failed: %w", err))
 			return
 		}
 		defer client.Disconnect(ctx)
@@ -340,6 +318,7 @@ func (m *MongoDB) CreateIndexFromDefinitionAsync(connectionString, collectionNam
 				case <-time.After(delay):
 				case <-ctx.Done():
 					m.log.Warnf("[async] Context canceled while waiting to retry index '%s' on '%s'", indexName, collectionName)
+					m.recordFailedIndex(collectionName, indexName, fmt.Errorf("context canceled during retry: %w", ctx.Err()))
 					return
 				}
 			}
@@ -363,14 +342,15 @@ func (m *MongoDB) CreateIndexFromDefinitionAsync(connectionString, collectionNam
 				indexName, collectionName, lastErr, attempt+1, maxRetries+1, time.Since(startTime).Round(time.Second))
 		}
 
-		// All attempts exhausted or non-contention error
+		// All attempts exhausted or non-contention error — record as failed
 		m.log.Warnf("[async] Failed to create index '%s' on '%s': %v (took %v)",
 			indexName, collectionName, lastErr, time.Since(startTime).Round(time.Second))
+		m.recordFailedIndex(collectionName, indexName, lastErr)
 	}()
 }
 
 // createIndexOnCollection is a helper that creates an index on a given collection.
-// It contains the shared index model building logic used by both sync and async paths.
+// It contains the shared index model building logic used by the async path.
 func (m *MongoDB) createIndexOnCollection(ctx context.Context, collection *mongo.Collection, collectionName string, indexDef bson.M) error {
 	indexName, ok := indexDef["name"].(string)
 	if !ok {
@@ -403,9 +383,20 @@ func (m *MongoDB) createIndexOnCollection(ctx context.Context, collection *mongo
 	if sparse, ok := indexDef["sparse"].(bool); ok && sparse {
 		opts.SetSparse(true)
 	}
-	if expireAfter, ok := indexDef["expireAfterSeconds"].(int32); ok {
-		opts.SetExpireAfterSeconds(expireAfter)
+
+	// Handle TTL (expireAfterSeconds) — the server may return int32, int64, or float64
+	// depending on the BSON encoding or deserialization path.
+	if val, ok := indexDef["expireAfterSeconds"]; ok {
+		switch v := val.(type) {
+		case int32:
+			opts.SetExpireAfterSeconds(v)
+		case int64:
+			opts.SetExpireAfterSeconds(int32(v))
+		case float64:
+			opts.SetExpireAfterSeconds(int32(v))
+		}
 	}
+
 	if partialFilter, ok := indexDef["partialFilterExpression"]; ok {
 		opts.SetPartialFilterExpression(partialFilter)
 	}

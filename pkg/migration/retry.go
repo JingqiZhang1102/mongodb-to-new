@@ -83,13 +83,14 @@ func (r *RetryManager) ClassifyError(err error) ErrorType {
 		return ErrorTypeConnection
 	}
 
-	// Check for contention errors
+	// Check for contention errors (includes Firestore "schema change" during concurrent index builds)
 	if strings.Contains(errStr, "too much contention") ||
 		strings.Contains(errStr, "lock timeout") ||
 		strings.Contains(errStr, "OperationFailed") && strings.Contains(errStr, "Aborted") ||
 		strings.Contains(errStr, "TransientTransactionError") ||
 		strings.Contains(errStr, "WriteConflict") ||
-		strings.Contains(errStr, "exceeded time limit") {
+		strings.Contains(errStr, "exceeded time limit") ||
+		strings.Contains(errStr, "schema change") {
 		return ErrorTypeContention
 	}
 

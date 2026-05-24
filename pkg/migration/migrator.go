@@ -173,7 +173,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 	if err != nil {
 		return fmt.Errorf("failed to connect to source MongoDB: %w", err)
 	}
-	
+
 	// Get maximum connection idle timeout for target
 	maxConnIdleTimeTarget := time.Duration(m.config.TargetMaxConnIdleSeconds) * time.Second
 
@@ -193,6 +193,11 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 	// Sync indexes before data migration (if configured)
 	// For live mode, each replicator handles index sync during its own initial migration
 	if mode == "migrate" && (pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0) {
+		// Configure index build concurrency before launching any async builds
+		if m.config.IndexConcurrency > 0 {
+			targetDB.SetIndexConcurrency(m.config.IndexConcurrency)
+		}
+
 		if err := m.syncIndexes(ctx, sourceDB, targetDB, pair, collections); err != nil {
 			m.log.Warnf("Index sync encountered issues: %v (continuing with migration)", err)
 			// Continue with migration even if index sync has issues
@@ -202,9 +207,18 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 		if pair.Target.IndexOnly {
 			m.log.Info("IndexOnly mode enabled. Waiting for all async index creation to complete...")
 			targetDB.WaitForIndexCreation()
-			m.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration.")
+			m.logFailedIndexes(targetDB)
+			m.log.Info("IndexOnly mode: all indexes synced. Skipping data migration.")
 			return nil
 		}
+
+		// Wait for all async index creation to complete before starting data migration
+		// This prevents "schema change" errors from Firestore when indexes are being built
+		// concurrently with data writes
+		m.log.Info("Waiting for all async index creation to complete before starting data migration...")
+		targetDB.WaitForIndexCreation()
+		m.logFailedIndexes(targetDB)
+		m.log.Info("All indexes created. Proceeding with data migration.")
 	}
 
 	// Process each collection
@@ -393,8 +407,6 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 		return fmt.Errorf("failed to connect to source MongoDB (legacy): %w", err)
 	}
 	defer sourceDBLegacy.Close()
-
-
 
 	// Get maximum connection idle timeout
 	maxConnIdleTime := time.Duration(m.config.TargetMaxConnIdleSeconds) * time.Second
@@ -1186,6 +1198,19 @@ func (m *Migrator) syncIndexes(ctx context.Context, sourceDB, targetDB *db.Mongo
 		// Get target collection name
 		targetCollName := m.getTargetCollectionName(indexConfig.SourceCollection, pair)
 
+		// List existing indexes on the target to skip already-created ones
+		existingIndexNames := make(map[string]bool)
+		targetIndexes, err := targetDB.ListIndexes(ctx, targetCollName)
+		if err != nil {
+			m.log.Debugf("Could not list target indexes for %s: %v (will attempt all)", targetCollName, err)
+		} else {
+			for _, idx := range targetIndexes {
+				if name, ok := idx["name"].(string); ok {
+					existingIndexNames[name] = true
+				}
+			}
+		}
+
 		// Filter to only requested indexes
 		for _, indexDef := range sourceIndexes {
 			indexName, ok := indexDef["name"].(string)
@@ -1212,6 +1237,12 @@ func (m *Migrator) syncIndexes(ctx context.Context, sourceDB, targetDB *db.Mongo
 				continue
 			}
 
+			// Skip if index already exists on target
+			if existingIndexNames[indexName] {
+				m.log.Infof("Index '%s' already exists on target collection '%s', skipping", indexName, targetCollName)
+				continue
+			}
+
 			// Fire-and-forget: launch async index creation with a dedicated client
 			m.log.Infof("Launching async index creation: '%s' on target collection '%s'", indexName, targetCollName)
 			targetDB.CreateIndexFromDefinitionAsync(pair.Target.ConnectionString, targetCollName, indexDef)
@@ -1235,6 +1266,18 @@ func (m *Migrator) getTargetCollectionName(sourceCollName string, pair config.Da
 	// If not found in explicit config, assume same name as source
 	m.log.Debugf("No explicit mapping for %s, using same collection name on target", sourceCollName)
 	return sourceCollName
+}
+
+// logFailedIndexes checks for and logs any indexes that failed to be created.
+func (m *Migrator) logFailedIndexes(targetDB *db.MongoDB) {
+	failed := targetDB.GetFailedIndexes()
+	if len(failed) == 0 {
+		return
+	}
+	m.log.Warnf("=== %d INDEX(ES) FAILED TO CREATE ===", len(failed))
+	for i, f := range failed {
+		m.log.Warnf("  [%d] Collection: %s, Index: %s, Error: %v", i+1, f.Collection, f.IndexName, f.Error)
+	}
 }
 
 func max(a, b int) int {

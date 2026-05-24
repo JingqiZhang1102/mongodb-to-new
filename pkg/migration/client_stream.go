@@ -169,6 +169,12 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		// Sync indexes before migrating data if configured
 		if pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0 {
 			r.log.Info("Syncing indexes before initial migration")
+
+			// Configure index build concurrency before launching any async builds
+			if migrator.config.IndexConcurrency > 0 {
+				r.targetDB.SetIndexConcurrency(migrator.config.IndexConcurrency)
+			}
+
 			// Build collections list from collectionMap
 			var collections []config.CollectionConfig
 			for _, colls := range r.collectionMap {
@@ -187,9 +193,18 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 			if pair.Target.IndexOnly {
 				r.log.Info("IndexOnly mode enabled. Waiting for all async index creation to complete...")
 				r.targetDB.WaitForIndexCreation()
+				migrator.logFailedIndexes(r.targetDB)
 				r.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration and change stream.")
 				return nil
 			}
+
+			// Wait for all async index creation to complete before starting data migration
+			// This prevents "schema change" errors from Firestore when indexes are being built
+			// concurrently with data writes
+			r.log.Info("Waiting for all async index creation to complete before starting data migration...")
+			r.targetDB.WaitForIndexCreation()
+			migrator.logFailedIndexes(r.targetDB)
+			r.log.Info("All indexes created. Proceeding with data migration.")
 		}
 
 		// Use a semaphore to limit the number of concurrent collection migrations
@@ -301,7 +316,7 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 											r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
 										}
 									}
-									// Phase 1 (Pre-Database failure): Update metrics early since the entire batch 
+									// Phase 1 (Pre-Database failure): Update metrics early since the entire batch
 									// is aborted here and will skip the post-database metrics block below.
 									workerMu.Lock()
 									failedCount += int64(len(batch))
@@ -392,7 +407,7 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 									}
 								}
 
-								// Phase 2 (Post-Database write execution): Distribute metrics dynamically 
+								// Phase 2 (Post-Database write execution): Distribute metrics dynamically
 								// based on successful writes and database retry failures within this batch.
 								workerMu.Lock()
 								successCount += int64(len(batch)) - batchFailed
@@ -593,6 +608,12 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		if !needsInitialMigration && (pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0) {
 			// Resume token exists, so initial migration was skipped — sync indexes now
 			r.log.Info("IndexOnly mode: resume token exists, performing index sync directly")
+
+			// Configure index build concurrency before launching any async builds
+			if migrator.config.IndexConcurrency > 0 {
+				r.targetDB.SetIndexConcurrency(migrator.config.IndexConcurrency)
+			}
+
 			var collections []config.CollectionConfig
 			for _, colls := range r.collectionMap {
 				for src, tgt := range colls {
@@ -607,6 +628,7 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 			}
 			r.log.Info("IndexOnly mode: waiting for all async index creation to complete...")
 			r.targetDB.WaitForIndexCreation()
+			migrator.logFailedIndexes(r.targetDB)
 		}
 		r.log.Info("IndexOnly mode: skipping change stream. Index replication complete.")
 		return nil

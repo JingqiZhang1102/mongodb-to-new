@@ -255,9 +255,16 @@ func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTime
 		if !needsInitialMigration && (pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0) {
 			// Checkpoint exists, so performInitialMigration was skipped — sync indexes now
 			r.log.Info("IndexOnly mode: checkpoint exists, performing index sync directly")
+
+			// Configure index build concurrency before launching any async builds
+			if r.config.IndexConcurrency > 0 {
+				r.targetDB.SetIndexConcurrency(r.config.IndexConcurrency)
+			}
+
 			r.syncIndexesLegacy(ctx, pair)
 			r.log.Info("IndexOnly mode: waiting for all async index creation to complete...")
 			r.targetDB.WaitForIndexCreation()
+			migrator.logFailedIndexes(r.targetDB)
 		}
 		r.log.Info("IndexOnly mode: skipping oplog tailing. Index replication complete.")
 		return nil
@@ -275,15 +282,30 @@ func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pai
 	// Sync indexes before migrating data if configured
 	if pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0 {
 		r.log.Info("Syncing indexes before initial migration (legacy mode)")
+
+		// Configure index build concurrency before launching any async builds
+		if r.config.IndexConcurrency > 0 {
+			r.targetDB.SetIndexConcurrency(r.config.IndexConcurrency)
+		}
+
 		r.syncIndexesLegacy(ctx, pair)
 
 		// Index-Only mode: wait for all async index builds then return without migrating data
 		if pair.Target.IndexOnly {
 			r.log.Info("IndexOnly mode enabled. Waiting for all async index creation to complete...")
 			r.targetDB.WaitForIndexCreation()
+			migrator.logFailedIndexes(r.targetDB)
 			r.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration.")
 			return 0, 0, nil
 		}
+
+		// Wait for all async index creation to complete before starting data migration
+		// This prevents "schema change" errors from Firestore when indexes are being built
+		// concurrently with data writes
+		r.log.Info("Waiting for all async index creation to complete before starting data migration...")
+		r.targetDB.WaitForIndexCreation()
+		migrator.logFailedIndexes(r.targetDB)
+		r.log.Info("All indexes created. Proceeding with data migration.")
 	}
 
 	// Use ConcurrentCollections for collection-level concurrency (separate from per-collection worker count)
@@ -1053,6 +1075,19 @@ func (r *OplogReplicatorLegacy) syncIndexesLegacy(ctx context.Context, pair conf
 			}
 		}
 
+		// List existing indexes on the target to skip already-created ones
+		existingIndexNames := make(map[string]bool)
+		targetIndexes, err := r.targetDB.ListIndexes(ctx, tgtColl)
+		if err != nil {
+			r.log.Debugf("Could not list target indexes for %s: %v (will attempt all)", tgtColl, err)
+		} else {
+			for _, idx := range targetIndexes {
+				if name, ok := idx["name"].(string); ok {
+					existingIndexNames[name] = true
+				}
+			}
+		}
+
 		for _, idx := range mgoIndexes {
 			if idx.Name == "_id_" {
 				continue
@@ -1066,6 +1101,12 @@ func (r *OplogReplicatorLegacy) syncIndexesLegacy(ctx context.Context, pair conf
 				}
 			}
 			if !found {
+				continue
+			}
+
+			// Skip if index already exists on target
+			if existingIndexNames[idx.Name] {
+				r.log.Infof("Index '%s' already exists on target collection '%s', skipping", idx.Name, tgtColl)
 				continue
 			}
 

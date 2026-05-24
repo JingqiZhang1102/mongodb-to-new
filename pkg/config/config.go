@@ -10,14 +10,15 @@ import (
 
 // Config represents the main configuration structure
 type Config struct {
-	DatabasePairs          []DatabasePair `json:"databasePairs"`
-	SaveThreshold          int            `json:"saveThreshold"`          // Number of processed events before saving a resume token checkpoint
+	DatabasePairs             []DatabasePair `json:"databasePairs"`
+	SaveThreshold             int            `json:"saveThreshold"`             // Number of processed events before saving a resume token checkpoint
 	CheckpointIntervalMinutes int            `json:"checkpointIntervalMinutes"` // Checkpoint interval in minutes
-	ForceOrderedOperations bool           `json:"forceOrderedOperations"` // Force ordered operations for all types
-	FlushIntervalMs        int            `json:"flushIntervalMs"`        // Flush interval in milliseconds
-	TargetMaxConnIdleSeconds int            `json:"targetMaxConnIdleSeconds"` // Maximum connection idle time for target in seconds
-	TargetMinPoolSize        int            `json:"targetMinPoolSize"`        // Minimum connection pool size for target
-	TargetMaxPoolSize        int            `json:"targetMaxPoolSize"`        // Maximum connection pool size for target
+	ForceOrderedOperations    bool           `json:"forceOrderedOperations"`    // Force ordered operations for all types
+	FlushIntervalMs           int            `json:"flushIntervalMs"`           // Flush interval in milliseconds
+	TargetMaxConnIdleSeconds  int            `json:"targetMaxConnIdleSeconds"`  // Maximum connection idle time for target in seconds
+	TargetMinPoolSize         int            `json:"targetMinPoolSize"`         // Minimum connection pool size for target
+	TargetMaxPoolSize         int            `json:"targetMaxPoolSize"`         // Maximum connection pool size for target
+	IndexConcurrency          int            `json:"indexConcurrency"`          // Max concurrent async index builds (default 1 for Firestore)
 
 	// Parameters for initial migration
 	InitialReadBatchSize     int `json:"initialReadBatchSize"`     // Number of documents to read in a batch during initial migration
@@ -27,13 +28,13 @@ type Config struct {
 	ConcurrentCollections    int `json:"concurrentCollections"`    // Number of collections to process concurrently
 
 	// Parameters for incremental replication
-	IncrementalReadBatchSize  int `json:"incrementalReadBatchSize"`  // Number of change events to read at once
-	IncrementalWriteBatchSize int `json:"incrementalWriteBatchSize"` // Maximum size of operation groups
-	IncrementalWorkerCount    int `json:"incrementalWorkerCount"`    // Number of worker goroutines
-	StatsIntervalMinutes      int `json:"statsIntervalMinutes"`      // Interval for reporting change stream statistics in minutes
-	GroupOpsByDistinctId      bool `json:"groupOpsByDistinctId"`      // Enable key-collision grouping instead of optype grouping
-	IncrementalIncomingQueueSize  int `json:"incrementalIncomingQueueSize"`  // Buffer size of workers' raw events queue
-	IncrementalProcessingQueueSize int `json:"incrementalProcessingQueueSize"` // Buffer size of workers' writing batches queue
+	IncrementalReadBatchSize       int  `json:"incrementalReadBatchSize"`       // Number of change events to read at once
+	IncrementalWriteBatchSize      int  `json:"incrementalWriteBatchSize"`      // Maximum size of operation groups
+	IncrementalWorkerCount         int  `json:"incrementalWorkerCount"`         // Number of worker goroutines
+	StatsIntervalMinutes           int  `json:"statsIntervalMinutes"`           // Interval for reporting change stream statistics in minutes
+	GroupOpsByDistinctId           bool `json:"groupOpsByDistinctId"`           // Enable key-collision grouping instead of optype grouping
+	IncrementalIncomingQueueSize   int  `json:"incrementalIncomingQueueSize"`   // Buffer size of workers' raw events queue
+	IncrementalProcessingQueueSize int  `json:"incrementalProcessingQueueSize"` // Buffer size of workers' writing batches queue
 
 	// Parallel read configuration for large collections
 	ParallelReadsEnabled    bool `json:"parallelReadsEnabled"`    // Enable parallel reads for large collections
@@ -158,8 +159,6 @@ func LoadConfig(configPath string) (*Config, error) {
 	if config.FlushIntervalMs <= 0 {
 		config.FlushIntervalMs = 500 // Default to 500 milliseconds
 	}
-
-
 
 	// Set default min and max pool size if not provided
 	if config.TargetMinPoolSize <= 0 {

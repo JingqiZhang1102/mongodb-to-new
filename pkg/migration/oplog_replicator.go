@@ -211,6 +211,12 @@ func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp 
 		if !needsInitialMigration && (pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0) {
 			// Checkpoint exists, so performInitialMigration was skipped — sync indexes now
 			r.log.Info("IndexOnly mode: checkpoint exists, performing index sync directly")
+
+			// Configure index build concurrency before launching any async builds
+			if migrator.config.IndexConcurrency > 0 {
+				r.targetDB.SetIndexConcurrency(migrator.config.IndexConcurrency)
+			}
+
 			var collections []config.CollectionConfig
 			for _, colls := range r.collectionMap {
 				for src, tgt := range colls {
@@ -225,6 +231,7 @@ func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp 
 			}
 			r.log.Info("IndexOnly mode: waiting for all async index creation to complete...")
 			r.targetDB.WaitForIndexCreation()
+			migrator.logFailedIndexes(r.targetDB)
 		}
 		r.log.Info("IndexOnly mode: skipping oplog tailing. Index replication complete.")
 		return nil
@@ -274,6 +281,12 @@ func (r *OplogReplicator) performInitialMigration(ctx context.Context, pair conf
 	// Sync indexes before migrating data if configured
 	if pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0 {
 		r.log.Info("Syncing indexes before initial migration")
+
+		// Configure index build concurrency before launching any async builds
+		if migrator.config.IndexConcurrency > 0 {
+			r.targetDB.SetIndexConcurrency(migrator.config.IndexConcurrency)
+		}
+
 		// Build collections list from collectionMap
 		var collections []config.CollectionConfig
 		for _, colls := range r.collectionMap {
@@ -292,9 +305,18 @@ func (r *OplogReplicator) performInitialMigration(ctx context.Context, pair conf
 		if pair.Target.IndexOnly {
 			r.log.Info("IndexOnly mode enabled. Waiting for all async index creation to complete...")
 			r.targetDB.WaitForIndexCreation()
+			migrator.logFailedIndexes(r.targetDB)
 			r.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration.")
 			return 0, 0, nil
 		}
+
+		// Wait for all async index creation to complete before starting data migration
+		// This prevents "schema change" errors from Firestore when indexes are being built
+		// concurrently with data writes
+		r.log.Info("Waiting for all async index creation to complete before starting data migration...")
+		r.targetDB.WaitForIndexCreation()
+		migrator.logFailedIndexes(r.targetDB)
+		r.log.Info("All indexes created. Proceeding with data migration.")
 	}
 
 	// Use a semaphore to limit the number of concurrent collection migrations

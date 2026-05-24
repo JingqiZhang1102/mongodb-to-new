@@ -193,6 +193,7 @@ If you want to migrate only specific collections or rename collections during mi
 #### Index Synchronization Configuration
 - **syncAllIndexes**: (Optional) When set to `true`, automatically syncs all indexes (excluding `_id_`) from every source collection to the corresponding target collection. Default is `false`.
 - **indexOnly**: (Optional) When set to `true`, the tool **only syncs indexes** and skips all data migration and incremental replication. The process exits after all indexes are created. Must be used with `syncAllIndexes: true` or explicit `indexes` configuration. Default is `false`.
+- **indexConcurrency**: (Optional) Maximum number of concurrent asynchronous index builds (default: 1). Use `1` for Firestore targets to serialize builds and avoid cross-transaction contention. Use a higher value (e.g., `4`) for regular MongoDB targets to speed up index creation.
 - **indexes**: (Optional) An array of index configurations for synchronizing specific indexes from source to target collections.
   - **sourceCollection**: The name of the source collection containing the indexes to sync.
   - **indexNames**: An array of index names to synchronize (the tool will retrieve the full index definitions from the source).
@@ -207,7 +208,10 @@ If you want to migrate only specific collections or rename collections during mi
 - **Non-blocking errors**: If index creation fails, the tool logs a warning and continues with data migration
 - **Preserves existing indexes**: Indexes already present on the target collection that don't exist in the source are kept unchanged
 - The `_id_` index is automatically skipped as it's created by MongoDB
-- **Async with throttling**: Index builds are launched asynchronously with a concurrency limit of 1 to prevent Firestore cross-transaction contention. Each build uses a dedicated client with no socket timeout so long-running index builds are not killed.
+- **Async with configurable concurrency**: Index builds are launched asynchronously with a configurable concurrency limit (controlled by `indexConcurrency`, default 1). Use `1` for Firestore targets to serialize builds and avoid cross-transaction contention; use a higher value for regular MongoDB targets. Each build uses a dedicated client with no socket timeout so long-running index builds are not killed.
+- **Compound index key order preservation**: When reading index definitions from the source, the tool preserves the exact field order of compound indexes (e.g., `{a:1, b:1}` is kept distinct from `{b:1, a:1}`). This is critical for compound indexes where field order determines query optimization.
+- **TTL index support**: TTL indexes (`expireAfterSeconds`) are correctly handled regardless of the BSON numeric type returned by the source (int32, int64, or float64).
+- **Failed index tracking**: Any index that fails to be created (due to connection errors, context cancellation, contention exhaustion, or unsupported index types) is recorded in an internal tracking list. After all index builds complete, a summary of failed indexes is logged with collection name, index name, and error details.
 
 **Example Configuration:**
 ```json
@@ -270,7 +274,8 @@ If you want to **only sync indexes** without migrating any data, set `indexOnly`
         "indexOnly": true
       }
     }
-  ]
+  ],
+  "indexConcurrency": 1
 }
 ```
 
@@ -278,8 +283,9 @@ If you want to **only sync indexes** without migrating any data, set `indexOnly`
 - Works with all modes: `migrate`, `changestream`, `oplog`, and `oplog-legacy`
 - Reads all index definitions from the source database
 - Skips indexes that already exist on the target (no duplicate creation)
-- Creates indexes asynchronously with throttling (one at a time) to prevent Firestore cross-transaction contention
+- Creates indexes asynchronously with configurable concurrency (`indexConcurrency`, default 1 for Firestore safety)
 - Waits for all index builds to complete before exiting
+- **Failed index summary**: After all builds complete, any failed indexes are logged with collection name, index name, and error details
 - **No data is migrated** — only index definitions are synced
 - **No incremental replication** — the process exits after indexes are created (no oplog tailing or change stream)
 
