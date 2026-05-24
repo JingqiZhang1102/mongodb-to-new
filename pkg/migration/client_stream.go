@@ -295,6 +295,9 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 					var lastLoggedPercentage int = -1 // Start at -1 to ensure 0% is logged
 					var workerMu sync.Mutex           // Mutex for thread-safe updates to successCount, failedCount, migratedCount, and lastLoggedPercentage
 
+					// Create retry manager for initial migration batch processing
+					retryManager := NewRetryManagerFromConfig(r.config, r.log)
+
 					// Start worker pool for parallel batch processing
 					workerCount := r.config.InitialMigrationWorkers
 					r.log.Infof("Starting %d workers for parallel document batch processing for %s.%s",
@@ -396,13 +399,64 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 										}
 									} else {
 										// Handle non-bulk write errors (e.g. network partition or context timeout)
-										// Mark the entire batch as failed since the call was aborted globally without itemized status
-										batchFailed = int64(len(batch))
-										select {
-										case errorChan <- fmt.Errorf("worker %d failed to process batch: %w", workerID, err):
-										default:
-											// Error channel already has an error
-											r.log.Errorf("Worker %d: Error processing batch: %v", workerID, err)
+										if err == context.Canceled {
+											r.log.Debugf("[%s.%s] Bulk insert canceled due to context cancellation", sourceDB, sourceCollection)
+											batchFailed = int64(len(batch))
+										} else {
+											r.log.Errorf("[%s.%s] InsertMany total failure: %v", sourceDB, sourceCollection, err)
+
+											// For transient errors, retry the bulk operation with backoff before falling back
+											bulkRetrySucceeded := false
+											errType := retryManager.ClassifyError(err)
+											if errType == ErrorTypeConnection || errType == ErrorTypeContention {
+												r.log.Infof("[%s.%s] Transient error detected. Retrying bulk insert with backoff...", sourceDB, sourceCollection)
+												retryErr := retryManager.RetryWithBackoff(ctx, func() error {
+													_, retryInsertErr := targetDBCollection.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false))
+													return retryInsertErr
+												})
+												if retryErr == nil {
+													r.log.Infof("[%s.%s] Bulk insert succeeded after retry", sourceDB, sourceCollection)
+													bulkRetrySucceeded = true
+												} else {
+													r.log.Warnf("[%s.%s] Bulk insert still failed after retries: %v. Falling back to individual operations.", sourceDB, sourceCollection, retryErr)
+												}
+											}
+
+											if !bulkRetrySucceeded {
+												// Fall back to individual insert → upsert → DLQ for each document
+												r.log.Warnf("[%s.%s] Falling back to individual insert/upsert for %d documents", sourceDB, sourceCollection, len(batch))
+												for _, doc := range batch {
+													docID := extractDocID(doc)
+
+													// Try individual insert first
+													if _, insertErr := targetDBCollection.InsertOne(ctx, doc); insertErr != nil {
+														// If insert fails, try upsert with ReplaceOne
+														if docID != nil {
+															filter := bson.M{"_id": docID}
+															if _, upsertErr := targetDBCollection.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); upsertErr != nil {
+																if upsertErr == context.Canceled {
+																	r.log.Debugf("[%s.%s] Upsert for document _id=%v canceled due to context cancellation", sourceDB, sourceCollection, docID)
+																} else {
+																	r.log.Errorf("[%s.%s] Fallback upsert failed for document _id=%v: %v", sourceDB, sourceCollection, docID, upsertErr)
+																	batchFailed++
+																	if r.dlq != nil {
+																		r.dlq.WriteFailed(sourceDB, sourceCollection, docID, upsertErr, "initial", "insert", doc)
+																	}
+																}
+															} else {
+																r.log.Debugf("[%s.%s] Successfully upserted document _id=%v after total failure fallback", sourceDB, sourceCollection, docID)
+															}
+														} else {
+															// No _id available, cannot upsert
+															batchFailed++
+															if r.dlq != nil {
+																r.dlq.WriteFailed(sourceDB, sourceCollection, docID, insertErr, "initial", "insert", doc)
+															}
+														}
+													}
+													// else: individual insert succeeded, no action needed
+												}
+											}
 										}
 									}
 								}
