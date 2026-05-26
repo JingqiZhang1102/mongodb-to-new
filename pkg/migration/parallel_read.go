@@ -449,15 +449,9 @@ func interpolateHex(minHex, maxHex string, ratio float64) string {
 
 // createPartitionsWithSampling creates partitions using sampling for any sortable _id type
 func (p *CollectionPartitioner) createPartitionsWithSampling(ctx context.Context, partitionCount int) ([]bson.D, error) {
-	// Adjust sample size based on collection size, but ensure it's large enough
-	sampleSize := p.sampleSize
-	if sampleSize < partitionCount*10 {
-		sampleSize = partitionCount * 10 // Ensure at least 10 samples per partition
-	}
-
+	sampleSize := max(p.sampleSize, partitionCount*10)
 	p.log.Infof("Sampling %d documents to create %d partitions", sampleSize, partitionCount)
 
-	// Sample documents to understand the _id distribution
 	pipeline := mongo.Pipeline{
 		{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
 		{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
@@ -470,16 +464,18 @@ func (p *CollectionPartitioner) createPartitionsWithSampling(ctx context.Context
 	}
 	defer cursor.Close(ctx)
 
-	// Collect all sampled _ids (generic interface{})
+	type idDoc struct {
+		ID interface{} `bson:"_id"`
+	}
+
 	var sampledIDs []interface{}
 	for cursor.Next(ctx) {
-		var doc bson.M
+		var doc idDoc
 		if err := cursor.Decode(&doc); err != nil {
 			return nil, fmt.Errorf("failed to decode sampled document: %w", err)
 		}
-
-		if id, exists := doc["_id"]; exists && id != nil {
-			sampledIDs = append(sampledIDs, id)
+		if doc.ID != nil {
+			sampledIDs = append(sampledIDs, doc.ID)
 		}
 	}
 
@@ -487,49 +483,36 @@ func (p *CollectionPartitioner) createPartitionsWithSampling(ctx context.Context
 		return nil, fmt.Errorf("cursor error during sampling: %w", err)
 	}
 
-	// If not enough samples, fall back to single partition
-	if len(sampledIDs) < partitionCount+1 {
-		p.log.Warnf("Not enough samples (%d) for %d partitions, falling back to single partition",
-			len(sampledIDs), partitionCount)
+	if len(sampledIDs) < partitionCount {
+		p.log.Warnf("Not enough samples (%d) for %d partitions, falling back to single partition", len(sampledIDs), partitionCount)
 		return []bson.D{{}}, nil
 	}
 
-	// Use sampled IDs to create partitions
 	partitions := make([]bson.D, 0, partitionCount)
+	step := len(sampledIDs) / partitionCount
 
-	// Calculate step size to evenly distribute partitions
-	step := len(sampledIDs) / (partitionCount + 1)
-
-	// Create partition filters
 	for i := 0; i < partitionCount; i++ {
-		startIdx := (i + 1) * step // Skip the first step to avoid edge cases
-		endIdx := (i + 2) * step
-
-		if endIdx >= len(sampledIDs) {
-			endIdx = len(sampledIDs) - 1
-		}
-
-		startID := sampledIDs[startIdx]
-		endID := sampledIDs[endIdx]
-
 		if i == 0 {
-			// First partition includes everything up to the first boundary
+			// First partition: unbounded lower
+			endID := sampledIDs[step]
 			partitions = append(partitions, bson.D{{Key: "_id", Value: bson.D{{Key: "$lt", Value: endID}}}})
-		} else if i == partitionCount-1 {
-			// Last partition includes everything from the last boundary
-			partitions = append(partitions, bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: startID}}}})
-		} else {
-			// Middle partitions
-			partitions = append(partitions, bson.D{
-				{Key: "_id", Value: bson.D{
-					{Key: "$gte", Value: startID},
-					{Key: "$lt", Value: endID},
-				}},
-			})
+			continue
 		}
+
+		startID := sampledIDs[i*step]
+
+		if i == partitionCount-1 {
+			// Last partition: unbounded upper
+			partitions = append(partitions, bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: startID}}}})
+			continue
+		}
+
+		// Middle partitions: bounded both sides
+		endID := sampledIDs[(i+1)*step]
+		partitions = append(partitions, bson.D{
+			{Key: "_id", Value: bson.D{{Key: "$gte", Value: startID}, {Key: "$lt", Value: endID}}},
+		})
 	}
 
 	return partitions, nil
 }
-
-
