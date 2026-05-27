@@ -23,7 +23,7 @@ type EventDistributor struct {
 	incrementalWorkerCount    int
 	sourceDB                  *db.MongoDB
 	targetDB                  *db.MongoDB
-	collectionMap             map[string]map[string]string
+	collectionConfigs         map[string]map[string]config.CollectionConfig
 	changeStream              *mongo.ChangeStream
 	ctx                       context.Context
 	log                       *logger.Logger
@@ -45,7 +45,7 @@ type EventDistributor struct {
 
 // NewEventDistributor creates a new event distributor
 func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
-	collectionMap map[string]map[string]string,
+	collectionConfigs map[string]map[string]config.CollectionConfig,
 	changeStream *mongo.ChangeStream, log *logger.Logger,
 	resumeTokenPath string, checkpointInterval time.Duration,
 	saveThreshold, incrementalWorkerCount, incrementalWriteBatchSize int,
@@ -59,7 +59,7 @@ func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 		incrementalWorkerCount:    incrementalWorkerCount,
 		sourceDB:                  sourceDB,
 		targetDB:                  targetDB,
-		collectionMap:             collectionMap,
+		collectionConfigs:         collectionConfigs,
 		changeStream:              changeStream,
 		ctx:                       ctx,
 		log:                       log,
@@ -132,7 +132,7 @@ func (d *EventDistributor) Start() error {
 
 	// Initialize workers with retry manager and stats manager
 	for i := 0; i < d.incrementalWorkerCount; i++ {
-		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.statsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval, d.cfg.IncrementalIncomingQueueSize, d.cfg.IncrementalProcessingQueueSize, d.DontApply)
+		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionConfigs, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.statsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval, d.cfg.IncrementalIncomingQueueSize, d.cfg.IncrementalProcessingQueueSize, d.DontApply)
 	}
 
 	// Ensure all workers are shut down sequentially and safely upon exit
@@ -287,12 +287,12 @@ type OperationGroup struct {
 
 // Worker processes change events for a subset of documents
 type Worker struct {
-	id            int
-	ctx           context.Context
-	log           *workerLogger
-	targetDB      *db.MongoDB
-	collectionMap map[string]map[string]string
-	statsManager  *StatsManager
+	id                int
+	ctx               context.Context
+	log               *workerLogger
+	targetDB          *db.MongoDB
+	collectionConfigs map[string]map[string]config.CollectionConfig
+	statsManager      *StatsManager
 
 	// Queue of raw change events waiting to be partitioned and batched concurrently
 	incomingQueue chan interface{}
@@ -366,7 +366,7 @@ func (s *statsTrackingDLQ) Close() {
 
 // NewWorker creates a new worker
 func NewWorker(id int, ctx context.Context, log *logger.Logger,
-	targetDB *db.MongoDB, collectionMap map[string]map[string]string,
+	targetDB *db.MongoDB, collectionConfigs map[string]map[string]config.CollectionConfig,
 	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager, statsManager *StatsManager, groupOpsByDistinctId bool, flushInterval time.Duration,
 	incomingQueueSize int, processingQueueSize int, dontApply bool) *Worker {
 
@@ -383,7 +383,7 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 		ctx:                       ctx,
 		log:                       &workerLogger{workerID: id, logger: log},
 		targetDB:                  targetDB,
-		collectionMap:             collectionMap,
+		collectionConfigs:         collectionConfigs,
 		incomingQueue:             make(chan interface{}, incomingQueueSize),
 		processingQueue:           make(chan *OperationGroup, processingQueueSize),
 		incrementalWriteBatchSize: incrementalWriteBatchSize,
@@ -671,8 +671,11 @@ func (w *Worker) processGroup(group OperationGroup) {
 	}
 
 	// Process based on operation type
-	switch group.OpType {
-	case "mixed":
+	collConfig, exists := w.collectionConfigs[dbName][collName]
+	isUpsertInsert := group.OpType == "insert" && exists && collConfig.UpsertMode
+	isBulkWrite := group.OpType == "mixed" || group.OpType == "update" || group.OpType == "replace" || group.OpType == "delete" || isUpsertInsert
+
+	if isBulkWrite {
 		var models []mongo.WriteModel
 		for idx := range group.Operations {
 			op := &group.Operations[idx]
@@ -688,15 +691,14 @@ func (w *Worker) processGroup(group OperationGroup) {
 			startTime := time.Now()
 			_, err := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
 			if w.statsManager != nil {
-				w.statsManager.RecordLatency("mixed", group.Operations, time.Since(startTime), w.id, err == nil)
+				w.statsManager.RecordLatency(group.OpType, group.Operations, time.Since(startTime), w.id, err == nil)
 			}
 			w.handleBulkWriteResult(writeCtx, &group, err, targetCollection, dbName, collName, func() error {
 				_, retryBulkErr := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
 				return retryBulkErr
 			})
 		}
-
-	case "insert":
+	} else if group.OpType == "insert" {
 		var docs []interface{}
 		for idx := range group.Operations {
 			op := &group.Operations[idx]
@@ -709,79 +711,17 @@ func (w *Worker) processGroup(group OperationGroup) {
 			docs = append(docs, transformed)
 		}
 
-		startTime := time.Now()
-		_, err := targetCollection.InsertMany(writeCtx, docs, options.InsertMany().SetOrdered(useOrdered))
-		if w.statsManager != nil {
-			w.statsManager.RecordLatency("insert", group.Operations, time.Since(startTime), w.id, err == nil)
-		}
-		w.handleBulkWriteResult(writeCtx, &group, err, targetCollection, dbName, collName, func() error {
-			_, retryInsertErr := targetCollection.InsertMany(writeCtx, docs, options.InsertMany().SetOrdered(useOrdered))
-			return retryInsertErr
-		})
-
-	case "update":
-		var models []mongo.WriteModel
-		for idx := range group.Operations {
-			op := &group.Operations[idx]
-			model, err := w.buildWriteModel(*op, dbName, collName)
-			if err != nil {
-				w.handleTransformationFailure(op, dbName, collName, err)
-				continue
+		if len(docs) > 0 {
+			startTime := time.Now()
+			_, err := targetCollection.InsertMany(writeCtx, docs, options.InsertMany().SetOrdered(useOrdered))
+			if w.statsManager != nil {
+				w.statsManager.RecordLatency("insert", group.Operations, time.Since(startTime), w.id, err == nil)
 			}
-			models = append(models, model)
+			w.handleBulkWriteResult(writeCtx, &group, err, targetCollection, dbName, collName, func() error {
+				_, retryInsertErr := targetCollection.InsertMany(writeCtx, docs, options.InsertMany().SetOrdered(useOrdered))
+				return retryInsertErr
+			})
 		}
-
-		startTime := time.Now()
-		_, err := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
-		if w.statsManager != nil {
-			w.statsManager.RecordLatency("update", group.Operations, time.Since(startTime), w.id, err == nil)
-		}
-		w.handleBulkWriteResult(writeCtx, &group, err, targetCollection, dbName, collName, func() error {
-			_, retryBulkErr := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
-			return retryBulkErr
-		})
-
-	case "delete":
-		var models []mongo.WriteModel
-		for _, op := range group.Operations {
-			model, err := w.buildWriteModel(op, dbName, collName)
-			if err != nil {
-				continue
-			}
-			models = append(models, model)
-		}
-
-		startTime := time.Now()
-		_, err := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
-		if w.statsManager != nil {
-			w.statsManager.RecordLatency("delete", group.Operations, time.Since(startTime), w.id, err == nil)
-		}
-		w.handleBulkWriteResult(writeCtx, &group, err, targetCollection, dbName, collName, func() error {
-			_, retryBulkErr := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
-			return retryBulkErr
-		})
-
-	case "replace":
-		var models []mongo.WriteModel
-		for idx := range group.Operations {
-			op := &group.Operations[idx]
-			model, err := w.buildWriteModel(*op, dbName, collName)
-			if err != nil {
-				w.handleTransformationFailure(op, dbName, collName, err)
-				continue
-			}
-			models = append(models, model)
-		}
-
-		startTime := time.Now()
-		_, err := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
-		if w.statsManager != nil {
-			w.statsManager.RecordLatency("replace", group.Operations, time.Since(startTime), w.id, err == nil)
-		}
-		w.handleBulkWriteResult(writeCtx, &group, err, targetCollection, dbName, collName, func() error {
-			_, retryBulkErr := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
-			return retryBulkErr
-		})
 	}
 
 	// Record replication lag for successfully processed operations
@@ -892,9 +832,9 @@ func (w *Worker) handleBulkWriteResult(ctx context.Context, group *OperationGrou
 // getTargetCollectionName gets the target collection name for a source collection
 func (w *Worker) getTargetCollectionName(dbName, collName string) string {
 	// Check if we have a mapping for this collection
-	if w.collectionMap[dbName] != nil {
-		if targetColl, exists := w.collectionMap[dbName][collName]; exists {
-			return targetColl
+	if w.collectionConfigs[dbName] != nil {
+		if collConfig, exists := w.collectionConfigs[dbName][collName]; exists {
+			return collConfig.TargetCollection
 		}
 	}
 
@@ -1086,30 +1026,33 @@ func isDuplicateKeyError(code int, msg string) bool {
 
 // buildWriteModel builds a single mongo.WriteModel from a WriteOperation, transforming Firestore-incompatible keys.
 func (w *Worker) buildWriteModel(op WriteOperation, dbName, collName string) (mongo.WriteModel, error) {
-	switch op.OpType {
-	case "insert":
-		transformed, err := TransformFieldNames(op.Document, w.log.logger, dbName, collName, op.DocumentID)
-		if err != nil {
-			return nil, err
-		}
-		return mongo.NewInsertOneModel().SetDocument(transformed), nil
-
-	case "update", "replace":
-		if op.Document == nil {
-			return nil, fmt.Errorf("document payload is nil for _id=%v", op.DocumentID)
-		}
-		transformed, err := TransformFieldNames(op.Document, w.log.logger, dbName, collName, op.DocumentID)
-		if err != nil {
-			return nil, err
-		}
-		return mongo.NewReplaceOneModel().
-			SetFilter(bson.M{"_id": op.DocumentID}).
-			SetReplacement(transformed).
-			SetUpsert(true), nil
-
-	case "delete":
+	if op.OpType == "delete" {
 		return mongo.NewDeleteOneModel().SetFilter(bson.M{"_id": op.DocumentID}), nil
 	}
+
+	if op.OpType == "insert" || op.OpType == "update" || op.OpType == "replace" {
+		if (op.OpType == "update" || op.OpType == "replace") && op.Document == nil {
+			return nil, fmt.Errorf("document payload is nil for _id=%v", op.DocumentID)
+		}
+
+		transformed, err := TransformFieldNames(op.Document, w.log.logger, dbName, collName, op.DocumentID)
+		if err != nil {
+			return nil, err
+		}
+
+		collConfig, exists := w.collectionConfigs[dbName][collName]
+		useUpsert := op.OpType == "update" || op.OpType == "replace" || (exists && collConfig.UpsertMode)
+
+		if useUpsert {
+			return mongo.NewReplaceOneModel().
+				SetFilter(bson.M{"_id": op.DocumentID}).
+				SetReplacement(transformed).
+				SetUpsert(true), nil
+		}
+
+		return mongo.NewInsertOneModel().SetDocument(transformed), nil
+	}
+
 	return nil, fmt.Errorf("unsupported operation type: %s", op.OpType)
 }
 
@@ -1176,4 +1119,35 @@ func hashBytes(data []byte) int {
 		hash *= fnvPrime32
 	}
 	return int(hash)
+}
+
+// StartPeriodicFlushLoop starts a goroutine that periodically checks all workers and flushes timed out groups
+func StartPeriodicFlushLoop(ctx context.Context, workers []*Worker, flushInterval time.Duration, log *logger.Logger) {
+	go func() {
+		ticker := time.NewTicker(flushInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				for _, worker := range workers {
+					if worker == nil {
+						continue
+					}
+					worker.mu.Lock()
+					if worker.currentGroup != nil && len(worker.currentGroup.Operations) > 0 {
+						if time.Since(worker.currentGroup.CreatedAt) >= flushInterval {
+							log.Debugf("Flushing group in worker %d due to timeout: %s.%s with %d operations",
+								worker.id, worker.currentGroup.Namespace, worker.currentGroup.OpType,
+								len(worker.currentGroup.Operations))
+							worker.flushCurrentGroup()
+						}
+					}
+					worker.mu.Unlock()
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 }

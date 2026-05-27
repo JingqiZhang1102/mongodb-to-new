@@ -17,26 +17,28 @@ import (
 
 // ClientLevelReplicator handles replication using a client-level change stream
 type ClientLevelReplicator struct {
-	sourceDB      *db.MongoDB
-	targetDB      *db.MongoDB
-	config        *config.Config
-	log           *logger.Logger
-	collectionMap map[string]map[string]string // Map of database -> source collection -> target collection
-	mu            sync.Mutex                   // Mutex for thread-safe operations
-	dlq           DLQ                          // Dead Letter Queue for failed documents
-	statsManager  *StatsManager                // Statistics manager
-	DontApply     bool                         // Don't apply flag
-	DryRun        bool                         // Dry run flag
+	sourceDB          *db.MongoDB
+	targetDB          *db.MongoDB
+	config            *config.Config
+	log               *logger.Logger
+	collectionMap     map[string]map[string]string // Map of database -> source collection -> target collection
+	collectionConfigs map[string]map[string]config.CollectionConfig // Map of database -> source collection -> full config
+	mu                sync.Mutex                   // Mutex for thread-safe operations
+	dlq               DLQ                          // Dead Letter Queue for failed documents
+	statsManager      *StatsManager                // Statistics manager
+	DontApply         bool                         // Don't apply flag
+	DryRun            bool                         // Dry run flag
 }
 
 // NewClientLevelReplicator creates a new client-level replicator
 func NewClientLevelReplicator(sourceDB, targetDB *db.MongoDB, cfg *config.Config, log *logger.Logger) *ClientLevelReplicator {
 	return &ClientLevelReplicator{
-		sourceDB:      sourceDB,
-		targetDB:      targetDB,
-		config:        cfg,
-		log:           log,
-		collectionMap: make(map[string]map[string]string),
+		sourceDB:          sourceDB,
+		targetDB:          targetDB,
+		config:            cfg,
+		log:               log,
+		collectionMap:     make(map[string]map[string]string),
+		collectionConfigs: make(map[string]map[string]config.CollectionConfig),
 	}
 }
 
@@ -51,7 +53,7 @@ func (r *ClientLevelReplicator) SetDLQ(dlq DLQ) {
 }
 
 // AddCollection adds a collection to be watched
-func (r *ClientLevelReplicator) AddCollection(sourceDB, targetDB, sourceCollection, targetCollection string) {
+func (r *ClientLevelReplicator) AddCollection(sourceDB, targetDB string, collConfig config.CollectionConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -59,11 +61,19 @@ func (r *ClientLevelReplicator) AddCollection(sourceDB, targetDB, sourceCollecti
 	if r.collectionMap[sourceDB] == nil {
 		r.collectionMap[sourceDB] = make(map[string]string)
 	}
+	if r.collectionConfigs == nil {
+		r.collectionConfigs = make(map[string]map[string]config.CollectionConfig)
+	}
+	if r.collectionConfigs[sourceDB] == nil {
+		r.collectionConfigs[sourceDB] = make(map[string]config.CollectionConfig)
+	}
 
 	// Add collection mapping
-	r.collectionMap[sourceDB][sourceCollection] = targetCollection
+	r.collectionMap[sourceDB][collConfig.SourceCollection] = collConfig.TargetCollection
+	r.collectionConfigs[sourceDB][collConfig.SourceCollection] = collConfig
 
-	r.log.Infof("Added collection mapping: %s.%s -> %s.%s", sourceDB, sourceCollection, targetDB, targetCollection)
+	r.log.Infof("Added collection mapping: %s.%s -> %s.%s (UpsertMode: %t)", 
+		sourceDB, collConfig.SourceCollection, targetDB, collConfig.TargetCollection, collConfig.UpsertMode)
 }
 
 // StartReplication starts the client-level replication
@@ -169,36 +179,8 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		if err := SaveInitialMigrationState(initialMigrationStatePath, StatusInProgress, 0); err != nil {
 			r.log.Errorf("Error saving initial migration state as incomplete: %v", err)
 		}
-
 		initialMigrationStart := time.Now()
 		r.log.Info("Performing initial migration for all collections")
-
-		// Sync indexes before migrating data if configured
-		if pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0 {
-			r.log.Info("Syncing indexes before initial migration")
-			// Build collections list from collectionMap
-			var collections []config.CollectionConfig
-			for _, colls := range r.collectionMap {
-				for src, tgt := range colls {
-					collections = append(collections, config.CollectionConfig{
-						SourceCollection: src,
-						TargetCollection: tgt,
-					})
-				}
-			}
-			if err := migrator.syncIndexes(ctx, r.sourceDB, r.targetDB, pair, collections); err != nil {
-				r.log.Warnf("Index sync encountered issues: %v (continuing with migration)", err)
-			}
-
-			// Index-Only mode: wait for all async index builds then return without migrating data
-			if pair.Target.IndexOnly {
-				r.log.Info("IndexOnly mode enabled. Waiting for all async index creation to complete...")
-				r.targetDB.WaitForIndexCreation()
-				r.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration and change stream.")
-				return nil
-			}
-		}
-
 		// Use a semaphore to limit the number of concurrent collection migrations
 		concurrentCollections := r.config.ConcurrentCollections
 		if concurrentCollections <= 0 {
@@ -219,26 +201,21 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		var errOnce sync.Once
 
 		totalCollections := 0
-		for _, colls := range r.collectionMap {
+		for _, colls := range r.collectionConfigs {
 			totalCollections += len(colls)
 		}
 
 		// Iterate through all collections in the map
-		for sourceDB, collections := range r.collectionMap {
-			for sourceCollection, targetCollection := range collections {
+		for sourceDB, collections := range r.collectionConfigs {
+			for sourceCollection, collConfig := range collections {
 				wg.Add(1)
 				semaphore <- struct{}{}
 
-				go func(sourceDB, sourceCollection, targetCollection string) {
+				go func(sourceDB, sourceCollection string, collConfig config.CollectionConfig) {
 					defer wg.Done()
 					defer func() { <-semaphore }()
 
-					r.log.Infof("Starting initial migration for %s.%s to %s", sourceDB, sourceCollection, targetCollection)
-
-					collConfig := config.CollectionConfig{
-						SourceCollection: sourceCollection,
-						TargetCollection: targetCollection,
-					}
+					r.log.Infof("Starting initial migration for %s.%s to %s", sourceDB, sourceCollection, collConfig.TargetCollection)
 
 					opts := MigrateOptions{
 						DLQ:          r.dlq,
@@ -260,7 +237,7 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 					completedCollections++
 					r.log.Infof("Overall progress: %d/%d collections completed", completedCollections, totalCollections)
 					mu.Unlock()
-				}(sourceDB, sourceCollection, targetCollection)
+				}(sourceDB, sourceCollection, collConfig)
 			}
 		}
 
@@ -321,13 +298,11 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		if !needsInitialMigration && (pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0) {
 			// Resume token exists, so initial migration was skipped — sync indexes now
 			r.log.Info("IndexOnly mode: resume token exists, performing index sync directly")
+			// Build collections list from collectionConfigs
 			var collections []config.CollectionConfig
-			for _, colls := range r.collectionMap {
-				for src, tgt := range colls {
-					collections = append(collections, config.CollectionConfig{
-						SourceCollection: src,
-						TargetCollection: tgt,
-					})
+			for _, colls := range r.collectionConfigs {
+				for _, collConfig := range colls {
+					collections = append(collections, collConfig)
 				}
 			}
 			if err := migrator.syncIndexes(ctx, r.sourceDB, r.targetDB, pair, collections); err != nil {
@@ -379,7 +354,7 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		ctx,
 		r.sourceDB,
 		r.targetDB,
-		r.collectionMap,
+		r.collectionConfigs,
 		changeStream,
 		r.log,
 		globalResumeTokenPath,

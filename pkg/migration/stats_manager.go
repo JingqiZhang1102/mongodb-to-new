@@ -846,9 +846,27 @@ func (sm *StatsManager) ReportStats() {
 		processedLabel = "Read"
 	}
 
+	var processedLine string
+	if sm.DryRun || sm.DontApply {
+		processedLine = fmt.Sprintf("  - "+processedLabel+": %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]",
+			eventsProcessed, rateProcessed,
+			insertsProcessed, rateInsertsProcessed,
+			deletesProcessed, rateDeletesProcessed,
+			updatesProcessed, rateUpdatesProcessed,
+			updatedThenDeleted, rateUpdatedThenDeleted)
+	} else {
+		processedLine = fmt.Sprintf("  - "+processedLabel+": %d (%.2f events/sec) (applied: %d (%.2f/sec)) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]",
+			eventsProcessed, rateProcessed,
+			eventsApplied, rateApplied,
+			insertsProcessed, rateInsertsProcessed,
+			deletesProcessed, rateDeletesProcessed,
+			updatesProcessed, rateUpdatesProcessed,
+			updatedThenDeleted, rateUpdatedThenDeleted)
+	}
+
 	msg := fmt.Sprintf(headerStr+" (last %v):\n"+
 		"  - Received:  %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec)]\n"+
-		"  - "+processedLabel+": %d (%.2f events/sec) (applied: %d (%.2f/sec)) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]\n"+
+		"%s\n"+
 		"  - Failed:    %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec)]\n"+
 		"  - Ordered BulkWrites: %d (%.2f/sec)%s\n"+
 		"  - Unordered BulkWrites: %d (%.2f/sec)%s\n"+
@@ -866,7 +884,7 @@ func (sm *StatsManager) ReportStats() {
 		"%s",
 		duration.Round(time.Second),
 		eventsReceived, rateReceived, insertsReceived, rateInsertsReceived, deletesReceived, rateDeletesReceived, updatesReceived, rateUpdatesReceived,
-		eventsProcessed, rateProcessed, eventsApplied, rateApplied, insertsProcessed, rateInsertsProcessed, deletesProcessed, rateDeletesProcessed, updatesProcessed, rateUpdatesProcessed, updatedThenDeleted, rateUpdatedThenDeleted,
+		processedLine,
 		eventsFailed, rateFailed, insertsFailed, rateInsertsFailed, deletesFailed, rateDeletesFailed, updatesFailed, rateUpdatesFailed,
 		orderedWrites, rateOrderedWrites, avgOrderedSizeStr, unorderedWrites, rateUnorderedWrites, avgUnorderedSizeStr, sequentialRetries, rateSequentialRetries, sequentialRetriesBreakdown, duplicateKeys, rateDuplicateKeys, groupFlushesOpType, rateGroupFlushesOpType, groupFlushesNamespace, rateGroupFlushesNamespace, groupFlushesBatchFull, rateGroupFlushesBatchFull, groupFlushesCollision, rateGroupFlushesCollision, timeoutFlushes, rateTimeoutFlushes,
 		dbLatencyMsg,
