@@ -39,6 +39,8 @@ type EventDistributor struct {
 	// Statistics tracking
 	statsManager *StatsManager // Manager for statistics and replication lag
 	cfg          *config.Config
+	DontApply    bool          // Don't apply flag
+	DryRun       bool          // Dry run flag
 }
 
 // NewEventDistributor creates a new event distributor
@@ -130,7 +132,7 @@ func (d *EventDistributor) Start() error {
 
 	// Initialize workers with retry manager and stats manager
 	for i := 0; i < d.incrementalWorkerCount; i++ {
-		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.statsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval, d.cfg.IncrementalIncomingQueueSize, d.cfg.IncrementalProcessingQueueSize)
+		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.statsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval, d.cfg.IncrementalIncomingQueueSize, d.cfg.IncrementalProcessingQueueSize, d.DontApply)
 	}
 
 	// Ensure all workers are shut down sequentially and safely upon exit
@@ -179,6 +181,13 @@ func (d *EventDistributor) Start() error {
 
 		if d.statsManager != nil {
 			d.statsManager.IncrementEventsReceived(opType)
+		}
+
+		if d.DryRun {
+			if d.statsManager != nil {
+				d.statsManager.IncrementEventsRead(opType, 1)
+			}
+			continue
 		}
 
 		// Extract documentKey._id via fast binary lookup
@@ -299,6 +308,7 @@ type Worker struct {
 
 	// Force ordered operations for all types
 	forceOrderedOperations bool
+	dontApply              bool
 
 	// Dead Letter Queue for failed documents
 	dlq DLQ
@@ -358,7 +368,7 @@ func (s *statsTrackingDLQ) Close() {
 func NewWorker(id int, ctx context.Context, log *logger.Logger,
 	targetDB *db.MongoDB, collectionMap map[string]map[string]string,
 	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager, statsManager *StatsManager, groupOpsByDistinctId bool, flushInterval time.Duration,
-	incomingQueueSize int, processingQueueSize int) *Worker {
+	incomingQueueSize int, processingQueueSize int, dontApply bool) *Worker {
 
 	var workerDLQ DLQ = dlq
 	if dlq != nil && statsManager != nil {
@@ -378,6 +388,7 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 		processingQueue:           make(chan *OperationGroup, processingQueueSize),
 		incrementalWriteBatchSize: incrementalWriteBatchSize,
 		forceOrderedOperations:    forceOrderedOperations,
+		dontApply:                 dontApply,
 		dlq:                       workerDLQ,
 		retryManager:              retryManager,
 		statsManager:              statsManager,
@@ -628,6 +639,19 @@ func (w *Worker) processGroup(group OperationGroup) {
 
 	// Get mapped collection name
 	targetCollName := w.getTargetCollectionName(dbName, collName)
+
+	if w.dontApply {
+		now := time.Now()
+		for i := range group.Operations {
+			group.Operations[i].SuccessTime = now
+		}
+		w.log.Debugf("[%s.%s] Don't apply: dropped batch of %d %s operations", dbName, targetCollName, len(group.Operations), group.OpType)
+		if w.statsManager != nil {
+			w.statsManager.RecordLags(group.Operations)
+		}
+		return
+	}
+
 	targetCollection := w.targetDB.GetCollection(targetCollName)
 
 	// Use a graceful shutdown context with timeout if the main context was canceled.
@@ -779,7 +803,18 @@ func (w *Worker) handleBulkWriteResult(ctx context.Context, group *OperationGrou
 
 	bulkWriteException, ok := err.(mongo.BulkWriteException)
 	if ok && ctx.Err() != context.Canceled {
-		w.log.Errorf("[%s.%s] Bulk %s operations partially failed: %d failed", dbName, collName, group.OpType, len(bulkWriteException.WriteErrors))
+		nonDupCount := 0
+		for _, writeErr := range bulkWriteException.WriteErrors {
+			if !isDuplicateKeyError(writeErr.Code, writeErr.Message) {
+				nonDupCount++
+			}
+		}
+
+		if nonDupCount > 0 {
+			w.log.Errorf("[%s.%s] Bulk %s operations partially failed: %d failed", dbName, collName, group.OpType, len(bulkWriteException.WriteErrors))
+		} else {
+			w.log.Debugf("[%s.%s] Bulk %s operations partially failed: %d failed (all duplicate key errors)", dbName, collName, group.OpType, len(bulkWriteException.WriteErrors))
+		}
 
 		failedIndices := make(map[int]bool)
 		for _, writeErr := range bulkWriteException.WriteErrors {
@@ -801,9 +836,12 @@ func (w *Worker) handleBulkWriteResult(ctx context.Context, group *OperationGrou
 				failedDocID = op.DocumentID
 			}
 
-			isDupInsert := op.OpType == "insert" && isDuplicateKeyError(writeErr.Code, writeErr.Message)
-			if isDupInsert {
-				w.log.Debugf("[%s.%s] Mixed insert had duplicate key occurrence for _id=%v, gracefully falling back to upsert", dbName, collName, failedDocID)
+			isDup := isDuplicateKeyError(writeErr.Code, writeErr.Message)
+			if isDup {
+				if w.statsManager != nil {
+					w.statsManager.IncrementDuplicateKeys(1)
+				}
+				w.log.Debugf("[%s.%s] Duplicate key occurrence at index %d (opType=%s), _id=%v: %v. Gracefully falling back.", dbName, collName, writeErr.Index, op.OpType, failedDocID, writeErr.Message)
 			} else {
 				w.log.Errorf("[%s.%s] Write error at index %d (opType=%s), _id=%v: %v", dbName, collName, writeErr.Index, op.OpType, failedDocID, writeErr.Message)
 			}
@@ -918,6 +956,9 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 			if _, err := targetCollection.InsertOne(ctx, transformed); err != nil {
 				// If it actually already exists (e.g. concurrent write or socket retry pre-exist), fallback to ReplaceOne upsert
 				if isDuplicateKeyError(0, err.Error()) {
+					if w.statsManager != nil {
+						w.statsManager.IncrementDuplicateKeys(1)
+					}
 					w.log.Debugf("[%s.%s] Fallback InsertOne got duplicate key, retrying with upsert overwrite for _id=%v", dbName, collName, op.DocumentID)
 					if _, replaceErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true)); replaceErr != nil {
 						w.log.Errorf("[%s.%s] Fallback upsert replace after duplicate insert failed for document _id=%v: %v", dbName, collName, op.DocumentID, replaceErr)
@@ -952,6 +993,9 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 
 				// If it failed because the document already exists (concurrent upsert collision), retry with upsert=false
 				if isDuplicateKeyError(0, err.Error()) {
+					if w.statsManager != nil {
+						w.statsManager.IncrementDuplicateKeys(1)
+					}
 					w.log.Debugf("[%s.%s] Concurrent upsert collision detected for replace document _id=%v, retrying without upsert", dbName, collName, op.DocumentID)
 					if _, retryErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(false)); retryErr != nil {
 						w.log.Errorf("[%s.%s] Fallback replace update without upsert failed for document _id=%v: %v", dbName, collName, op.DocumentID, retryErr)
@@ -988,6 +1032,9 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 
 			// If it failed because the document already exists (concurrent upsert collision), retry with upsert=false
 			if isDuplicateKeyError(0, err.Error()) {
+				if w.statsManager != nil {
+					w.statsManager.IncrementDuplicateKeys(1)
+				}
 				w.log.Debugf("[%s.%s] Concurrent upsert collision detected for replace document _id=%v, retrying without upsert", dbName, collName, op.DocumentID)
 				if _, retryErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(false)); retryErr != nil {
 					w.log.Errorf("[%s.%s] Fallback replace without upsert failed for document _id=%v: %v", dbName, collName, op.DocumentID, retryErr)

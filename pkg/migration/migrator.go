@@ -24,6 +24,8 @@ type Migrator struct {
 	config       *config.Config
 	log          *logger.Logger
 	CdcStartTime *primitive.Timestamp
+	DontApply    bool
+	DryRun       bool
 }
 
 // NewMigrator creates a new migrator
@@ -39,6 +41,21 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 	// Validate mode
 	if mode != "migrate" && mode != "live" && mode != "live-only" {
 		return fmt.Errorf("invalid mode: %s, must be 'migrate', 'live', or 'live-only'", mode)
+	}
+
+	// Validate dont-apply constraint: dont-apply is only supported for 'live-only' mode
+	if m.DontApply && mode != "live-only" {
+		return fmt.Errorf("dont-apply mode is only supported for 'live-only' migrations")
+	}
+
+	// Validate dry run constraint: dry run is only supported for 'live-only' mode
+	if m.DryRun && mode != "live-only" {
+		return fmt.Errorf("dry-run mode is only supported for 'live-only' migrations")
+	}
+
+	// Validate mutual exclusivity of dont-apply and dry-run
+	if m.DontApply && m.DryRun {
+		return fmt.Errorf("dont-apply and dry-run modes are mutually exclusive")
 	}
 
 	m.log.Infof("Starting MongoDB to MongoDB %s process", mode)
@@ -139,6 +156,8 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 	// Initialize shared stats tracking for this database pair
 	statsInterval := time.Duration(m.config.StatsIntervalMinutes) * time.Minute
 	statsManager := NewStatsManager(m.log, statsInterval, m.config.GroupOpsByDistinctId)
+	statsManager.DontApply = m.DontApply
+	statsManager.DryRun = m.DryRun
 
 	// Check if this is legacy mode - if so, handle it separately
 	if (mode == "live" || mode == "live-only") && pair.Source.ReplicationMethod == "oplog-legacy" {
@@ -173,17 +192,17 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 
 	// Connect to source MongoDB (modern driver)
 	m.log.Infof("Connecting to source MongoDB at %s (MinPoolSize: 128, MaxPoolSize: 256)", pair.Source.ConnectionString)
-	sourceDB, err := db.NewMongoDB(pair.Source.ConnectionString, pair.Source.Database, 128, 256, 0, statsManager.GetPoolMonitor(), m.log) // Source uses static pool size (min 128, max 256)
+	sourceDB, err := db.NewMongoDB(pair.Source.ConnectionString, pair.Source.Database, 128, 256, 0, statsManager.GetSourcePoolMonitor(), m.log) // Source uses static pool size (min 128, max 256)
 	if err != nil {
 		return fmt.Errorf("failed to connect to source MongoDB: %w", err)
 	}
-	
+
 	// Get maximum connection idle timeout for target
 	maxConnIdleTimeTarget := time.Duration(m.config.TargetMaxConnIdleSeconds) * time.Second
 
 	// Connect to target MongoDB
 	m.log.Infof("Connecting to target MongoDB at %s (MinPoolSize: %d, MaxPoolSize: %d, MaxIdleTime: %v)", pair.Target.ConnectionString, m.config.TargetMinPoolSize, m.config.TargetMaxPoolSize, maxConnIdleTimeTarget)
-	targetDB, err := db.NewMongoDB(pair.Target.ConnectionString, pair.Target.Database, uint64(m.config.TargetMinPoolSize), uint64(m.config.TargetMaxPoolSize), maxConnIdleTimeTarget, statsManager.GetPoolMonitor(), m.log)
+	targetDB, err := db.NewMongoDB(pair.Target.ConnectionString, pair.Target.Database, uint64(m.config.TargetMinPoolSize), uint64(m.config.TargetMaxPoolSize), maxConnIdleTimeTarget, statsManager.GetTargetPoolMonitor(), m.log)
 	if err != nil {
 		return fmt.Errorf("failed to connect to target MongoDB: %w", err)
 	}
@@ -292,6 +311,8 @@ func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, t
 	// Create client-level replicator
 	replicator := NewClientLevelReplicator(sourceDB, targetDB, m.config, m.log)
 	replicator.SetStatsManager(statsManager)
+	replicator.DontApply = m.DontApply
+	replicator.DryRun = m.DryRun
 
 	// Add all collections to the replicator
 	for _, collConfig := range collections {
@@ -340,6 +361,8 @@ func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB
 
 	// Use modern oplog replicator
 	replicator := NewOplogReplicator(sourceDB, targetDB, m.config, m.log)
+	replicator.DontApply = m.DontApply
+	replicator.DryRun = m.DryRun
 
 	// Add all collections to the replicator
 	for _, collConfig := range collections {
@@ -399,8 +422,6 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 	}
 	defer sourceDBLegacy.Close()
 
-
-
 	// Get maximum connection idle timeout
 	maxConnIdleTime := time.Duration(m.config.TargetMaxConnIdleSeconds) * time.Second
 
@@ -414,6 +435,8 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 
 	// Create legacy oplog replicator
 	replicator := NewOplogReplicatorLegacy(sourceDBLegacy, targetDB, m.config, m.log)
+	replicator.DontApply = m.DontApply
+	replicator.DryRun = m.DryRun
 
 	// Add all collections to the replicator
 	for _, collConfig := range collections {

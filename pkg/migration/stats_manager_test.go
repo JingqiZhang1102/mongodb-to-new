@@ -165,6 +165,8 @@ func TestStatsManagerMetrics(t *testing.T) {
 	sm.RecordBulkWrite(42, true)
 	sm.RecordBulkWrite(10, false)
 	sm.IncrementTimeoutFlushes()
+	sm.IncrementDuplicateKeys(5)
+	sm.IncrementEventsRead("insert", 3)
 
 	missingCount := sm.GetUpdatedThenDeleted()
 	inputCount := sm.GetReceivedCount("insert")
@@ -175,6 +177,8 @@ func TestStatsManagerMetrics(t *testing.T) {
 	unorderedWritesCount := sm.GetUnorderedBulkWrites()
 	unorderedWritesSize := sm.GetUnorderedBulkWritesSize()
 	timeoutFlushesCount := sm.GetTimeoutFlushes()
+	duplicateKeysCount := sm.GetDuplicateKeys()
+	readCount := sm.GetReadCount("insert")
 
 	if missingCount != 1 {
 		t.Errorf("expected updatedThenDeletedSinceLastStats 1, got %d", missingCount)
@@ -202,6 +206,12 @@ func TestStatsManagerMetrics(t *testing.T) {
 	}
 	if timeoutFlushesCount != 1 {
 		t.Errorf("expected timeout flushes 1, got %d", timeoutFlushesCount)
+	}
+	if duplicateKeysCount != 5 {
+		t.Errorf("expected duplicate keys 5, got %d", duplicateKeysCount)
+	}
+	if readCount != 3 {
+		t.Errorf("expected read count 3, got %d", readCount)
 	}
 
 	// Test concurrent increments
@@ -262,6 +272,12 @@ func TestStatsManagerMetrics(t *testing.T) {
 	}
 	if sm.GetTimeoutFlushes() != 0 {
 		t.Errorf("expected timeout flushes to reset to 0, got %d", sm.GetTimeoutFlushes())
+	}
+	if sm.GetDuplicateKeys() != 0 {
+		t.Errorf("expected duplicate keys to reset to 0, got %d", sm.GetDuplicateKeys())
+	}
+	if sm.GetReadCount("insert") != 0 {
+		t.Errorf("expected read count to reset to 0, got %d", sm.GetReadCount("insert"))
 	}
 	if sm.GetReceivedCount("insert") != 0 || sm.GetReceivedCount("update") != 0 || sm.GetReceivedCount("delete") != 0 {
 		t.Errorf("expected received counters to reset to 0")

@@ -40,11 +40,23 @@ func opIndex(opType string) int {
 type opStats struct {
 	received              int64
 	processed             int64
+	read                  int64
 	failed                int64
 	dlq                   int64
 	totalBulkWriteLatency int64
 	bulkWriteLatencyCount int64
 	sequentialRetries     int64
+}
+
+type poolMonitorStats struct {
+	opened       int64
+	closed       int64
+	open         int64
+	inUse        int64
+	succeeded    int64
+	failed       int64
+	returned     int64
+	waitDuration int64
 }
 
 // StatsManager coordinates statistics and replication lag tracking thread-safely
@@ -55,6 +67,11 @@ type StatsManager struct {
 	log                  *logger.Logger
 	statsInterval        time.Duration
 	groupOpsByDistinctId bool
+	DontApply            bool
+	DryRun               bool
+
+	// Unified operation statistics
+	opsStats [5]opStats
 
 	// Unified operation statistics
 	opsStats [5]opStats
@@ -67,6 +84,7 @@ type StatsManager struct {
 	unorderedBulkWritesSinceLastStats     int64
 	unorderedBulkWritesSizeSinceLastStats int64
 	timeoutFlushesSinceLastStats          int64
+	duplicateKeysSinceLastStats           int64
 
 	// Group flush reasons (atomically tracked)
 	groupFlushesOpType    int64
@@ -86,14 +104,8 @@ type StatsManager struct {
 	failureBreakdown map[string]map[string]int64 // opType -> simplified error message -> count
 
 	// Connection Pool stats (atomically tracked)
-	poolConnectionsOpened    int64 // Cleared when logged
-	poolConnectionsClosed    int64 // Cleared when logged
-	poolConnectionsOpen      int64 // Total open connections currently maintained (never cleared)
-	poolCheckoutInUse        int64 // Checked out connections currently held (never cleared)
-	poolCheckoutSucceeded    int64 // Succeeded connection checkouts (cleared when logged)
-	poolCheckoutFailed       int64 // Failed connection checkouts (cleared when logged)
-	poolCheckoutReturned     int64 // Checked in connections returned to the pool (cleared when logged)
-	poolCheckoutWaitDuration int64 // Cumulative wait time in nanoseconds (cleared when logged)
+	sourcePool poolMonitorStats
+	targetPool poolMonitorStats
 }
 
 // NewStatsManager creates a new StatsManager
@@ -322,6 +334,22 @@ func (sm *StatsManager) GetTimeoutFlushes() int {
 	return int(atomic.LoadInt64(&sm.timeoutFlushesSinceLastStats))
 }
 
+// IncrementDuplicateKeys increments the count of duplicate key errors thread-safely and lock-freely
+func (sm *StatsManager) IncrementDuplicateKeys(count int64) {
+	if sm == nil {
+		return
+	}
+	atomic.AddInt64(&sm.duplicateKeysSinceLastStats, count)
+}
+
+// GetDuplicateKeys returns the duplicate keys count thread-safely and lock-freely
+func (sm *StatsManager) GetDuplicateKeys() int {
+	if sm == nil {
+		return 0
+	}
+	return int(atomic.LoadInt64(&sm.duplicateKeysSinceLastStats))
+}
+
 // IncrementGroupFlushReason increments the count of group flushes by reason thread-safely and lock-freely
 func (sm *StatsManager) IncrementGroupFlushReason(reason string) {
 	if sm == nil {
@@ -369,6 +397,7 @@ func (sm *StatsManager) IncrementEventsProcessed(opType string, count int64) {
 	if idx >= 0 {
 		atomic.AddInt64(&sm.opsStats[idx].processed, count)
 	}
+	return errStr
 }
 
 func simplifyError(errStr string) string {
@@ -425,40 +454,80 @@ func (sm *StatsManager) GetDLQCount(opType string) int {
 	return 0
 }
 
-// GetPoolMonitor returns a MongoDB client PoolMonitor that routes connection events to StatsManager atomically.
-func (sm *StatsManager) GetPoolMonitor() *event.PoolMonitor {
+// GetSourcePoolMonitor returns a MongoDB client PoolMonitor for the source connection pool.
+func (sm *StatsManager) GetSourcePoolMonitor() *event.PoolMonitor {
 	if sm == nil {
 		return nil
 	}
+	return sm.createPoolMonitor(&sm.sourcePool)
+}
+
+// GetTargetPoolMonitor returns a MongoDB client PoolMonitor for the target connection pool.
+func (sm *StatsManager) GetTargetPoolMonitor() *event.PoolMonitor {
+	if sm == nil {
+		return nil
+	}
+	return sm.createPoolMonitor(&sm.targetPool)
+}
+
+func (sm *StatsManager) createPoolMonitor(stats *poolMonitorStats) *event.PoolMonitor {
 	return &event.PoolMonitor{
 		Event: func(evt *event.PoolEvent) {
 			switch evt.Type {
 			case event.ConnectionCreated:
-				// Emitted when a new TCP socket connection is successfully established to the database
-				atomic.AddInt64(&sm.poolConnectionsOpened, 1)
-				atomic.AddInt64(&sm.poolConnectionsOpen, 1)
+				atomic.AddInt64(&stats.opened, 1)
+				atomic.AddInt64(&stats.open, 1)
 			case event.ConnectionClosed:
-				// Emitted when an open TCP socket connection is closed (e.g., client-side idle timeout or server-side drop)
-				atomic.AddInt64(&sm.poolConnectionsClosed, 1)
-				atomic.AddInt64(&sm.poolConnectionsOpen, -1)
+				atomic.AddInt64(&stats.closed, 1)
+				atomic.AddInt64(&stats.open, -1)
 			case event.GetSucceeded:
-				// Emitted when a connection is successfully checked out of the pool for executing a query/write
-				// evt.Duration captures the exact duration the thread spent waiting in the pool's checkout queue
-				atomic.AddInt64(&sm.poolCheckoutInUse, 1)
-				atomic.AddInt64(&sm.poolCheckoutSucceeded, 1)
-				atomic.AddInt64(&sm.poolCheckoutWaitDuration, int64(evt.Duration))
+				atomic.AddInt64(&stats.inUse, 1)
+				atomic.AddInt64(&stats.succeeded, 1)
+				atomic.AddInt64(&stats.waitDuration, int64(evt.Duration))
 			case event.GetFailed:
-				// Emitted when a checkout attempt fails (e.g., checkout queue timeout or parent context canceled)
-				// evt.Duration captures the wait duration in the queue before the operation failed
-				atomic.AddInt64(&sm.poolCheckoutFailed, 1)
-				atomic.AddInt64(&sm.poolCheckoutWaitDuration, int64(evt.Duration))
+				atomic.AddInt64(&stats.failed, 1)
+				atomic.AddInt64(&stats.waitDuration, int64(evt.Duration))
 			case event.ConnectionReturned:
-				// Emitted when an active query/write completes and returns its connection socket back to the pool
-				atomic.AddInt64(&sm.poolCheckoutInUse, -1)
-				atomic.AddInt64(&sm.poolCheckoutReturned, 1)
+				atomic.AddInt64(&stats.inUse, -1)
+				atomic.AddInt64(&stats.returned, 1)
 			}
 		},
 	}
+}
+
+func (sm *StatsManager) formatPoolStats(stats *poolMonitorStats, name string, duration time.Duration) string {
+	opened := atomic.SwapInt64(&stats.opened, 0)
+	closed := atomic.SwapInt64(&stats.closed, 0)
+	open := atomic.LoadInt64(&stats.open)
+	inUse := atomic.LoadInt64(&stats.inUse)
+	succeeded := atomic.SwapInt64(&stats.succeeded, 0)
+	failed := atomic.SwapInt64(&stats.failed, 0)
+	returned := atomic.SwapInt64(&stats.returned, 0)
+	waitDuration := atomic.SwapInt64(&stats.waitDuration, 0)
+
+	var rateOpened, rateClosed, rateSucceeded, rateFailed, rateReturned float64
+	if duration.Seconds() > 0 {
+		rateOpened = float64(opened) / duration.Seconds()
+		rateClosed = float64(closed) / duration.Seconds()
+		rateSucceeded = float64(succeeded) / duration.Seconds()
+		rateFailed = float64(failed) / duration.Seconds()
+		rateReturned = float64(returned) / duration.Seconds()
+	}
+
+	attempts := succeeded + failed
+	avgWaitStr := "N/A"
+	if attempts > 0 {
+		avgWaitStr = (time.Duration(waitDuration) / time.Duration(attempts)).Round(time.Microsecond).String()
+	}
+
+	idle := open - inUse
+	if idle < 0 {
+		idle = 0
+	}
+
+	return fmt.Sprintf("%s: Connections: [Opened: %d (%.2f/sec), Closed: %d (%.2f/sec), Open: %d, In-Use: %d, Idle: %d] Checkouts: [Succeeded: %d (%.2f/sec), Failed: %d (%.2f/sec), Returned: %d (%.2f/sec), Avg Wait: %s]",
+		name, opened, rateOpened, closed, rateClosed, open, inUse, idle,
+		succeeded, rateSucceeded, failed, rateFailed, returned, rateReturned, avgWaitStr)
 }
 
 // GetProcessedCount returns the count of processed events of the given type thread-safely and lock-freely
@@ -469,6 +538,29 @@ func (sm *StatsManager) GetProcessedCount(opType string) int {
 	idx := opIndex(opType)
 	if idx >= 0 {
 		return int(atomic.LoadInt64(&sm.opsStats[idx].processed))
+	}
+	return 0
+}
+
+// IncrementEventsRead increments the count of read input events by operation type thread-safely and lock-freely
+func (sm *StatsManager) IncrementEventsRead(opType string, count int64) {
+	if sm == nil {
+		return
+	}
+	idx := opIndex(opType)
+	if idx >= 0 {
+		atomic.AddInt64(&sm.opsStats[idx].read, count)
+	}
+}
+
+// GetReadCount returns the count of read events of the given type thread-safely and lock-freely
+func (sm *StatsManager) GetReadCount(opType string) int {
+	if sm == nil {
+		return 0
+	}
+	idx := opIndex(opType)
+	if idx >= 0 {
+		return int(atomic.LoadInt64(&sm.opsStats[idx].read))
 	}
 	return 0
 }
@@ -507,6 +599,7 @@ func (sm *StatsManager) ReportStats() {
 	unorderedWrites := atomic.SwapInt64(&sm.unorderedBulkWritesSinceLastStats, 0)
 	unorderedWritesSize := atomic.SwapInt64(&sm.unorderedBulkWritesSizeSinceLastStats, 0)
 	timeoutFlushes := atomic.SwapInt64(&sm.timeoutFlushesSinceLastStats, 0)
+	duplicateKeys := atomic.SwapInt64(&sm.duplicateKeysSinceLastStats, 0)
 
 	groupFlushesOpType := atomic.SwapInt64(&sm.groupFlushesOpType, 0)
 	groupFlushesBatchFull := atomic.SwapInt64(&sm.groupFlushesBatchFull, 0)
@@ -522,6 +615,7 @@ func (sm *StatsManager) ReportStats() {
 	for i := 0; i < 5; i++ {
 		swapped[i].received = atomic.SwapInt64(&sm.opsStats[i].received, 0)
 		swapped[i].processed = atomic.SwapInt64(&sm.opsStats[i].processed, 0)
+		swapped[i].read = atomic.SwapInt64(&sm.opsStats[i].read, 0)
 		swapped[i].failed = atomic.SwapInt64(&sm.opsStats[i].failed, 0)
 		swapped[i].dlq = atomic.SwapInt64(&sm.opsStats[i].dlq, 0)
 		swapped[i].totalBulkWriteLatency = atomic.SwapInt64(&sm.opsStats[i].totalBulkWriteLatency, 0)
@@ -558,38 +652,55 @@ func (sm *StatsManager) ReportStats() {
 	sm.mu.Unlock()
 
 	eventsReceived := swapped[opInsert].received + swapped[opUpdate].received + swapped[opDelete].received + swapped[opReplace].received + swapped[opMixed].received
-	eventsProcessed := swapped[opInsert].processed + swapped[opUpdate].processed + swapped[opDelete].processed + swapped[opReplace].processed + swapped[opMixed].processed + updatedThenDeleted
 	eventsFailed := swapped[opInsert].failed + swapped[opUpdate].failed + swapped[opDelete].failed + swapped[opReplace].failed + swapped[opMixed].failed
 
 	insertsReceived := swapped[opInsert].received
 	updatesReceived := swapped[opUpdate].received + swapped[opReplace].received
 	deletesReceived := swapped[opDelete].received
 
-	insertsProcessed := swapped[opInsert].processed
-	updatesProcessed := swapped[opUpdate].processed + swapped[opReplace].processed
-	deletesProcessed := swapped[opDelete].processed
-
 	insertsFailed := swapped[opInsert].failed
 	updatesFailed := swapped[opUpdate].failed + swapped[opReplace].failed
 	deletesFailed := swapped[opDelete].failed
 
-	var rateReceived, rateProcessed, rateFailed, rateUpdatedThenDeleted float64
+	var eventsProcessed, eventsApplied int64
+	var insertsProcessed, updatesProcessed, deletesProcessed int64
+
+	if sm.DryRun {
+		eventsProcessed = swapped[opInsert].read + swapped[opUpdate].read + swapped[opDelete].read + swapped[opReplace].read + swapped[opMixed].read
+		eventsApplied = 0
+
+		insertsProcessed = swapped[opInsert].read
+		updatesProcessed = swapped[opUpdate].read + swapped[opReplace].read
+		deletesProcessed = swapped[opDelete].read
+	} else {
+		eventsProcessed = swapped[opInsert].processed + swapped[opUpdate].processed + swapped[opDelete].processed + swapped[opReplace].processed + swapped[opMixed].processed + updatedThenDeleted
+		eventsApplied = swapped[opInsert].processed + swapped[opUpdate].processed + swapped[opDelete].processed + swapped[opReplace].processed + swapped[opMixed].processed
+
+		insertsProcessed = swapped[opInsert].processed
+		updatesProcessed = swapped[opUpdate].processed + swapped[opReplace].processed
+		deletesProcessed = swapped[opDelete].processed
+	}
+
+	var rateReceived, rateProcessed, rateApplied, rateFailed, rateUpdatedThenDeleted float64
 	var rateInsertsProcessed, rateUpdatesProcessed, rateDeletesProcessed float64
 	var rateInsertsFailed, rateUpdatesFailed, rateDeletesFailed float64
 	var rateSequentialRetries, rateOrderedWrites, rateUnorderedWrites float64
 	var rateTimeoutFlushes, rateGroupFlushesOpType, rateGroupFlushesBatchFull, rateGroupFlushesNamespace, rateGroupFlushesCollision float64
+	var rateDuplicateKeys float64
 
 	var rateInsertsReceived, rateUpdatesReceived, rateDeletesReceived float64
 
 	if duration.Seconds() > 0 {
 		rateReceived = float64(eventsReceived) / duration.Seconds()
 		rateProcessed = float64(eventsProcessed) / duration.Seconds()
+		rateApplied = float64(eventsApplied) / duration.Seconds()
 		rateFailed = float64(eventsFailed) / duration.Seconds()
 		rateUpdatedThenDeleted = float64(updatedThenDeleted) / duration.Seconds()
 		rateSequentialRetries = float64(sequentialRetries) / duration.Seconds()
 		rateOrderedWrites = float64(orderedWrites) / duration.Seconds()
 		rateUnorderedWrites = float64(unorderedWrites) / duration.Seconds()
 		rateTimeoutFlushes = float64(timeoutFlushes) / duration.Seconds()
+		rateDuplicateKeys = float64(duplicateKeys) / duration.Seconds()
 
 		rateGroupFlushesOpType = float64(groupFlushesOpType) / duration.Seconds()
 		rateGroupFlushesBatchFull = float64(groupFlushesBatchFull) / duration.Seconds()
@@ -703,40 +814,13 @@ func (sm *StatsManager) ReportStats() {
 		dlqStatsStr += " 0"
 	}
 
-	// Extract and clear connection pool stats
-	poolConnectionsOpened := atomic.SwapInt64(&sm.poolConnectionsOpened, 0)
-	poolConnectionsClosed := atomic.SwapInt64(&sm.poolConnectionsClosed, 0)
-	poolConnectionsOpen := atomic.LoadInt64(&sm.poolConnectionsOpen)
-	poolCheckoutInUse := atomic.LoadInt64(&sm.poolCheckoutInUse)
-	poolCheckoutSucceeded := atomic.SwapInt64(&sm.poolCheckoutSucceeded, 0)
-	poolCheckoutFailed := atomic.SwapInt64(&sm.poolCheckoutFailed, 0)
-	poolCheckoutReturned := atomic.SwapInt64(&sm.poolCheckoutReturned, 0)
-	poolCheckoutWaitDuration := atomic.SwapInt64(&sm.poolCheckoutWaitDuration, 0)
+	// Extract and format connection pool stats for source and target
+	sourcePoolStr := sm.formatPoolStats(&sm.sourcePool, "Source", duration)
+	targetPoolStr := sm.formatPoolStats(&sm.targetPool, "Target", duration)
 
-	var ratePoolConnectionsOpened, ratePoolConnectionsClosed, ratePoolCheckoutSucceeded, ratePoolCheckoutFailed, ratePoolCheckoutReturned float64
-	if duration.Seconds() > 0 {
-		ratePoolConnectionsOpened = float64(poolConnectionsOpened) / duration.Seconds()
-		ratePoolConnectionsClosed = float64(poolConnectionsClosed) / duration.Seconds()
-		ratePoolCheckoutSucceeded = float64(poolCheckoutSucceeded) / duration.Seconds()
-		ratePoolCheckoutFailed = float64(poolCheckoutFailed) / duration.Seconds()
-		ratePoolCheckoutReturned = float64(poolCheckoutReturned) / duration.Seconds()
-	}
-
-	// Average wait time across all checkout attempts (succeeded + failed) in this period
-	totalAttempts := poolCheckoutSucceeded + poolCheckoutFailed
-	avgWaitStr := "N/A"
-	if totalAttempts > 0 {
-		avgWaitStr = (time.Duration(poolCheckoutWaitDuration) / time.Duration(totalAttempts)).Round(time.Microsecond).String()
-	}
-
-	// Open: total open TCP sockets managed by the pool (Created - Closed)
-	// In-Use: connections currently busy executing database queries/writes at this moment
-	// Idle: pre-warmed sockets sitting unused and ready to be checked out instantly (Open - In-Use)
 	poolStatsStr := fmt.Sprintf("  - Connection Pool:\n"+
-		"      * Connections: [Opened: %d (%.2f/sec), Closed: %d (%.2f/sec), Open: %d, In-Use: %d, Idle: %d]\n"+
-		"      * Checkouts:   [Succeeded: %d (%.2f/sec), Failed: %d (%.2f/sec), Returned: %d (%.2f/sec), Avg Wait: %s]",
-		poolConnectionsOpened, ratePoolConnectionsOpened, poolConnectionsClosed, ratePoolConnectionsClosed, poolConnectionsOpen, poolCheckoutInUse, poolConnectionsOpen-poolCheckoutInUse,
-		poolCheckoutSucceeded, ratePoolCheckoutSucceeded, poolCheckoutFailed, ratePoolCheckoutFailed, poolCheckoutReturned, ratePoolCheckoutReturned, avgWaitStr)
+		"      * %s\n"+
+		"      * %s", sourcePoolStr, targetPoolStr)
 
 	// Format Failure Breakdown
 	failureBreakdownStr := "  - Failure Details (Error/Op):"
@@ -754,13 +838,26 @@ func (sm *StatsManager) ReportStats() {
 		failureBreakdownStr += " 0"
 	}
 
-	msg := fmt.Sprintf("Change stream statistics (last %v):\n"+
+	headerStr := "Change stream statistics"
+	if sm.DryRun {
+		headerStr += " in dry-run live-only mode"
+	} else if sm.DontApply {
+		headerStr += " in dont-apply live-only mode"
+	}
+
+	processedLabel := "Processed"
+	if sm.DryRun {
+		processedLabel = "Read"
+	}
+
+	msg := fmt.Sprintf(headerStr+" (last %v):\n"+
 		"  - Received:  %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec)]\n"+
-		"  - Processed: %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]\n"+
+		"  - "+processedLabel+": %d (%.2f events/sec) (applied: %d (%.2f/sec)) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]\n"+
 		"  - Failed:    %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec)]\n"+
 		"  - Ordered BulkWrites: %d (%.2f/sec)%s\n"+
 		"  - Unordered BulkWrites: %d (%.2f/sec)%s\n"+
 		"  - Sequential Retries: %d (%.2f/sec)%s\n"+
+		"  - Duplicate Key Errors: %d (%.2f/sec)\n"+
 		"  - Group Flushes: [optype: %d (%.2f/sec), namespace: %d (%.2f/sec), batchfull: %d (%.2f/sec), id collision: %d (%.2f/sec), timeout: %d (%.2f/sec)]\n"+
 		"  - BulkWrite Execution Latency: %s\n"+
 		"  - Worker QPS: [Active: %d] [p50: %.2f, p70: %.2f, p90: %.2f, p100: %.2f]\n"+
@@ -773,9 +870,9 @@ func (sm *StatsManager) ReportStats() {
 		"%s",
 		duration.Round(time.Second),
 		eventsReceived, rateReceived, insertsReceived, rateInsertsReceived, deletesReceived, rateDeletesReceived, updatesReceived, rateUpdatesReceived,
-		eventsProcessed, rateProcessed, insertsProcessed, rateInsertsProcessed, deletesProcessed, rateDeletesProcessed, updatesProcessed, rateUpdatesProcessed, updatedThenDeleted, rateUpdatedThenDeleted,
+		eventsProcessed, rateProcessed, eventsApplied, rateApplied, insertsProcessed, rateInsertsProcessed, deletesProcessed, rateDeletesProcessed, updatesProcessed, rateUpdatesProcessed, updatedThenDeleted, rateUpdatedThenDeleted,
 		eventsFailed, rateFailed, insertsFailed, rateInsertsFailed, deletesFailed, rateDeletesFailed, updatesFailed, rateUpdatesFailed,
-		orderedWrites, rateOrderedWrites, avgOrderedSizeStr, unorderedWrites, rateUnorderedWrites, avgUnorderedSizeStr, sequentialRetries, rateSequentialRetries, sequentialRetriesBreakdown, groupFlushesOpType, rateGroupFlushesOpType, groupFlushesNamespace, rateGroupFlushesNamespace, groupFlushesBatchFull, rateGroupFlushesBatchFull, groupFlushesCollision, rateGroupFlushesCollision, timeoutFlushes, rateTimeoutFlushes,
+		orderedWrites, rateOrderedWrites, avgOrderedSizeStr, unorderedWrites, rateUnorderedWrites, avgUnorderedSizeStr, sequentialRetries, rateSequentialRetries, sequentialRetriesBreakdown, duplicateKeys, rateDuplicateKeys, groupFlushesOpType, rateGroupFlushesOpType, groupFlushesNamespace, rateGroupFlushesNamespace, groupFlushesBatchFull, rateGroupFlushesBatchFull, groupFlushesCollision, rateGroupFlushesCollision, timeoutFlushes, rateTimeoutFlushes,
 		dbLatencyMsg,
 		activeWorkers,
 		wQpsP50, wQpsP70, wQpsP90, wQpsP100,

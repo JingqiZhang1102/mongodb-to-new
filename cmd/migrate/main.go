@@ -25,6 +25,8 @@ func main() {
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	logFile := flag.String("log-file", "", "Path to log file (logs to both stdout and file when specified)")
 	cdcStartTimeStr := flag.String("cdc-start-timestamp", "", "Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)")
+	dontApply := flag.Bool("dont-apply", false, "Don't apply mode (live-only migrations only, drops all target writes)")
+	dryRun := flag.Bool("dry-run", false, "Dry run mode (live-only migrations only, drops all events in reader)")
 	help := flag.Bool("help", false, "Display help information")
 	flag.Parse()
 
@@ -57,7 +59,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
-
 	// Display and log the loaded configuration with sensitive values masked
 	log.Infof("Active Configuration:\n%s", getSanitizedConfigJSON(cfg))
 
@@ -66,6 +67,18 @@ func main() {
 	// Validate mode
 	if *mode != "migrate" && *mode != "live" && *mode != "live-only" {
 		log.Fatalf("Invalid mode: %s. Please choose either 'migrate', 'live', or 'live-only'", *mode)
+	}
+
+	// Validate dry-run and read-only options
+	// Validate dont-apply and read-only options
+	if *dontApply && *mode != "live-only" {
+		log.Fatal("Error: -dont-apply can only be specified when -mode is 'live-only'")
+	}
+	if *dryRun && *mode != "live-only" {
+		log.Fatal("Error: -dry-run can only be specified when -mode is 'live-only'")
+	}
+	if *dontApply && *dryRun {
+		log.Fatal("Error: -dont-apply and -dry-run are mutually exclusive")
 	}
 
 	// Parse and validate cdc-start-timestamp option.
@@ -106,6 +119,8 @@ func main() {
 	// Create migrator
 	migrator := migration.NewMigrator(cfg, log)
 	migrator.CdcStartTime = cdcStartTime
+	migrator.DontApply = *dontApply
+	migrator.DryRun = *dryRun
 
 	// Start migration/replication
 	startTime := time.Now()
@@ -160,13 +175,20 @@ func displayUsage() {
 	fmt.Println("        Debian command-line examples to get 'now':")
 	fmt.Printf("          * Unix epoch seconds:             date +%%s\n")
 	fmt.Println("          * RFC3339 format:                 date --rfc-3339=seconds   (or: date -Iseconds)")
+	fmt.Println("  -dont-apply")
+	fmt.Println("        Don't apply mode (live-only migrations only, drops all target writes)")
+	fmt.Println("  -dry-run")
+	fmt.Println("        Dry run mode (live-only migrations only, drops all events in reader)")
 	fmt.Println("  -help")
 	fmt.Println("        Display this help information")
 	fmt.Println("Examples:")
 	fmt.Println("  migrate -mode=live")
 	fmt.Println("  migrate -mode=live-only")
+	fmt.Println("  migrate -mode=live-only -dont-apply")
+	fmt.Println("  migrate -mode=live-only -dry-run")
 	fmt.Println("  migrate -mode=live-only -cdc-start-timestamp=1716234000")
-	fmt.Println("  migrate -mode=live-only -cdc-start-timestamp=2026-05-20T21:00:00Z")
+	fmt.Println("  migrate -mode=live-only -cdc-start-timestamp=2026-05-20T21:00:00Z -dont-apply")
+	fmt.Println("  migrate -mode=live-only -cdc-start-timestamp=2026-05-20T21:00:00Z -dry-run")
 	fmt.Println("  migrate -config=custom_config.json -mode=migrate -log-level=debug")
 	fmt.Println("  migrate -mode=live -log-file=migration.log")
 }
