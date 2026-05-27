@@ -21,26 +21,28 @@ import (
 
 // OplogReplicatorLegacy handles replication using oplog tailing via GTM legacy library with mgo
 type OplogReplicatorLegacy struct {
-	sourceDB      *db.MongoDBLegacy
-	targetDB      *db.MongoDB
-	config        *config.Config
-	log           *logger.Logger
-	collectionMap map[string]map[string]string // Map of database -> source collection -> target collection
-	mu            sync.Mutex                   // Mutex for thread-safe operations
-	dlq           DLQ                          // Dead Letter Queue for failed documents
-	retryManager  *RetryManager                // Retry manager for transient errors
-	DontApply     bool                         // Don't apply flag
-	DryRun        bool                         // Dry run flag
+	sourceDB          *db.MongoDBLegacy
+	targetDB          *db.MongoDB
+	config            *config.Config
+	log               *logger.Logger
+	collectionMap     map[string]map[string]string // Map of database -> source collection -> target collection
+	collectionConfigs map[string]map[string]config.CollectionConfig // Map of database -> source collection -> full config
+	mu                sync.Mutex                   // Mutex for thread-safe operations
+	dlq               DLQ                          // Dead Letter Queue for failed documents
+	retryManager      *RetryManager                // Retry manager for transient errors
+	DontApply         bool                         // Don't apply flag
+	DryRun            bool                         // Dry run flag
 }
 
 // NewOplogReplicatorLegacy creates a new oplog-based replicator using GTM legacy
 func NewOplogReplicatorLegacy(sourceDB *db.MongoDBLegacy, targetDB *db.MongoDB, cfg *config.Config, log *logger.Logger) *OplogReplicatorLegacy {
 	return &OplogReplicatorLegacy{
-		sourceDB:      sourceDB,
-		targetDB:      targetDB,
-		config:        cfg,
-		log:           log,
-		collectionMap: make(map[string]map[string]string),
+		sourceDB:          sourceDB,
+		targetDB:          targetDB,
+		config:            cfg,
+		log:               log,
+		collectionMap:     make(map[string]map[string]string),
+		collectionConfigs: make(map[string]map[string]config.CollectionConfig),
 	}
 }
 
@@ -50,16 +52,24 @@ func (r *OplogReplicatorLegacy) SetDLQ(dlq DLQ) {
 }
 
 // AddCollection adds a collection to be watched
-func (r *OplogReplicatorLegacy) AddCollection(sourceDB, targetDB, sourceCollection, targetCollection string) {
+func (r *OplogReplicatorLegacy) AddCollection(sourceDB, targetDB string, collConfig config.CollectionConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if r.collectionMap[sourceDB] == nil {
 		r.collectionMap[sourceDB] = make(map[string]string)
 	}
+	if r.collectionConfigs == nil {
+		r.collectionConfigs = make(map[string]map[string]config.CollectionConfig)
+	}
+	if r.collectionConfigs[sourceDB] == nil {
+		r.collectionConfigs[sourceDB] = make(map[string]config.CollectionConfig)
+	}
 
-	r.collectionMap[sourceDB][sourceCollection] = targetCollection
-	r.log.Infof("Added collection mapping: %s.%s -> %s.%s", sourceDB, sourceCollection, targetDB, targetCollection)
+	r.collectionMap[sourceDB][collConfig.SourceCollection] = collConfig.TargetCollection
+	r.collectionConfigs[sourceDB][collConfig.SourceCollection] = collConfig
+	r.log.Infof("Added collection mapping: %s.%s -> %s.%s (UpsertMode: %t)", 
+		sourceDB, collConfig.SourceCollection, targetDB, collConfig.TargetCollection, collConfig.UpsertMode)
 }
 
 // getCurrentOplogTimestamp gets the current oplog timestamp from the oplog collection
@@ -305,21 +315,23 @@ func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pai
 	// Pre-compute total collection count before launching goroutines
 	// so the progress log always shows the correct total
 	totalCollections := 0
-	for _, colls := range r.collectionMap {
+	for _, colls := range r.collectionConfigs {
 		totalCollections += len(colls)
 	}
 
-	for sourceDB, collections := range r.collectionMap {
-		for sourceCollection, targetCollection := range collections {
+	for sourceDB, collections := range r.collectionConfigs {
+		for sourceCollection, collConfig := range collections {
 			wg.Add(1)
 
 			semaphore <- struct{}{}
 
-			go func(sourceDB, sourceCollection, targetCollection string) {
+			go func(sourceDB, sourceCollection string, collConfig config.CollectionConfig) {
 				defer wg.Done()
 				defer func() { <-semaphore }()
 
-				r.log.Infof("Starting initial migration for %s.%s to %s", sourceDB, sourceCollection, targetCollection)
+				targetCollection := collConfig.TargetCollection
+				r.log.Infof("Starting initial migration for %s.%s to %s (UpsertMode: %t)", 
+					sourceDB, sourceCollection, targetCollection, collConfig.UpsertMode)
 
 				// Get source collection using mgo
 				sourceCol := r.sourceDB.GetCollection(sourceCollection)
@@ -351,7 +363,7 @@ func (r *OplogReplicatorLegacy) performInitialMigration(ctx context.Context, pai
 				completedCollections++
 				r.log.Infof("Overall progress: %d/%d collections completed", completedCollections, totalCollections)
 				mu.Unlock()
-			}(sourceDB, sourceCollection, targetCollection)
+			}(sourceDB, sourceCollection, collConfig)
 		}
 	}
 
@@ -519,6 +531,74 @@ func (r *OplogReplicatorLegacy) insertBatchWithRetry(ctx context.Context, target
 	batch = transformedBatch
 
 	var successCount int64
+
+	collConfig, exists := r.collectionConfigs[sourceDB][sourceCollection]
+	useUpsert := exists && collConfig.UpsertMode
+
+	if useUpsert {
+		var models []mongod.WriteModel
+		for _, doc := range batch {
+			docID := extractDocID(doc)
+			if docID != nil {
+				filter := modernbson.M{"_id": docID}
+				model := mongod.NewReplaceOneModel().
+					SetFilter(filter).
+					SetReplacement(doc).
+					SetUpsert(true)
+				models = append(models, model)
+			}
+		}
+
+		if len(models) > 0 {
+			if _, err := targetCol.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false)); err != nil {
+				bulkWriteException, ok := err.(mongod.BulkWriteException)
+				if ok {
+					successCount = int64(len(batch) - len(bulkWriteException.WriteErrors))
+					r.log.Errorf("Bulk upsert partially failed for %s.%s: %d succeeded, %d failed",
+						sourceDB, sourceCollection, successCount, len(bulkWriteException.WriteErrors))
+
+					for _, writeErr := range bulkWriteException.WriteErrors {
+						var errDocID interface{}
+						if writeErr.Index < len(batch) {
+							errDocID = extractDocID(batch[writeErr.Index])
+						}
+						r.log.Errorf("[%s.%s] Upsert error at index %d, _id=%v: %v", sourceDB, sourceCollection, writeErr.Index, errDocID, writeErr.Message)
+						if r.dlq != nil && writeErr.Index < len(batch) {
+							r.dlq.WriteFailed(sourceDB, sourceCollection, errDocID, fmt.Errorf("upsert failed: %s", writeErr.Message), "initial", "insert", batch[writeErr.Index])
+						}
+					}
+				} else {
+					// Global failure
+					if err == context.Canceled {
+						r.log.Debugf("Bulk upsert canceled for %s.%s due to context cancellation", sourceDB, sourceCollection)
+					} else {
+						r.log.Errorf("Error performing bulk upsert for %s.%s: %v", sourceDB, sourceCollection, err)
+					}
+					// Fall back to individual upserts
+					for _, doc := range batch {
+						docID := extractDocID(doc)
+						if docID != nil {
+							filter := modernbson.M{"_id": docID}
+							if _, err := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); err != nil {
+								if err != context.Canceled {
+									r.log.Errorf("Error fallback upserting document %v in %s.%s: %v", docID, sourceDB, sourceCollection, err)
+									if r.dlq != nil {
+										r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
+									}
+								}
+							} else {
+								successCount++
+							}
+						}
+					}
+				}
+			} else {
+				successCount = int64(len(batch))
+				r.log.Debugf("Bulk upserted %d documents successfully in %s.%s", len(batch), sourceDB, sourceCollection)
+			}
+		}
+		return successCount
+	}
 
 	if _, err := targetCol.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false)); err != nil {
 		bulkWriteException, ok := err.(mongod.BulkWriteException)
@@ -705,7 +785,7 @@ func (r *OplogReplicatorLegacy) tailOplog(ctx context.Context, afterTimestamp bs
 	r.log.Infof("Starting parallel oplog processing with %d workers", r.config.IncrementalWorkerCount)
 	workers := make([]*Worker, r.config.IncrementalWorkerCount)
 	for i := 0; i < r.config.IncrementalWorkerCount; i++ {
-		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionMap, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager, nil, r.config.GroupOpsByDistinctId, time.Duration(r.config.FlushIntervalMs)*time.Millisecond, r.config.IncrementalIncomingQueueSize, r.config.IncrementalProcessingQueueSize, r.DontApply)
+		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionConfigs, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager, nil, r.config.GroupOpsByDistinctId, time.Duration(r.config.FlushIntervalMs)*time.Millisecond, r.config.IncrementalIncomingQueueSize, r.config.IncrementalProcessingQueueSize, r.DontApply)
 	}
 
 	// Set up context cancellation handling for workers
@@ -719,33 +799,7 @@ func (r *OplogReplicatorLegacy) tailOplog(ctx context.Context, afterTimestamp bs
 
 	// Set up periodic flushing (matching EventDistributor pattern)
 	flushInterval := time.Duration(r.config.FlushIntervalMs) * time.Millisecond
-	flushTicker := time.NewTicker(flushInterval)
-	defer flushTicker.Stop()
-
-	go func() {
-		for {
-			select {
-			case <-flushTicker.C:
-				// Check all workers for groups that need flushing
-				for _, worker := range workers {
-					worker.mu.Lock()
-					if worker.currentGroup != nil && len(worker.currentGroup.Operations) > 0 {
-						// If the group has been waiting for more than the flush interval
-						if time.Since(worker.currentGroup.CreatedAt) >= flushInterval {
-							r.log.Debugf("Flushing group in worker %d due to timeout: %s.%s with %d operations",
-								worker.id, worker.currentGroup.Namespace, worker.currentGroup.OpType,
-								len(worker.currentGroup.Operations))
-
-							worker.flushCurrentGroup()
-						}
-					}
-					worker.mu.Unlock()
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+	StartPeriodicFlushLoop(ctx, workers, flushInterval, r.log)
 
 	// Statistics tracking
 	var processedCount int
