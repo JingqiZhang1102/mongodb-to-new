@@ -111,6 +111,29 @@ Here's a basic example:
 
 When no collections are specified, the tool will automatically detect all collections in the source database and migrate them to the target database with the same collection names.
 
+### Global Database-Level Upsert
+
+If you want to enable upsert mode globally for all collections (both explicitly mapped and auto-detected collections), you can specify `"upsertMode": true` at the target database level:
+
+```json
+{
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://localhost:27017/?replicaSet=rs0",
+        "database": "source_db"
+      },
+      "target": {
+        "connectionString": "mongodb://localhost:27017",
+        "database": "target_db",
+        "upsertMode": true
+      }
+    }
+  ],
+  "saveThreshold": 1000
+}
+```
+
 ### Specific Collections Migration
 
 If you want to migrate only specific collections or rename collections during migration, you can specify them explicitly:
@@ -146,10 +169,11 @@ If you want to migrate only specific collections or rename collections during mi
 - **databasePairs**: An array of objects, each defining a source MongoDB database and a target MongoDB database to replicate.
 - **connectionString**: The MongoDB connection string for source and target databases.
 - **database**: The name of the MongoDB database for source and target.
+- **upsertMode**: (Optional, target-level) Whether to use upsert operations globally by default for all collections in this target database instead of standard inserts. Default is false.
 - **collections**: (Optional) An array of objects, each defining a source MongoDB collection and a target MongoDB collection to replicate. If omitted, all collections will be migrated with the same names.
   - **sourceCollection**: The name of the collection in the source database.
   - **targetCollection**: The name of the collection in the target database.
-  - **upsertMode**: (Optional) Whether to use upsert operations instead of inserts. Default is false.
+  - **upsertMode**: (Optional) Whether to use upsert operations instead of inserts for this specific collection (overrides/complements the database-level default). Default is false.
 
 #### Checkpoint Configuration
 - **saveThreshold**: The number of changes to process before saving the resume token (for live replication).

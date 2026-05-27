@@ -77,6 +77,7 @@ type TargetConfig struct {
 	Collections      []CollectionConfig `json:"collections,omitempty"`
 	SyncAllIndexes   bool               `json:"syncAllIndexes,omitempty"` // Sync all indexes (excluding _id_) from source
 	IndexOnly        bool               `json:"indexOnly,omitempty"`      // Only sync indexes, skip data migration
+	UpsertMode       bool               `json:"upsertMode,omitempty"`     // Use upsert by default for all collections in this database target
 	Indexes          []IndexSyncConfig  `json:"indexes,omitempty"`
 }
 

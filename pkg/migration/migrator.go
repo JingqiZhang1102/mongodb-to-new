@@ -213,6 +213,13 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 		return fmt.Errorf("failed to determine collections to process: %w", err)
 	}
 
+	// Apply database target-level default UpsertMode if active
+	if pair.Target.UpsertMode {
+		for i := range collections {
+			collections[i].UpsertMode = true
+		}
+	}
+
 	// Sync indexes before data migration (if configured)
 	// For live mode, each replicator handles index sync during its own initial migration
 	if mode == "migrate" && (pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0) {
@@ -317,7 +324,7 @@ func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, t
 	// Add all collections to the replicator
 	for _, collConfig := range collections {
 		// Add collection to replicator
-		replicator.AddCollection(sourceDBName, targetDBName, collConfig.SourceCollection, collConfig.TargetCollection)
+		replicator.AddCollection(sourceDBName, targetDBName, collConfig)
 	}
 
 	// Load global resume token if it exists (per-pair path)
@@ -366,7 +373,7 @@ func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB
 
 	// Add all collections to the replicator
 	for _, collConfig := range collections {
-		replicator.AddCollection(sourceDBName, targetDBName, collConfig.SourceCollection, collConfig.TargetCollection)
+		replicator.AddCollection(sourceDBName, targetDBName, collConfig)
 	}
 
 	// Load oplog timestamp if it exists (per-pair path)
@@ -440,7 +447,7 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 
 	// Add all collections to the replicator
 	for _, collConfig := range collections {
-		replicator.AddCollection(sourceDBName, targetDBName, collConfig.SourceCollection, collConfig.TargetCollection)
+		replicator.AddCollection(sourceDBName, targetDBName, collConfig)
 	}
 
 	// Load oplog timestamp if it exists (per-pair path)
