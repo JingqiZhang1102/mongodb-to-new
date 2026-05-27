@@ -1366,8 +1366,48 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 				}
 			} else {
 				// Handle non-bulk write errors (e.g. network partition or context timeout)
-				batchFailed = int64(len(batch))
-				return 0, batchFailed, err
+				bulkRetrySucceeded := false
+				if retryManager != nil && err != context.Canceled {
+					errType := retryManager.ClassifyError(err)
+					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
+						m.log.Infof("Transient error detected for %s.%s. Retrying bulk insert with backoff...", sourceDB, sourceCollection)
+						retryErr := retryManager.RetryWithBackoff(ctx, func() error {
+							_, retryInsertErr := targetCol.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false))
+							return retryInsertErr
+						})
+						if retryErr == nil {
+							m.log.Infof("Bulk insert for %s.%s succeeded after retry", sourceDB, sourceCollection)
+							bulkRetrySucceeded = true
+						} else {
+							m.log.Warnf("Bulk insert for %s.%s still failed after retries: %v. Falling back to individual operations.", sourceDB, sourceCollection, retryErr)
+						}
+					}
+				}
+
+				if !bulkRetrySucceeded {
+					// Fall back to individual operations with upsert for all documents
+					for _, doc := range batch {
+						if _, err := targetCol.InsertOne(ctx, doc); err != nil {
+							docID := extractDocID(doc)
+							if docID != nil {
+								filter := bson.M{"_id": docID}
+								if _, err := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); err != nil {
+									if err == context.Canceled {
+										m.log.Debugf("Upserting document %v in %s.%s canceled due to context cancellation", docID, sourceDB, sourceCollection)
+									} else {
+										m.log.Errorf("Error upserting document %v in %s.%s: %v", docID, sourceDB, sourceCollection, err)
+										batchFailed++
+										if opts.DLQ != nil {
+											opts.DLQ.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
+										}
+									}
+								}
+							} else {
+								batchFailed++
+							}
+						}
+					}
+				}
 			}
 		}
 
