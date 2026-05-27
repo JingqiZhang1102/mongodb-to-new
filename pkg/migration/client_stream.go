@@ -13,7 +13,6 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // ClientLevelReplicator handles replication using a client-level change stream
@@ -201,7 +200,6 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		}
 
 		// Use a semaphore to limit the number of concurrent collection migrations
-		// Use ConcurrentCollections for collection-level concurrency (separate from per-collection worker count)
 		concurrentCollections := r.config.ConcurrentCollections
 		if concurrentCollections <= 0 {
 			concurrentCollections = 4
@@ -216,8 +214,10 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		var completedCollections int64
 		var mu sync.Mutex // Mutex for thread-safe updates to statistics
 
-		// Pre-compute total collection count before launching goroutines
-		// so the progress log always shows the correct total
+		// Track critical errors
+		var criticalErr error
+		var errOnce sync.Once
+
 		totalCollections := 0
 		for _, colls := range r.collectionMap {
 			totalCollections += len(colls)
@@ -227,388 +227,36 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		for sourceDB, collections := range r.collectionMap {
 			for sourceCollection, targetCollection := range collections {
 				wg.Add(1)
-
-				// Acquire semaphore
 				semaphore <- struct{}{}
 
-				// Start migration in a goroutine
 				go func(sourceDB, sourceCollection, targetCollection string) {
 					defer wg.Done()
-					defer func() { <-semaphore }() // Release semaphore when done
+					defer func() { <-semaphore }()
 
 					r.log.Infof("Starting initial migration for %s.%s to %s", sourceDB, sourceCollection, targetCollection)
 
-					// Get source and target collections
-					sourceDBCollection := r.sourceDB.GetCollection(sourceCollection)
-					targetDBCollection := r.targetDB.GetCollection(targetCollection)
+					collConfig := config.CollectionConfig{
+						SourceCollection: sourceCollection,
+						TargetCollection: targetCollection,
+					}
 
-					// Count documents
-					count, err := sourceDBCollection.EstimatedDocumentCount(ctx)
+					opts := MigrateOptions{
+						DLQ:          r.dlq,
+						StatsManager: r.statsManager,
+						UpsertMode:   true, // resilient mode always performs upserts on duplicates
+					}
+
+					succeeded, failed, err := migrator.migrateCollection(ctx, r.sourceDB, r.targetDB, collConfig, opts)
 					if err != nil {
-						r.log.Errorf("Error counting documents in %s.%s: %v", sourceDB, sourceCollection, err)
-						return
-					}
-
-					r.log.Infof("Found %d documents to migrate in %s.%s", count, sourceDB, sourceCollection)
-
-					// Skip if no documents
-					if count == 0 {
-						r.log.Infof("No documents to migrate for %s.%s", sourceDB, sourceCollection)
-						return
-					}
-
-					// Set up batch processing using configuration parameters
-					readBatchSize := r.config.InitialReadBatchSize
-					writeBatchSize := r.config.InitialWriteBatchSize
-
-					r.log.Infof("Using read batch size: %d, write batch size: %d for %s.%s",
-						readBatchSize, writeBatchSize, sourceDB, sourceCollection)
-
-					var successCount int64
-					var failedCount int64
-					var migratedCount int64
-					var lastLoggedPercentage int = -1 // Start at -1 to ensure 0% is logged
-					var workerMu sync.Mutex           // Mutex for thread-safe updates to successCount, failedCount, migratedCount, and lastLoggedPercentage
-
-					if r.config.ParallelReadsEnabled && count >= int64(r.config.MinDocsForParallelReads) {
-						r.log.Infof("Using parallel reads for large collection in live mode: %s.%s (%d documents)", sourceDB, sourceCollection, count)
-
-						// 1. Create partitioner
-						partitioner := NewCollectionPartitioner(
-							sourceDBCollection,
-							r.log,
-							r.config.MaxReadPartitions,
-							r.config.MinDocsPerPartition,
-							r.config.SampleSize,
-						)
-
-						// 2. Create partitions
-						partitions, err := partitioner.Partition(ctx)
-						if err != nil {
-							r.log.Errorf("Failed to create partitions for %s.%s: %v", sourceDB, sourceCollection, err)
-							return
-						}
-
-						r.log.Infof("Created %d partitions for collection %s.%s", len(partitions), sourceDB, sourceCollection)
-
-						// 3. Process partitions in parallel
-						var partitionWg sync.WaitGroup
-						partitionErrorChan := make(chan error, len(partitions))
-						partitionDoneChan := make(chan struct{})
-
-						// Start a goroutine to close partitionDoneChan when all partition goroutines are done
-						go func() {
-							partitionWg.Wait()
-							close(partitionDoneChan)
-						}()
-
-						for i, partition := range partitions {
-							partitionWg.Add(1)
-							go func(partitionIndex int, filter bson.D) {
-								defer partitionWg.Done()
-
-								r.log.Debugf("Starting partition %d with filter: %v", partitionIndex, filter)
-
-								cursor, err := sourceDBCollection.Find(ctx, filter, options.Find().SetBatchSize(int32(readBatchSize)))
-								if err != nil {
-									select {
-									case partitionErrorChan <- fmt.Errorf("failed to create cursor for partition %d: %w", partitionIndex, err):
-									default:
-									}
-									return
-								}
-								defer cursor.Close(ctx)
-
-								// Local worker pool for this partition
-								var workerWg sync.WaitGroup
-								batchChan := make(chan []interface{}, r.config.InitialChannelBufferSize)
-								workerDoneChan := make(chan struct{})
-
-								workerCount := r.config.WorkersPerPartition
-								if workerCount < 1 {
-									workerCount = 1
-								}
-
-								for w := 0; w < workerCount; w++ {
-									workerWg.Add(1)
-									go func(workerID int) {
-										defer workerWg.Done()
-										for batch := range batchChan {
-											succeeded, failed, err := r.writeBatchWithDLQ(ctx, targetDBCollection, batch, sourceDB, sourceCollection)
-											if err != nil {
-												select {
-												case partitionErrorChan <- fmt.Errorf("partition %d worker %d failed: %w", partitionIndex, workerID, err):
-												default:
-												}
-											}
-
-											// Update shared metrics
-											workerMu.Lock()
-											successCount += succeeded
-											failedCount += failed
-											migratedCount += int64(len(batch))
-											currentCount := migratedCount
-											currentSuccess := successCount
-											currentFailed := failedCount
-
-											// Calculate current percentage
-											currentPercentage := int(float64(currentCount) / float64(count) * 10)
-											if currentPercentage > lastLoggedPercentage {
-												r.log.Infof("Collection %s.%s progress: %d/%d documents (%.0f%%) - Successful: %d, Failed: %d",
-													sourceDB, sourceCollection, currentCount, count, float64(currentPercentage)*10, currentSuccess, currentFailed)
-												lastLoggedPercentage = currentPercentage
-											}
-											workerMu.Unlock()
-										}
-									}(w)
-								}
-
-								go func() {
-									workerWg.Wait()
-									close(workerDoneChan)
-								}()
-
-								// Read partition and feed batch channel
-								var batch []interface{}
-								for {
-									// Check for critical errors from other partitions
-									select {
-									case <-partitionErrorChan:
-										return
-									default:
-									}
-
-									if !cursor.Next(ctx) {
-										break
-									}
-
-									var doc bson.D
-									if err := cursor.Decode(&doc); err != nil {
-										select {
-										case partitionErrorChan <- fmt.Errorf("partition %d failed to decode doc: %w", partitionIndex, err):
-										default:
-										}
-										return
-									}
-
-									batch = append(batch, doc)
-									if len(batch) >= writeBatchSize {
-										select {
-										case batchChan <- batch:
-										case <-ctx.Done():
-											return
-										}
-										batch = nil
-										time.Sleep(5 * time.Millisecond) // small delay
-									}
-								}
-
-								if len(batch) > 0 {
-									select {
-									case batchChan <- batch:
-									case <-ctx.Done():
-										return
-									}
-								}
-
-								close(batchChan)
-								<-workerDoneChan
-							}(i, partition)
-						}
-
-						// Wait for all partitions to finish or for a critical error
-						select {
-						case <-partitionDoneChan:
-							// All partitions succeeded
-						case err := <-partitionErrorChan:
-							r.log.Errorf("Error during parallel migration of %s.%s: %v", sourceDB, sourceCollection, err)
-							// Note: we continue with other collections even if this one fails, 
-							// but we increment failedCount so it gets caught in overall progress status
-							workerMu.Lock()
-							failedCount += count - successCount // mark rest as failed
-							workerMu.Unlock()
-							return
-						case <-ctx.Done():
-							r.log.Info("Parallel migration interrupted due to context cancellation")
-							return
-						}
-
-					} else {
-						cursor, err := sourceDBCollection.Find(ctx, bson.D{}, options.Find().SetBatchSize(int32(readBatchSize)))
-						if err != nil {
-							r.log.Errorf("Error creating cursor for %s.%s: %v", sourceDB, sourceCollection, err)
-							return
-						}
-						defer cursor.Close(ctx)
-
-						// Set up parallel batch processing
-						var workerWg sync.WaitGroup
-						channelBufferSize := r.config.InitialChannelBufferSize
-						batchChan := make(chan []interface{}, channelBufferSize) // Buffer for batches
-						errorChan := make(chan error, 1)                         // Channel for errors
-						doneChan := make(chan struct{})                          // Channel to signal completion
-
-						// Start worker pool for parallel batch processing
-						workerCount := r.config.InitialMigrationWorkers
-						r.log.Infof("Starting %d workers for parallel document batch processing for %s.%s",
-							workerCount, sourceDB, sourceCollection)
-
-						for i := 0; i < workerCount; i++ {
-							workerWg.Add(1)
-							go func(workerID int) {
-								defer workerWg.Done()
-
-								for batch := range batchChan {
-									succeeded, failed, err := r.writeBatchWithDLQ(ctx, targetDBCollection, batch, sourceDB, sourceCollection)
-									if err != nil {
-										select {
-										case errorChan <- fmt.Errorf("worker %d failed to process batch: %w", workerID, err):
-										default:
-											r.log.Errorf("Worker %d: Error processing batch: %v", workerID, err)
-										}
-									}
-
-									// Update metrics
-									workerMu.Lock()
-									successCount += succeeded
-									failedCount += failed
-									migratedCount += int64(len(batch))
-									currentCount := migratedCount
-									currentSuccess := successCount
-									currentFailed := failedCount
-
-									// Calculate current percentage (0-10 for 0%-100%)
-									currentPercentage := int(float64(currentCount) / float64(count) * 10)
-
-									// Only log when crossing a 10% threshold at the collection level
-									if currentPercentage > lastLoggedPercentage {
-										r.log.Infof("Collection %s.%s progress: %d/%d documents (%.0f%%) - Successful: %d, Failed: %d",
-											sourceDB, sourceCollection, currentCount, count, float64(currentPercentage)*10, currentSuccess, currentFailed)
-										lastLoggedPercentage = currentPercentage
-									}
-									workerMu.Unlock()
-								}
-							}(i)
-						}
-
-						// Start a goroutine to close channels when all batches are processed
-						go func() {
-							workerWg.Wait()
-							close(doneChan)
-						}()
-
-						// Process documents and create batches
-						var batch []interface{}
-						var batchCount int
-
-						for {
-							// Check for errors from workers
-							select {
-							case err := <-errorChan:
-								cursor.Close(ctx)
-								close(batchChan)
-								r.log.Errorf("Error during migration of %s.%s: %v", sourceDB, sourceCollection, err)
-								return
-							default:
-								// No errors, continue processing
-							}
-
-							// Get next document
-							if !cursor.Next(ctx) {
-								break
-							}
-
-							// Decode document
-							var doc bson.D
-							if err := cursor.Decode(&doc); err != nil {
-								r.log.Errorf("Error decoding document from %s.%s: %v", sourceDB, sourceCollection, err)
-								continue
-							}
-
-							// Add to batch
-							batch = append(batch, doc)
-							batchCount++
-
-							// Send batch if it reaches the write batch size
-							if batchCount >= writeBatchSize {
-								select {
-								case batchChan <- batch:
-									// Batch sent to worker
-								case err := <-errorChan:
-									// Error from a worker
-									cursor.Close(ctx)
-									close(batchChan)
-									r.log.Errorf("Error during migration of %s.%s: %v", sourceDB, sourceCollection, err)
-									return
-								case <-ctx.Done():
-									// Context cancelled
-									cursor.Close(ctx)
-									close(batchChan)
-									r.log.Info("Migration interrupted due to context cancellation")
-									return
-								}
-
-								// Reset batch
-								batch = nil
-								batchCount = 0
-							}
-						}
-
-						// Check for cursor errors
-						if err := cursor.Err(); err != nil {
-							close(batchChan)
-							r.log.Errorf("Cursor error for %s.%s: %v", sourceDB, sourceCollection, err)
-							return
-						}
-
-						// Process any remaining documents
-						if len(batch) > 0 {
-							select {
-							case batchChan <- batch:
-								// Final batch sent to worker
-							case err := <-errorChan:
-								// Error from a worker
-								close(batchChan)
-								r.log.Errorf("Error during migration of %s.%s: %v", sourceDB, sourceCollection, err)
-								return
-							case <-ctx.Done():
-								// Context cancelled
-								close(batchChan)
-								r.log.Info("Migration interrupted due to context cancellation")
-								return
-							}
-						}
-
-						// Close batch channel to signal workers to exit
-						close(batchChan)
-
-						// Wait for all workers to finish or for an error
-						select {
-						case <-doneChan:
-							// All workers finished successfully
-						case err := <-errorChan:
-							// Error from a worker
-							r.log.Errorf("Error during migration of %s.%s: %v", sourceDB, sourceCollection, err)
-							return
-						case <-ctx.Done():
-							// Context cancelled
-							r.log.Info("Migration interrupted due to context cancellation")
-							return
-						}
-					}
-
-					if failedCount > 0 {
-						r.log.Warnf("Migration for %s.%s completed with %d failures! Successful: %d, Failed: %d, Total: %d",
-							sourceDB, sourceCollection, failedCount, successCount, failedCount, migratedCount)
-					} else {
-						r.log.Infof("Migration for %s.%s completed successfully! Total documents: %d",
-							sourceDB, sourceCollection, migratedCount)
+						errOnce.Do(func() {
+							criticalErr = fmt.Errorf("critical error during migration of collection %s.%s: %w", sourceDB, sourceCollection, err)
+						})
 					}
 
 					// Update overall statistics and log overall progress
 					mu.Lock()
-					totalMigratedCount += migratedCount
-					totalFailedCount += failedCount
+					totalMigratedCount += succeeded + failed
+					totalFailedCount += failed
 					completedCollections++
 					r.log.Infof("Overall progress: %d/%d collections completed", completedCollections, totalCollections)
 					mu.Unlock()
@@ -618,6 +266,10 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 
 		// Wait for all collection migrations to complete
 		wg.Wait()
+
+		if criticalErr != nil {
+			return criticalErr
+		}
 
 		initialMigrationDuration := time.Since(initialMigrationStart)
 		var failurePercentage float64
@@ -753,76 +405,4 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 	return err
 }
 
-// writeBatchWithDLQ processes and writes a batch of documents, routing failures to DLQ.
-// Returns success count, failed count, and any critical error (non-bulk errors like network partition).
-func (r *ClientLevelReplicator) writeBatchWithDLQ(ctx context.Context, targetDBCollection *mongo.Collection, batch []interface{}, sourceDB, sourceCollection string) (int64, int64, error) {
-	// Transform __*__ field names to _*_ for Firestore compatibility
-	transformedBatch, err := TransformBatch(batch, r.log, sourceDB, sourceCollection)
-	if err != nil {
-		r.log.Errorf("Field name transformation failed for batch in %s.%s: %v", sourceDB, sourceCollection, err)
-		for _, doc := range batch {
-			docID := extractDocID(doc)
-			if r.dlq != nil {
-				r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
-			}
-		}
-		return 0, int64(len(batch)), nil
-	}
-	batch = transformedBatch
 
-	var batchFailed int64
-
-	// Process batch
-	if _, err := targetDBCollection.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false)); err != nil {
-		// Handle bulk write errors
-		bulkWriteException, ok := err.(mongo.BulkWriteException)
-		if ok {
-			r.log.Debugf("Bulk insert partially failed for %s.%s: %d failed",
-				sourceDB, sourceCollection, len(bulkWriteException.WriteErrors))
-
-			// Process individual errors
-			for _, writeErr := range bulkWriteException.WriteErrors {
-				// Extract document ID for logging
-				var errDocID interface{}
-				if writeErr.Index < len(batch) {
-					errDocID = extractDocID(batch[writeErr.Index])
-				}
-
-				r.log.Debugf("[%s.%s] Insert error at index %d, _id=%v: %v", sourceDB, sourceCollection, writeErr.Index, errDocID, writeErr.Message)
-
-				// Check if it's a duplicate key error (code 11000)
-				if writeErr.Code == 11000 && writeErr.Index < len(batch) {
-					// Skip duplicate key errors as they likely mean the document already exists
-					r.log.Debugf("[%s.%s] Skipping duplicate document _id=%v at index %d", sourceDB, sourceCollection, errDocID, writeErr.Index)
-				} else if writeErr.Index < len(batch) {
-					// For non-duplicate key errors, retry with upsert
-					doc := batch[writeErr.Index]
-					id := extractDocID(doc)
-
-					if id != nil {
-						filter := bson.M{"_id": id}
-						if _, err := targetDBCollection.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); err != nil {
-							r.log.Errorf("[%s.%s] Retry upsert failed for document _id=%v: %v", sourceDB, sourceCollection, id, err)
-							// Increment batch failures because even individual fallback retry upsert failed
-							batchFailed++
-							if r.dlq != nil {
-								r.dlq.WriteFailed(sourceDB, sourceCollection, id, err, "initial", "insert", doc)
-							}
-						}
-					} else {
-						// Increment batch failures because we cannot retry upsert without a valid _id
-						batchFailed++
-					}
-				}
-			}
-		} else {
-			// Handle non-bulk write errors (e.g. network partition or context timeout)
-			// Mark the entire batch as failed since the call was aborted globally without itemized status
-			batchFailed = int64(len(batch))
-			return 0, batchFailed, err
-		}
-	}
-
-	successCount := int64(len(batch)) - batchFailed
-	return successCount, batchFailed, nil
-}

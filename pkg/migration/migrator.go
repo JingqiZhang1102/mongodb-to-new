@@ -250,7 +250,12 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 				defer wg.Done()
 				defer func() { <-semaphore }() // Release semaphore when done
 
-				if err := m.migrateCollection(ctx, sourceDB, targetDB, collConfig); err != nil {
+				opts := MigrateOptions{
+					DLQ:          nil, // fail-fast
+					StatsManager: nil,
+					UpsertMode:   collConfig.UpsertMode,
+				}
+				if _, _, err := m.migrateCollection(ctx, sourceDB, targetDB, collConfig, opts); err != nil {
 					if err == context.Canceled {
 						m.log.Infof("Migration of collection %s interrupted due to user interrupt (Ctrl+C)", collConfig.SourceCollection)
 						// Don't report as an error
@@ -513,8 +518,15 @@ func (m *Migrator) getCollectionsToProcess(ctx context.Context, sourceDB *db.Mon
 	return collections, nil
 }
 
+// MigrateOptions defines parameters to tune the backfill behavior dynamically
+type MigrateOptions struct {
+	DLQ          DLQ           // If provided, failures are routed here and migration continues (resilient mode)
+	StatsManager *StatsManager // If provided, statistics are updated thread-safely (live mode stats)
+	UpsertMode   bool          // Use upsert instead of insert (from CollectionConfig)
+}
+
 // migrateCollection performs a one-time migration of a collection with parallel batch processing
-func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db.MongoDB, collConfig config.CollectionConfig) error {
+func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db.MongoDB, collConfig config.CollectionConfig, opts MigrateOptions) (int64, int64, error) {
 	// Get source and target collections
 	sourceCollection := sourceDB.GetCollection(collConfig.SourceCollection)
 	targetCollection := targetDB.GetCollection(collConfig.TargetCollection)
@@ -524,7 +536,7 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	// Get total count for progress reporting
 	totalCount, err := sourceCollection.EstimatedDocumentCount(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to count documents: %w", err)
+		return 0, 0, fmt.Errorf("failed to count documents: %w", err)
 	}
 
 	m.log.Infof("Found %d documents to migrate", totalCount)
@@ -532,13 +544,13 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	// If no documents, we're done
 	if totalCount == 0 {
 		m.log.Infof("No documents to migrate for collection %s", collConfig.SourceCollection)
-		return nil
+		return 0, 0, nil
 	}
 
 	// Check if parallel reads are enabled and collection is large enough
 	if m.config.ParallelReadsEnabled && totalCount >= int64(m.config.MinDocsForParallelReads) {
 		m.log.Infof("Using parallel reads for large collection: %s (%d documents)", collConfig.SourceCollection, totalCount)
-		return m.migrateCollectionParallel(ctx, sourceDB, targetDB, collConfig, totalCount)
+		return m.migrateCollectionParallel(ctx, sourceDB, targetDB, collConfig, totalCount, opts)
 	}
 
 	// Set up batch processing using configuration parameters
@@ -560,7 +572,7 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 
 	cursor, err := sourceCollection.Find(ctx, bson.D{}, options.Find().SetBatchSize(int32(readBatchSize)))
 	if err != nil {
-		return fmt.Errorf("failed to create cursor: %w", err)
+		return 0, 0, fmt.Errorf("failed to create cursor: %w", err)
 	}
 	defer cursor.Close(ctx)
 
@@ -572,9 +584,11 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	doneChan := make(chan struct{})                          // Channel to signal completion
 
 	// Track progress
+	var successCount int64
+	var failedCount int64
 	var migratedCount int64
 	var lastLoggedPercentage int = -1 // Start at -1 to ensure 0% is logged
-	var mu sync.Mutex                 // Mutex for thread-safe updates to migratedCount and lastLoggedPercentage
+	var mu sync.Mutex                 // Mutex for thread-safe updates to successCount, failedCount, migratedCount, and lastLoggedPercentage
 
 	// Start worker pool for parallel batch processing
 	workerCount := m.config.InitialMigrationWorkers
@@ -586,23 +600,23 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 			defer wg.Done()
 
 			for batch := range batchChan {
-				// Use RetryManager to handle retries with batch splitting
-				err := retryManager.RetryWithSplit(ctx, batch, collConfig.SourceCollection, func(b []interface{}) error {
-					return processBatch(ctx, targetCollection, b, collConfig.UpsertMode, m.log, sourceDB.GetDatabaseName(), collConfig.SourceCollection)
-				})
+				succeeded, failed, err := m.writeBatch(ctx, targetCollection, batch, sourceDB.GetDatabaseName(), collConfig.SourceCollection, opts, retryManager)
 				if err != nil {
 					select {
 					case errorChan <- fmt.Errorf("worker %d failed to process batch: %w", workerID, err):
 					default:
-						// Error channel already has an error
 					}
 					return
 				}
 
 				// Update progress
 				mu.Lock()
+				successCount += succeeded
+				failedCount += failed
 				migratedCount += int64(len(batch))
-				currentCount := migratedCount // Copy for logging outside the lock
+				currentCount := migratedCount
+				currentSuccess := successCount
+				currentFailed := failedCount
 
 				// Calculate current percentage (0-10 for 0%-100%)
 				currentPercentage := int(float64(currentCount) / float64(totalCount) * 10)
@@ -618,8 +632,13 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 
 				// Log outside the mutex lock to reduce lock contention
 				if shouldLog {
-					m.log.Infof("Collection %s progress: %d/%d documents (%.0f%%)",
-						collConfig.SourceCollection, currentCount, totalCount, float64(currentPercentage)*10)
+					if failedCount > 0 {
+						m.log.Infof("Collection %s progress: %d/%d documents (%.0f%%) - Successful: %d, Failed: %d",
+							collConfig.SourceCollection, currentCount, totalCount, float64(currentPercentage)*10, currentSuccess, currentFailed)
+					} else {
+						m.log.Infof("Collection %s progress: %d/%d documents (%.0f%%)",
+							collConfig.SourceCollection, currentCount, totalCount, float64(currentPercentage)*10)
+					}
 				}
 			}
 		}(i)
@@ -641,7 +660,7 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		case err := <-errorChan:
 			cursor.Close(ctx)
 			close(batchChan)
-			return err
+			return successCount, failedCount, err
 		default:
 			// No errors, continue processing
 		}
@@ -655,7 +674,7 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		var doc bson.D
 		if err := cursor.Decode(&doc); err != nil {
 			close(batchChan)
-			return fmt.Errorf("failed to decode document: %w", err)
+			return successCount, failedCount, fmt.Errorf("failed to decode document: %w", err)
 		}
 
 		// Add to batch
@@ -671,13 +690,13 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 				// Error from a worker
 				cursor.Close(ctx)
 				close(batchChan)
-				return err
+				return successCount, failedCount, err
 			case <-ctx.Done():
 				// Context cancelled
 				cursor.Close(ctx)
 				close(batchChan)
 				m.log.Info("Batch processing interrupted due to context cancellation")
-				return context.Canceled // Return context.Canceled for consistent error handling
+				return successCount, failedCount, context.Canceled // Return context.Canceled for consistent error handling
 			}
 
 			// Reset batch
@@ -692,7 +711,7 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	// Check for cursor errors
 	if err := cursor.Err(); err != nil {
 		close(batchChan)
-		return fmt.Errorf("cursor error: %w", err)
+		return successCount, failedCount, fmt.Errorf("cursor error: %w", err)
 	}
 
 	// Process any remaining documents
@@ -703,12 +722,12 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		case err := <-errorChan:
 			// Error from a worker
 			close(batchChan)
-			return err
+			return successCount, failedCount, err
 		case <-ctx.Done():
 			// Context cancelled
 			close(batchChan)
 			m.log.Info("Final batch processing interrupted due to context cancellation")
-			return context.Canceled // Return context.Canceled for consistent error handling
+			return successCount, failedCount, context.Canceled // Return context.Canceled for consistent error handling
 		}
 	}
 
@@ -721,15 +740,21 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		// All workers finished successfully
 	case err := <-errorChan:
 		// Error from a worker
-		return err
+		return successCount, failedCount, err
 	case <-ctx.Done():
 		// Context cancelled
 		m.log.Info("Migration interrupted due to context cancellation")
-		return context.Canceled // Return context.Canceled for consistent error handling
+		return successCount, failedCount, context.Canceled // Return context.Canceled for consistent error handling
 	}
 
-	m.log.Infof("Migration for %s completed successfully! Total documents: %d", collConfig.SourceCollection, migratedCount)
-	return nil
+	if failedCount > 0 {
+		m.log.Warnf("Migration for %s completed with %d failures! Successful: %d, Failed: %d, Total: %d",
+			collConfig.SourceCollection, failedCount, successCount, failedCount, migratedCount)
+	} else {
+		m.log.Infof("Migration for %s completed successfully! Total documents: %d",
+			collConfig.SourceCollection, migratedCount)
+	}
+	return successCount, failedCount, nil
 }
 
 // processBatch processes a batch of documents
@@ -856,7 +881,7 @@ func processBatch(ctx context.Context, collection *mongo.Collection, batch []int
 // change stream approach in the startClientLevelReplication function.
 
 // migrateCollectionParallel performs a one-time migration of a collection using parallel reads
-func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targetDB *db.MongoDB, collConfig config.CollectionConfig, totalCount int64) error {
+func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targetDB *db.MongoDB, collConfig config.CollectionConfig, totalCount int64, opts MigrateOptions) (int64, int64, error) {
 	sourceCollection := sourceDB.GetCollection(collConfig.SourceCollection)
 	targetCollection := targetDB.GetCollection(collConfig.TargetCollection)
 
@@ -872,7 +897,7 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 	// Create partitions
 	partitions, err := partitioner.Partition(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to create partitions: %w", err)
+		return 0, 0, fmt.Errorf("failed to create partitions: %w", err)
 	}
 
 	m.log.Infof("Created %d partitions for collection %s", len(partitions), collConfig.SourceCollection)
@@ -894,6 +919,8 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 	doneChan := make(chan struct{})
 
 	// Track progress
+	var successCount int64
+	var failedCount int64
 	var migratedCount int64
 	var mu sync.Mutex
 	var lastLoggedPercentage int = -1 // Start at -1 to ensure 0% is logged
@@ -915,8 +942,13 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 
 				// Only log when crossing a 10% threshold
 				if currentPercentage > lastLoggedPercentage {
-					m.log.Infof("Collection %s progress: %d/%d documents (%.0f%%)",
-						collConfig.SourceCollection, currentCount, totalCount, float64(currentPercentage)*10)
+					if failedCount > 0 {
+						m.log.Infof("Collection %s progress: %d/%d documents (%.0f%%) - Successful: %d, Failed: %d",
+							collConfig.SourceCollection, currentCount, totalCount, float64(currentPercentage)*10, successCount, failedCount)
+					} else {
+						m.log.Infof("Collection %s progress: %d/%d documents (%.0f%%)",
+							collConfig.SourceCollection, currentCount, totalCount, float64(currentPercentage)*10)
+					}
 					lastLoggedPercentage = currentPercentage
 				}
 				mu.Unlock()
@@ -975,16 +1007,11 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 					defer partitionWg.Done()
 
 					for batch := range partitionBatchChan {
-						// Use RetryManager to handle retries with batch splitting
-						err := retryManager.RetryWithSplit(ctx, batch, collConfig.SourceCollection, func(b []interface{}) error {
-							return processBatch(ctx, targetCollection, b, collConfig.UpsertMode, m.log, sourceDB.GetDatabaseName(), collConfig.SourceCollection)
-						})
-
+						succeeded, failed, err := m.writeBatch(ctx, targetCollection, batch, sourceDB.GetDatabaseName(), collConfig.SourceCollection, opts, retryManager)
 						if err != nil {
 							select {
 							case partitionErrorChan <- fmt.Errorf("worker %d in partition %d failed: %w", workerID, partitionIndex, err):
 							default:
-								// Error channel already has an error
 							}
 							return
 						}
@@ -996,6 +1023,8 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 
 						// Update overall progress counter
 						mu.Lock()
+						successCount += succeeded
+						failedCount += failed
 						migratedCount += int64(len(batch))
 						mu.Unlock()
 					}
@@ -1124,13 +1153,18 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 	// Check for errors
 	for err := range errorChan {
 		if err != nil {
-			return err
+			return successCount, failedCount, err
 		}
 	}
 
-	m.log.Infof("Parallel migration for %s completed successfully! Total documents: %d",
-		collConfig.SourceCollection, migratedCount)
-	return nil
+	if failedCount > 0 {
+		m.log.Warnf("Parallel migration for %s completed with %d failures! Successful: %d, Failed: %d, Total: %d",
+			collConfig.SourceCollection, failedCount, successCount, failedCount, migratedCount)
+	} else {
+		m.log.Infof("Parallel migration for %s completed successfully! Total documents: %d",
+			collConfig.SourceCollection, migratedCount)
+	}
+	return successCount, failedCount, nil
 }
 
 // Helper functions for min/max
@@ -1270,4 +1304,76 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// writeBatch processes and writes a batch of documents.
+// - If opts.DLQ is provided, it uses resilient writes (upsert fallback + DLQ routing) and returns counts.
+// - If opts.DLQ is nil, it uses fail-fast writes (standard InsertMany + RetryManager) and aborts on errors.
+func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, batch []interface{}, sourceDB, sourceCollection string, opts MigrateOptions, retryManager *RetryManager) (int64, int64, error) {
+	if opts.DLQ != nil {
+		// Resilient Mode: Use DLQ Fallback (exactly identical to client_stream.go)
+		transformedBatch, err := TransformBatch(batch, m.log, sourceDB, sourceCollection)
+		if err != nil {
+			m.log.Errorf("Field name transformation failed for batch in %s.%s: %v", sourceDB, sourceCollection, err)
+			for _, doc := range batch {
+				docID := extractDocID(doc)
+				opts.DLQ.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
+			}
+			return 0, int64(len(batch)), nil
+		}
+		batch = transformedBatch
+
+		var batchFailed int64
+
+		if _, err := targetCol.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false)); err != nil {
+			bulkWriteException, ok := err.(mongo.BulkWriteException)
+			if ok {
+				m.log.Debugf("Bulk insert partially failed for %s.%s: %d failed",
+					sourceDB, sourceCollection, len(bulkWriteException.WriteErrors))
+
+				for _, writeErr := range bulkWriteException.WriteErrors {
+					var errDocID interface{}
+					if writeErr.Index < len(batch) {
+						errDocID = extractDocID(batch[writeErr.Index])
+					}
+
+					m.log.Debugf("[%s.%s] Insert error at index %d, _id=%v: %v", sourceDB, sourceCollection, writeErr.Index, errDocID, writeErr.Message)
+
+					if writeErr.Code == 11000 && writeErr.Index < len(batch) {
+						m.log.Debugf("[%s.%s] Skipping duplicate document _id=%v at index %d", sourceDB, sourceCollection, errDocID, writeErr.Index)
+					} else if writeErr.Index < len(batch) {
+						doc := batch[writeErr.Index]
+						id := extractDocID(doc)
+
+						if id != nil {
+							filter := bson.M{"_id": id}
+							if _, err := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); err != nil {
+								m.log.Errorf("[%s.%s] Retry upsert failed for document _id=%v: %v", sourceDB, sourceCollection, id, err)
+								batchFailed++
+								opts.DLQ.WriteFailed(sourceDB, sourceCollection, id, err, "initial", "insert", doc)
+							}
+						} else {
+							batchFailed++
+						}
+					}
+				}
+			} else {
+				// Handle non-bulk write errors (e.g. network partition or context timeout)
+				batchFailed = int64(len(batch))
+				return 0, batchFailed, err
+			}
+		}
+
+		successCount := int64(len(batch)) - batchFailed
+		return successCount, batchFailed, nil
+	} else {
+		// Fail-Fast Mode (standard mode=migrate behavior)
+		err := retryManager.RetryWithSplit(ctx, batch, sourceCollection, func(b []interface{}) error {
+			return processBatch(ctx, targetCol, b, opts.UpsertMode, m.log, sourceDB, sourceCollection)
+		})
+		if err != nil {
+			return 0, int64(len(batch)), err
+		}
+		return int64(len(batch)), 0, nil
+	}
 }
