@@ -488,6 +488,11 @@ func (p *CollectionPartitioner) createPartitionsWithSampling(ctx context.Context
 		return []bson.D{{}}, nil
 	}
 
+	return buildPartitionFilters(sampledIDs, partitionCount), nil
+}
+
+// buildPartitionFilters constructs contiguous range BSON filters from sorted sampled _ids
+func buildPartitionFilters(sampledIDs []interface{}, partitionCount int) []bson.D {
 	partitions := make([]bson.D, 0, partitionCount)
 	step := len(sampledIDs) / partitionCount
 
@@ -514,5 +519,5 @@ func (p *CollectionPartitioner) createPartitionsWithSampling(ctx context.Context
 		})
 	}
 
-	return partitions, nil
+	return partitions
 }
