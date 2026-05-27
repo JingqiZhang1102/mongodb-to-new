@@ -73,9 +73,6 @@ type StatsManager struct {
 	// Unified operation statistics
 	opsStats [5]opStats
 
-	// Unified operation statistics
-	opsStats [5]opStats
-
 	// Scalar counters updated lock-freely via atomic package
 	updatedThenDeletedSinceLastStats      int64
 	sequentialRetriesSinceLastStats       int64
@@ -397,7 +394,6 @@ func (sm *StatsManager) IncrementEventsProcessed(opType string, count int64) {
 	if idx >= 0 {
 		atomic.AddInt64(&sm.opsStats[idx].processed, count)
 	}
-	return errStr
 }
 
 func simplifyError(errStr string) string {
