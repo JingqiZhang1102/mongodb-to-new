@@ -40,6 +40,7 @@ func opIndex(opType string) int {
 type opStats struct {
 	received              int64
 	processed             int64
+	read                  int64
 	failed                int64
 	dlq                   int64
 	totalBulkWriteLatency int64
@@ -66,6 +67,8 @@ type StatsManager struct {
 	log                  *logger.Logger
 	statsInterval        time.Duration
 	groupOpsByDistinctId bool
+	DontApply            bool
+	DryRun               bool
 
 	// Unified operation statistics
 	opsStats [5]opStats
@@ -535,6 +538,29 @@ func (sm *StatsManager) GetProcessedCount(opType string) int {
 	return 0
 }
 
+// IncrementEventsRead increments the count of read input events by operation type thread-safely and lock-freely
+func (sm *StatsManager) IncrementEventsRead(opType string, count int64) {
+	if sm == nil {
+		return
+	}
+	idx := opIndex(opType)
+	if idx >= 0 {
+		atomic.AddInt64(&sm.opsStats[idx].read, count)
+	}
+}
+
+// GetReadCount returns the count of read events of the given type thread-safely and lock-freely
+func (sm *StatsManager) GetReadCount(opType string) int {
+	if sm == nil {
+		return 0
+	}
+	idx := opIndex(opType)
+	if idx >= 0 {
+		return int(atomic.LoadInt64(&sm.opsStats[idx].read))
+	}
+	return 0
+}
+
 // GetReceivedCount returns the count of received events of the given type thread-safely and lock-freely
 func (sm *StatsManager) GetReceivedCount(opType string) int {
 	if sm == nil {
@@ -585,6 +611,7 @@ func (sm *StatsManager) ReportStats() {
 	for i := 0; i < 5; i++ {
 		swapped[i].received = atomic.SwapInt64(&sm.opsStats[i].received, 0)
 		swapped[i].processed = atomic.SwapInt64(&sm.opsStats[i].processed, 0)
+		swapped[i].read = atomic.SwapInt64(&sm.opsStats[i].read, 0)
 		swapped[i].failed = atomic.SwapInt64(&sm.opsStats[i].failed, 0)
 		swapped[i].dlq = atomic.SwapInt64(&sm.opsStats[i].dlq, 0)
 		swapped[i].totalBulkWriteLatency = atomic.SwapInt64(&sm.opsStats[i].totalBulkWriteLatency, 0)
@@ -621,22 +648,36 @@ func (sm *StatsManager) ReportStats() {
 	sm.mu.Unlock()
 
 	eventsReceived := swapped[opInsert].received + swapped[opUpdate].received + swapped[opDelete].received + swapped[opReplace].received + swapped[opMixed].received
-	eventsProcessed := swapped[opInsert].processed + swapped[opUpdate].processed + swapped[opDelete].processed + swapped[opReplace].processed + swapped[opMixed].processed + updatedThenDeleted
 	eventsFailed := swapped[opInsert].failed + swapped[opUpdate].failed + swapped[opDelete].failed + swapped[opReplace].failed + swapped[opMixed].failed
 
 	insertsReceived := swapped[opInsert].received
 	updatesReceived := swapped[opUpdate].received + swapped[opReplace].received
 	deletesReceived := swapped[opDelete].received
 
-	insertsProcessed := swapped[opInsert].processed
-	updatesProcessed := swapped[opUpdate].processed + swapped[opReplace].processed
-	deletesProcessed := swapped[opDelete].processed
-
 	insertsFailed := swapped[opInsert].failed
 	updatesFailed := swapped[opUpdate].failed + swapped[opReplace].failed
 	deletesFailed := swapped[opDelete].failed
 
-	var rateReceived, rateProcessed, rateFailed, rateUpdatedThenDeleted float64
+	var eventsProcessed, eventsApplied int64
+	var insertsProcessed, updatesProcessed, deletesProcessed int64
+
+	if sm.DryRun {
+		eventsProcessed = swapped[opInsert].read + swapped[opUpdate].read + swapped[opDelete].read + swapped[opReplace].read + swapped[opMixed].read
+		eventsApplied = 0
+
+		insertsProcessed = swapped[opInsert].read
+		updatesProcessed = swapped[opUpdate].read + swapped[opReplace].read
+		deletesProcessed = swapped[opDelete].read
+	} else {
+		eventsProcessed = swapped[opInsert].processed + swapped[opUpdate].processed + swapped[opDelete].processed + swapped[opReplace].processed + swapped[opMixed].processed + updatedThenDeleted
+		eventsApplied = swapped[opInsert].processed + swapped[opUpdate].processed + swapped[opDelete].processed + swapped[opReplace].processed + swapped[opMixed].processed
+
+		insertsProcessed = swapped[opInsert].processed
+		updatesProcessed = swapped[opUpdate].processed + swapped[opReplace].processed
+		deletesProcessed = swapped[opDelete].processed
+	}
+
+	var rateReceived, rateProcessed, rateApplied, rateFailed, rateUpdatedThenDeleted float64
 	var rateInsertsProcessed, rateUpdatesProcessed, rateDeletesProcessed float64
 	var rateInsertsFailed, rateUpdatesFailed, rateDeletesFailed float64
 	var rateSequentialRetries, rateOrderedWrites, rateUnorderedWrites float64
@@ -648,6 +689,7 @@ func (sm *StatsManager) ReportStats() {
 	if duration.Seconds() > 0 {
 		rateReceived = float64(eventsReceived) / duration.Seconds()
 		rateProcessed = float64(eventsProcessed) / duration.Seconds()
+		rateApplied = float64(eventsApplied) / duration.Seconds()
 		rateFailed = float64(eventsFailed) / duration.Seconds()
 		rateUpdatedThenDeleted = float64(updatedThenDeleted) / duration.Seconds()
 		rateSequentialRetries = float64(sequentialRetries) / duration.Seconds()
@@ -792,9 +834,21 @@ func (sm *StatsManager) ReportStats() {
 		failureBreakdownStr += " 0"
 	}
 
-	msg := fmt.Sprintf("Change stream statistics (last %v):\n"+
+	headerStr := "Change stream statistics"
+	if sm.DryRun {
+		headerStr += " in dry-run live-only mode"
+	} else if sm.DontApply {
+		headerStr += " in dont-apply live-only mode"
+	}
+
+	processedLabel := "Processed"
+	if sm.DryRun {
+		processedLabel = "Read"
+	}
+
+	msg := fmt.Sprintf(headerStr+" (last %v):\n"+
 		"  - Received:  %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec)]\n"+
-		"  - Processed: %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]\n"+
+		"  - "+processedLabel+": %d (%.2f events/sec) (applied: %d (%.2f/sec)) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]\n"+
 		"  - Failed:    %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec)]\n"+
 		"  - Ordered BulkWrites: %d (%.2f/sec)%s\n"+
 		"  - Unordered BulkWrites: %d (%.2f/sec)%s\n"+
@@ -812,7 +866,7 @@ func (sm *StatsManager) ReportStats() {
 		"%s",
 		duration.Round(time.Second),
 		eventsReceived, rateReceived, insertsReceived, rateInsertsReceived, deletesReceived, rateDeletesReceived, updatesReceived, rateUpdatesReceived,
-		eventsProcessed, rateProcessed, insertsProcessed, rateInsertsProcessed, deletesProcessed, rateDeletesProcessed, updatesProcessed, rateUpdatesProcessed, updatedThenDeleted, rateUpdatedThenDeleted,
+		eventsProcessed, rateProcessed, eventsApplied, rateApplied, insertsProcessed, rateInsertsProcessed, deletesProcessed, rateDeletesProcessed, updatesProcessed, rateUpdatesProcessed, updatedThenDeleted, rateUpdatedThenDeleted,
 		eventsFailed, rateFailed, insertsFailed, rateInsertsFailed, deletesFailed, rateDeletesFailed, updatesFailed, rateUpdatesFailed,
 		orderedWrites, rateOrderedWrites, avgOrderedSizeStr, unorderedWrites, rateUnorderedWrites, avgUnorderedSizeStr, sequentialRetries, rateSequentialRetries, sequentialRetriesBreakdown, duplicateKeys, rateDuplicateKeys, groupFlushesOpType, rateGroupFlushesOpType, groupFlushesNamespace, rateGroupFlushesNamespace, groupFlushesBatchFull, rateGroupFlushesBatchFull, groupFlushesCollision, rateGroupFlushesCollision, timeoutFlushes, rateTimeoutFlushes,
 		dbLatencyMsg,

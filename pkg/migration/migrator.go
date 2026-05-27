@@ -24,6 +24,8 @@ type Migrator struct {
 	config       *config.Config
 	log          *logger.Logger
 	CdcStartTime *primitive.Timestamp
+	DontApply    bool
+	DryRun       bool
 }
 
 // NewMigrator creates a new migrator
@@ -39,6 +41,21 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 	// Validate mode
 	if mode != "migrate" && mode != "live" && mode != "live-only" {
 		return fmt.Errorf("invalid mode: %s, must be 'migrate', 'live', or 'live-only'", mode)
+	}
+
+	// Validate dont-apply constraint: dont-apply is only supported for 'live-only' mode
+	if m.DontApply && mode != "live-only" {
+		return fmt.Errorf("dont-apply mode is only supported for 'live-only' migrations")
+	}
+
+	// Validate dry run constraint: dry run is only supported for 'live-only' mode
+	if m.DryRun && mode != "live-only" {
+		return fmt.Errorf("dry-run mode is only supported for 'live-only' migrations")
+	}
+
+	// Validate mutual exclusivity of dont-apply and dry-run
+	if m.DontApply && m.DryRun {
+		return fmt.Errorf("dont-apply and dry-run modes are mutually exclusive")
 	}
 
 	m.log.Infof("Starting MongoDB to MongoDB %s process", mode)
@@ -139,6 +156,8 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 	// Initialize shared stats tracking for this database pair
 	statsInterval := time.Duration(m.config.StatsIntervalMinutes) * time.Minute
 	statsManager := NewStatsManager(m.log, statsInterval, m.config.GroupOpsByDistinctId)
+	statsManager.DontApply = m.DontApply
+	statsManager.DryRun = m.DryRun
 
 	// Check if this is legacy mode - if so, handle it separately
 	if (mode == "live" || mode == "live-only") && pair.Source.ReplicationMethod == "oplog-legacy" {
@@ -292,6 +311,8 @@ func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, t
 	// Create client-level replicator
 	replicator := NewClientLevelReplicator(sourceDB, targetDB, m.config, m.log)
 	replicator.SetStatsManager(statsManager)
+	replicator.DontApply = m.DontApply
+	replicator.DryRun = m.DryRun
 
 	// Add all collections to the replicator
 	for _, collConfig := range collections {
@@ -340,6 +361,8 @@ func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB
 
 	// Use modern oplog replicator
 	replicator := NewOplogReplicator(sourceDB, targetDB, m.config, m.log)
+	replicator.DontApply = m.DontApply
+	replicator.DryRun = m.DryRun
 
 	// Add all collections to the replicator
 	for _, collConfig := range collections {
@@ -412,6 +435,8 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 
 	// Create legacy oplog replicator
 	replicator := NewOplogReplicatorLegacy(sourceDBLegacy, targetDB, m.config, m.log)
+	replicator.DontApply = m.DontApply
+	replicator.DryRun = m.DryRun
 
 	// Add all collections to the replicator
 	for _, collConfig := range collections {

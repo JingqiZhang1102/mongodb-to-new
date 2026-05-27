@@ -39,6 +39,8 @@ type EventDistributor struct {
 	// Statistics tracking
 	statsManager *StatsManager // Manager for statistics and replication lag
 	cfg          *config.Config
+	DontApply    bool          // Don't apply flag
+	DryRun       bool          // Dry run flag
 }
 
 // NewEventDistributor creates a new event distributor
@@ -130,7 +132,7 @@ func (d *EventDistributor) Start() error {
 
 	// Initialize workers with retry manager and stats manager
 	for i := 0; i < d.incrementalWorkerCount; i++ {
-		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.statsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval, d.cfg.IncrementalIncomingQueueSize, d.cfg.IncrementalProcessingQueueSize)
+		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.statsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval, d.cfg.IncrementalIncomingQueueSize, d.cfg.IncrementalProcessingQueueSize, d.DontApply)
 	}
 
 	// Ensure all workers are shut down sequentially and safely upon exit
@@ -179,6 +181,13 @@ func (d *EventDistributor) Start() error {
 
 		if d.statsManager != nil {
 			d.statsManager.IncrementEventsReceived(opType)
+		}
+
+		if d.DryRun {
+			if d.statsManager != nil {
+				d.statsManager.IncrementEventsRead(opType, 1)
+			}
+			continue
 		}
 
 		// Extract documentKey._id via fast binary lookup
@@ -299,6 +308,7 @@ type Worker struct {
 
 	// Force ordered operations for all types
 	forceOrderedOperations bool
+	dontApply              bool
 
 	// Dead Letter Queue for failed documents
 	dlq DLQ
@@ -358,7 +368,7 @@ func (s *statsTrackingDLQ) Close() {
 func NewWorker(id int, ctx context.Context, log *logger.Logger,
 	targetDB *db.MongoDB, collectionMap map[string]map[string]string,
 	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager, statsManager *StatsManager, groupOpsByDistinctId bool, flushInterval time.Duration,
-	incomingQueueSize int, processingQueueSize int) *Worker {
+	incomingQueueSize int, processingQueueSize int, dontApply bool) *Worker {
 
 	var workerDLQ DLQ = dlq
 	if dlq != nil && statsManager != nil {
@@ -378,6 +388,7 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 		processingQueue:           make(chan *OperationGroup, processingQueueSize),
 		incrementalWriteBatchSize: incrementalWriteBatchSize,
 		forceOrderedOperations:    forceOrderedOperations,
+		dontApply:                 dontApply,
 		dlq:                       workerDLQ,
 		retryManager:              retryManager,
 		statsManager:              statsManager,
@@ -628,6 +639,19 @@ func (w *Worker) processGroup(group OperationGroup) {
 
 	// Get mapped collection name
 	targetCollName := w.getTargetCollectionName(dbName, collName)
+
+	if w.dontApply {
+		now := time.Now()
+		for i := range group.Operations {
+			group.Operations[i].SuccessTime = now
+		}
+		w.log.Debugf("[%s.%s] Don't apply: dropped batch of %d %s operations", dbName, targetCollName, len(group.Operations), group.OpType)
+		if w.statsManager != nil {
+			w.statsManager.RecordLags(group.Operations)
+		}
+		return
+	}
+
 	targetCollection := w.targetDB.GetCollection(targetCollName)
 
 	// Use a graceful shutdown context with timeout if the main context was canceled.

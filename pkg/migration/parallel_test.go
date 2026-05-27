@@ -31,6 +31,7 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndDescription(t *testing.T
 		5*time.Minute,                       // flushInterval
 		8192,                                // incomingQueueSize
 		2,                                   // processingQueueSize
+		false,                               // dontApply
 	)
 
 	// Create an update event where both fullDocument and updateDescription are nil/null
@@ -98,6 +99,7 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndStatsManager(t *testing.
 		5*time.Minute,                       // flushInterval
 		8192,                                // incomingQueueSize
 		2,                                   // processingQueueSize
+		false,                               // dontApply
 	)
 
 	// Create an update event where fullDocument is nil
@@ -158,3 +160,53 @@ func BenchmarkNewHashing(b *testing.B) {
 		_ = int(hash)
 	}
 }
+
+func TestWorkerDontApply(t *testing.T) {
+	log := logger.New()
+	ctx := context.Background()
+	statsMgr := NewStatsManager(log, 0, false)
+
+	worker := NewWorker(
+		1,                                   // id
+		ctx,                                 // ctx
+		log,                                 // logger
+		nil,                                 // targetDB
+		nil,                                 // collectionMap
+		10,                                  // batch size
+		false,                               // forceOrdered
+		nil,                                 // dlq
+		nil,                                 // retryManager
+		statsMgr,                            // statsManager
+		false,                               // groupOpsByDistinctID
+		5*time.Minute,                       // flushInterval
+		8192,                                // incomingQueueSize
+		2,                                   // processingQueueSize
+		true,                                // dontApply
+	)
+
+	group := OperationGroup{
+		Namespace: "db.coll",
+		OpType:    "insert",
+		Operations: []WriteOperation{
+			{DocumentID: "123", OpType: "insert"},
+			{DocumentID: "456", OpType: "insert"},
+		},
+	}
+
+	// This should run successfully and return immediately without panicking on nil targetDB
+	worker.processGroup(group)
+
+	// Verify both operations are marked with a non-zero SuccessTime
+	for i, op := range group.Operations {
+		if op.SuccessTime.IsZero() {
+			t.Errorf("expected operation %d SuccessTime to be non-zero in dont-apply", i)
+		}
+	}
+
+	// Verify statsManager has registered 2 processed inserts
+	processedCount := statsMgr.GetProcessedCount("insert")
+	if processedCount != 2 {
+		t.Errorf("expected processed count 2, got %d", processedCount)
+	}
+}
+

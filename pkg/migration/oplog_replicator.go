@@ -27,6 +27,8 @@ type OplogReplicator struct {
 	mu            sync.Mutex                   // Mutex for thread-safe operations
 	dlq           DLQ                          // Dead Letter Queue for failed documents
 	retryManager  *RetryManager                // Retry manager for transient errors
+	DontApply     bool                         // Don't apply flag
+	DryRun        bool                         // Dry run flag
 }
 
 // NewOplogReplicator creates a new oplog-based replicator
@@ -747,7 +749,7 @@ func (r *OplogReplicator) tailOplog(ctx context.Context, afterTimestamp primitiv
 	r.log.Infof("Starting parallel oplog processing with %d workers", r.config.IncrementalWorkerCount)
 	workers := make([]*Worker, r.config.IncrementalWorkerCount)
 	for i := 0; i < r.config.IncrementalWorkerCount; i++ {
-		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionMap, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager, nil, r.config.GroupOpsByDistinctId, time.Duration(r.config.FlushIntervalMs)*time.Millisecond, r.config.IncrementalIncomingQueueSize, r.config.IncrementalProcessingQueueSize)
+		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionMap, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager, nil, r.config.GroupOpsByDistinctId, time.Duration(r.config.FlushIntervalMs)*time.Millisecond, r.config.IncrementalIncomingQueueSize, r.config.IncrementalProcessingQueueSize, r.DontApply)
 	}
 
 	// Set up context cancellation handling for workers
@@ -840,6 +842,10 @@ func (r *OplogReplicator) tailOplog(ctx context.Context, afterTimestamp primitiv
 
 			// Update latest oplog timestamp
 			latestOplogTimestamp = op.Timestamp
+
+			if r.DryRun {
+				continue
+			}
 
 			// Convert oplog event to worker event format and distribute to workers
 			r.distributeOplogEvent(ctx, op, workers)
