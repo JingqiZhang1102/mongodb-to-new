@@ -39,8 +39,8 @@ type EventDistributor struct {
 	// Statistics tracking
 	statsManager *StatsManager // Manager for statistics and replication lag
 	cfg          *config.Config
-	DontApply    bool          // Don't apply flag
-	DryRun       bool          // Dry run flag
+	DontApply    bool // Don't apply flag
+	DryRun       bool // Dry run flag
 }
 
 // NewEventDistributor creates a new event distributor
@@ -151,6 +151,7 @@ func (d *EventDistributor) Start() error {
 
 	for {
 		// Try to get next change event
+		startTime := time.Now()
 		ok := d.changeStream.Next(d.ctx)
 		readTime := time.Now()
 		if !ok {
@@ -170,6 +171,15 @@ func (d *EventDistributor) Start() error {
 
 		// Get raw change event bytes
 		rawEvent := d.changeStream.Current
+		size := len(rawEvent)
+
+		if d.statsManager != nil {
+			d.statsManager.RecordReadMetric(readTime.Sub(startTime), size)
+		}
+
+		if d.DryRun {
+			continue
+		}
 
 		// Extract operationType via fast binary lookup
 		opTypeVal, err := rawEvent.LookupErr("operationType")
@@ -181,13 +191,6 @@ func (d *EventDistributor) Start() error {
 
 		if d.statsManager != nil {
 			d.statsManager.IncrementEventsReceived(opType)
-		}
-
-		if d.DryRun {
-			if d.statsManager != nil {
-				d.statsManager.IncrementEventsRead(opType, 1)
-			}
-			continue
 		}
 
 		// Extract documentKey._id via fast binary lookup

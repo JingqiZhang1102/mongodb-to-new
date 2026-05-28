@@ -181,6 +181,34 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		}
 		initialMigrationStart := time.Now()
 		r.log.Info("Performing initial migration for all collections")
+
+		// Sync indexes before migrating data if configured
+		if pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0 {
+			r.log.Info("Syncing indexes before initial migration")
+			var collections []config.CollectionConfig
+			for _, colls := range r.collectionConfigs {
+				for _, collConfig := range colls {
+					collections = append(collections, collConfig)
+				}
+			}
+			if err := migrator.syncIndexes(ctx, r.sourceDB, r.targetDB, pair, collections); err != nil {
+				r.log.Warnf("Index sync encountered issues: %v (continuing with migration)", err)
+			}
+
+			// Index-Only mode: wait for all async index builds then return without migrating data
+			if pair.Target.IndexOnly {
+				r.log.Info("IndexOnly mode enabled. Waiting for all async index creation to complete...")
+				r.targetDB.WaitForIndexCreation()
+				r.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration.")
+
+				// Determine if initial migration completed with failures (none in IndexOnly since no data migrated)
+				if err := SaveInitialMigrationState(initialMigrationStatePath, StatusCompleted, 0); err != nil {
+					r.log.Errorf("Error saving initial migration state as complete: %v", err)
+				}
+				return nil
+			}
+		}
+
 		// Use a semaphore to limit the number of concurrent collection migrations
 		concurrentCollections := r.config.ConcurrentCollections
 		if concurrentCollections <= 0 {

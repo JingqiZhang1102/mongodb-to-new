@@ -40,7 +40,6 @@ func opIndex(opType string) int {
 type opStats struct {
 	received              int64
 	processed             int64
-	read                  int64
 	failed                int64
 	dlq                   int64
 	totalBulkWriteLatency int64
@@ -82,6 +81,12 @@ type StatsManager struct {
 	unorderedBulkWritesSizeSinceLastStats int64
 	timeoutFlushesSinceLastStats          int64
 	duplicateKeysSinceLastStats           int64
+
+	// Read latency and size tracking (atomically updated)
+	totalReadLatencyNs int64
+	readCount          int64
+	totalReadSizeBytes int64
+
 
 	// Group flush reasons (atomically tracked)
 	groupFlushesOpType    int64
@@ -149,7 +154,11 @@ func (sm *StatsManager) Start(ctx context.Context) {
 		for {
 			select {
 			case <-ticker.C:
-				sm.ReportStats()
+				if sm.DryRun {
+					sm.ReportDryRunStats()
+				} else {
+					sm.ReportStats()
+				}
 			case <-ctx.Done():
 				return
 			}
@@ -385,6 +394,16 @@ func (sm *StatsManager) IncrementEventsReceived(opType string) {
 	}
 }
 
+// RecordReadMetric records changeStream.Next latency and document size metrics thread-safely and lock-freely
+func (sm *StatsManager) RecordReadMetric(latency time.Duration, sizeBytes int) {
+	if sm == nil {
+		return
+	}
+	atomic.AddInt64(&sm.totalReadLatencyNs, int64(latency))
+	atomic.AddInt64(&sm.readCount, 1)
+	atomic.AddInt64(&sm.totalReadSizeBytes, int64(sizeBytes))
+}
+
 // IncrementEventsProcessed increments the count of successfully processed events by operation type thread-safely and lock-freely
 func (sm *StatsManager) IncrementEventsProcessed(opType string, count int64) {
 	if sm == nil {
@@ -538,28 +557,6 @@ func (sm *StatsManager) GetProcessedCount(opType string) int {
 	return 0
 }
 
-// IncrementEventsRead increments the count of read input events by operation type thread-safely and lock-freely
-func (sm *StatsManager) IncrementEventsRead(opType string, count int64) {
-	if sm == nil {
-		return
-	}
-	idx := opIndex(opType)
-	if idx >= 0 {
-		atomic.AddInt64(&sm.opsStats[idx].read, count)
-	}
-}
-
-// GetReadCount returns the count of read events of the given type thread-safely and lock-freely
-func (sm *StatsManager) GetReadCount(opType string) int {
-	if sm == nil {
-		return 0
-	}
-	idx := opIndex(opType)
-	if idx >= 0 {
-		return int(atomic.LoadInt64(&sm.opsStats[idx].read))
-	}
-	return 0
-}
 
 // GetReceivedCount returns the count of received events of the given type thread-safely and lock-freely
 func (sm *StatsManager) GetReceivedCount(opType string) int {
@@ -597,6 +594,10 @@ func (sm *StatsManager) ReportStats() {
 	timeoutFlushes := atomic.SwapInt64(&sm.timeoutFlushesSinceLastStats, 0)
 	duplicateKeys := atomic.SwapInt64(&sm.duplicateKeysSinceLastStats, 0)
 
+	totalReadLatencyNs := atomic.SwapInt64(&sm.totalReadLatencyNs, 0)
+	readCount := atomic.SwapInt64(&sm.readCount, 0)
+	totalReadSizeBytes := atomic.SwapInt64(&sm.totalReadSizeBytes, 0)
+
 	groupFlushesOpType := atomic.SwapInt64(&sm.groupFlushesOpType, 0)
 	groupFlushesBatchFull := atomic.SwapInt64(&sm.groupFlushesBatchFull, 0)
 	groupFlushesNamespace := atomic.SwapInt64(&sm.groupFlushesNamespace, 0)
@@ -611,7 +612,6 @@ func (sm *StatsManager) ReportStats() {
 	for i := 0; i < 5; i++ {
 		swapped[i].received = atomic.SwapInt64(&sm.opsStats[i].received, 0)
 		swapped[i].processed = atomic.SwapInt64(&sm.opsStats[i].processed, 0)
-		swapped[i].read = atomic.SwapInt64(&sm.opsStats[i].read, 0)
 		swapped[i].failed = atomic.SwapInt64(&sm.opsStats[i].failed, 0)
 		swapped[i].dlq = atomic.SwapInt64(&sm.opsStats[i].dlq, 0)
 		swapped[i].totalBulkWriteLatency = atomic.SwapInt64(&sm.opsStats[i].totalBulkWriteLatency, 0)
@@ -661,20 +661,18 @@ func (sm *StatsManager) ReportStats() {
 	var eventsProcessed, eventsApplied int64
 	var insertsProcessed, updatesProcessed, deletesProcessed int64
 
-	if sm.DryRun {
-		eventsProcessed = swapped[opInsert].read + swapped[opUpdate].read + swapped[opDelete].read + swapped[opReplace].read + swapped[opMixed].read
-		eventsApplied = 0
+	eventsProcessed = swapped[opInsert].processed + swapped[opUpdate].processed + swapped[opDelete].processed + swapped[opReplace].processed + swapped[opMixed].processed + updatedThenDeleted
+	eventsApplied = swapped[opInsert].processed + swapped[opUpdate].processed + swapped[opDelete].processed + swapped[opReplace].processed + swapped[opMixed].processed
 
-		insertsProcessed = swapped[opInsert].read
-		updatesProcessed = swapped[opUpdate].read + swapped[opReplace].read
-		deletesProcessed = swapped[opDelete].read
-	} else {
-		eventsProcessed = swapped[opInsert].processed + swapped[opUpdate].processed + swapped[opDelete].processed + swapped[opReplace].processed + swapped[opMixed].processed + updatedThenDeleted
-		eventsApplied = swapped[opInsert].processed + swapped[opUpdate].processed + swapped[opDelete].processed + swapped[opReplace].processed + swapped[opMixed].processed
+	insertsProcessed = swapped[opInsert].processed
+	updatesProcessed = swapped[opUpdate].processed + swapped[opReplace].processed
+	deletesProcessed = swapped[opDelete].processed
 
-		insertsProcessed = swapped[opInsert].processed
-		updatesProcessed = swapped[opUpdate].processed + swapped[opReplace].processed
-		deletesProcessed = swapped[opDelete].processed
+	avgReadLatency := time.Duration(0)
+	avgReadSize := 0.0
+	if readCount > 0 {
+		avgReadLatency = time.Duration(totalReadLatencyNs / readCount)
+		avgReadSize = float64(totalReadSizeBytes) / float64(readCount)
 	}
 
 	var rateReceived, rateProcessed, rateApplied, rateFailed, rateUpdatedThenDeleted float64
@@ -835,27 +833,20 @@ func (sm *StatsManager) ReportStats() {
 	}
 
 	headerStr := "Change stream statistics"
-	if sm.DryRun {
-		headerStr += " in dry-run live-only mode"
-	} else if sm.DontApply {
+	if sm.DontApply {
 		headerStr += " in dont-apply live-only mode"
 	}
 
-	processedLabel := "Processed"
-	if sm.DryRun {
-		processedLabel = "Read"
-	}
-
 	var processedLine string
-	if sm.DryRun || sm.DontApply {
-		processedLine = fmt.Sprintf("  - "+processedLabel+": %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]",
+	if sm.DontApply {
+		processedLine = fmt.Sprintf("  - Processed: %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]",
 			eventsProcessed, rateProcessed,
 			insertsProcessed, rateInsertsProcessed,
 			deletesProcessed, rateDeletesProcessed,
 			updatesProcessed, rateUpdatesProcessed,
 			updatedThenDeleted, rateUpdatedThenDeleted)
 	} else {
-		processedLine = fmt.Sprintf("  - "+processedLabel+": %d (%.2f events/sec) (applied: %d (%.2f/sec)) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]",
+		processedLine = fmt.Sprintf("  - Processed: %d (%.2f events/sec) (applied: %d (%.2f/sec)) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]",
 			eventsProcessed, rateProcessed,
 			eventsApplied, rateApplied,
 			insertsProcessed, rateInsertsProcessed,
@@ -863,6 +854,7 @@ func (sm *StatsManager) ReportStats() {
 			updatesProcessed, rateUpdatesProcessed,
 			updatedThenDeleted, rateUpdatedThenDeleted)
 	}
+
 
 	msg := fmt.Sprintf(headerStr+" (last %v):\n"+
 		"  - Received:  %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec)]\n"+
@@ -879,6 +871,8 @@ func (sm *StatsManager) ReportStats() {
 		"      * ReadToEventTimeLag: %s | WorkerReceivedToReadTimeLag: %s\n"+
 		"      * SuccessWithRetryLag: [from received  : %s, from event time: %s]\n"+
 		"      * SuccessLag: [from received  : %s, from event time: %s]\n"+
+		"  - ChangeStream Read Performance:\n"+
+		"      * Next Latency: %s | Event Size: avg %.1f bytes (total %s)\n"+
 		"%s\n"+
 		"%s\n"+
 		"%s",
@@ -896,9 +890,57 @@ func (sm *StatsManager) ReportStats() {
 		formatLag(lagRes.SuccessWithRetryTimeToEventTime),
 		formatLag(lagRes.SuccessTimeToWorkerReceivedLag),
 		formatLag(lagRes.SuccessTimeToEventTimeLag),
+		avgReadLatency.Round(time.Microsecond),
+		avgReadSize,
+		formatBytes(totalReadSizeBytes),
 		dlqStatsStr,
 		failureBreakdownStr,
 		poolStatsStr)
+
+	sm.log.Info(msg)
+}
+
+// ReportDryRunStats logs the dry-run statistics, resetting dry-run specific counters.
+func (sm *StatsManager) ReportDryRunStats() {
+	// Reset and load dry-run atomic counters atomically
+	totalReadLatencyNs := atomic.SwapInt64(&sm.totalReadLatencyNs, 0)
+	readCount := atomic.SwapInt64(&sm.readCount, 0)
+	totalReadSizeBytes := atomic.SwapInt64(&sm.totalReadSizeBytes, 0)
+
+	sm.mu.Lock()
+	now := time.Now()
+	duration := now.Sub(sm.lastStatsTime)
+	sm.lastStatsTime = now
+	sm.mu.Unlock()
+
+	var rateProcessed float64
+	if duration.Seconds() > 0 {
+		rateProcessed = float64(readCount) / duration.Seconds()
+	}
+
+	avgLatency := time.Duration(0)
+	avgSize := 0.0
+	if readCount > 0 {
+		avgLatency = time.Duration(totalReadLatencyNs / readCount)
+		avgSize = float64(totalReadSizeBytes) / float64(readCount)
+	}
+
+	// Format connection pool stats
+	sourcePoolStr := sm.formatPoolStats(&sm.sourcePool, "Source", duration)
+	targetPoolStr := sm.formatPoolStats(&sm.targetPool, "Target", duration)
+
+	msg := fmt.Sprintf("Change stream statistics in dry-run live-only mode (last %v):\n"+
+		"  - Read: %d (%.2f events/sec) | Next Latency: avg %s | Event Size: avg %.1f bytes (total %s)\n"+
+		"  - Connection Pool:\n"+
+		"      * %s\n"+
+		"      * %s",
+		duration.Round(time.Second),
+		readCount, rateProcessed,
+		avgLatency.Round(time.Microsecond),
+		avgSize,
+		formatBytes(totalReadSizeBytes),
+		sourcePoolStr,
+		targetPoolStr)
 
 	sm.log.Info(msg)
 }
@@ -925,4 +967,17 @@ func calculatePercentiles(values []int) (int, int, int) {
 	p100 := activeValues[len(activeValues)-1]
 
 	return p50, p90, p100
+}
+
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
