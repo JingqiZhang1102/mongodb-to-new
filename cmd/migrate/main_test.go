@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-func TestParseCdcStartTime(t *testing.T) {
+func TestParseLiveStartTime(t *testing.T) {
 	tests := []struct {
 		name        string
 		input       string

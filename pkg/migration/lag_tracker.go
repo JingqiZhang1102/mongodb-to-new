@@ -6,12 +6,12 @@ import (
 
 // LagFlushResult represents the averaged lag metrics flushed from LagTracker
 type LagFlushResult struct {
-	ReadToEventTimeLag                      time.Duration
-	WorkerReceivedToReadTimeLag             time.Duration
-	SuccessTimeToWorkerReceivedLag          time.Duration
-	SuccessTimeToEventTimeLag               time.Duration
-	SuccessWithRetryTimeToEventTime         time.Duration
-	SuccessWithRetryLagToWorkerReceivedTime time.Duration
+	EventToReadLag             time.Duration
+	ReadToWorkerReceiveLag     time.Duration
+	ReceiveToApplyLag          time.Duration
+	EndToEndLag                time.Duration
+	EndToEndWithRetryLag       time.Duration
+	ReceiveToApplyWithRetryLag time.Duration
 }
 
 // metricAccumulator unifies duration sum and event count for simple averaging
@@ -37,17 +37,17 @@ func (m *metricAccumulator) Reset() {
 	m.count = 0
 }
 
-// LagTracker tracks replication lag measurements (mutex-free, relies on parent locking)
+// LagTracker tracks replication lag measurements
 type LagTracker struct {
-	readToEventTime                      metricAccumulator
-	workerReceivedToReadTime             metricAccumulator
-	successTimeToWorkerReceived          metricAccumulator
-	successTimeToEventTime               metricAccumulator
-	successWithRetryTimeToEventTime         metricAccumulator
-	successWithRetryLagToWorkerReceivedTime metricAccumulator
+	eventToRead               metricAccumulator
+	readToWorkerReceive       metricAccumulator
+	receiveToApply            metricAccumulator
+	endToEnd                  metricAccumulator
+	endToEndWithRetry         metricAccumulator
+	receiveToApplyWithRetry   metricAccumulator
 }
 
-// NewLagTracker creates a new instance of LagTracker
+// NewPartitionTracker creates a new instance of LagTracker (NewLagTracker signature alias)
 func NewLagTracker() *LagTracker {
 	return &LagTracker{}
 }
@@ -60,26 +60,26 @@ func (lt *LagTracker) RecordLags(ops []WriteOperation) {
 		}
 
 		if !op.ReadTime.IsZero() && !op.EventTime.IsZero() {
-			lt.readToEventTime.Add(op.ReadTime.Sub(op.EventTime))
+			lt.eventToRead.Add(op.ReadTime.Sub(op.EventTime))
 		}
 
 		if !op.WorkerReceiveTime.IsZero() && !op.ReadTime.IsZero() {
-			lt.workerReceivedToReadTime.Add(op.WorkerReceiveTime.Sub(op.ReadTime))
+			lt.readToWorkerReceive.Add(op.WorkerReceiveTime.Sub(op.ReadTime))
 		}
 
 		if op.SuccessAfterRetry {
 			if !op.EventTime.IsZero() {
-				lt.successWithRetryTimeToEventTime.Add(op.SuccessTime.Sub(op.EventTime))
+				lt.endToEndWithRetry.Add(op.SuccessTime.Sub(op.EventTime))
 			}
 			if !op.WorkerReceiveTime.IsZero() {
-				lt.successWithRetryLagToWorkerReceivedTime.Add(op.SuccessTime.Sub(op.WorkerReceiveTime))
+				lt.receiveToApplyWithRetry.Add(op.SuccessTime.Sub(op.WorkerReceiveTime))
 			}
 		} else {
 			if !op.WorkerReceiveTime.IsZero() {
-				lt.successTimeToWorkerReceived.Add(op.SuccessTime.Sub(op.WorkerReceiveTime))
+				lt.receiveToApply.Add(op.SuccessTime.Sub(op.WorkerReceiveTime))
 			}
 			if !op.EventTime.IsZero() {
-				lt.successTimeToEventTime.Add(op.SuccessTime.Sub(op.EventTime))
+				lt.endToEnd.Add(op.SuccessTime.Sub(op.EventTime))
 			}
 		}
 	}
@@ -88,20 +88,20 @@ func (lt *LagTracker) RecordLags(ops []WriteOperation) {
 // Flush returns the accumulated lag averages, then resets internal counters
 func (lt *LagTracker) Flush() LagFlushResult {
 	res := LagFlushResult{
-		ReadToEventTimeLag:                      lt.readToEventTime.Average(),
-		WorkerReceivedToReadTimeLag:             lt.workerReceivedToReadTime.Average(),
-		SuccessTimeToWorkerReceivedLag:          lt.successTimeToWorkerReceived.Average(),
-		SuccessTimeToEventTimeLag:               lt.successTimeToEventTime.Average(),
-		SuccessWithRetryTimeToEventTime:         lt.successWithRetryTimeToEventTime.Average(),
-		SuccessWithRetryLagToWorkerReceivedTime: lt.successWithRetryLagToWorkerReceivedTime.Average(),
+		EventToReadLag:             lt.eventToRead.Average(),
+		ReadToWorkerReceiveLag:     lt.readToWorkerReceive.Average(),
+		ReceiveToApplyLag:          lt.receiveToApply.Average(),
+		EndToEndLag:                lt.endToEnd.Average(),
+		EndToEndWithRetryLag:       lt.endToEndWithRetry.Average(),
+		ReceiveToApplyWithRetryLag: lt.receiveToApplyWithRetry.Average(),
 	}
 
-	lt.readToEventTime.Reset()
-	lt.workerReceivedToReadTime.Reset()
-	lt.successTimeToWorkerReceived.Reset()
-	lt.successTimeToEventTime.Reset()
-	lt.successWithRetryTimeToEventTime.Reset()
-	lt.successWithRetryLagToWorkerReceivedTime.Reset()
+	lt.eventToRead.Reset()
+	lt.readToWorkerReceive.Reset()
+	lt.receiveToApply.Reset()
+	lt.endToEnd.Reset()
+	lt.endToEndWithRetry.Reset()
+	lt.receiveToApplyWithRetry.Reset()
 
 	return res
 }

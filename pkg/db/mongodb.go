@@ -130,9 +130,10 @@ func (m *MongoDB) CreateChangeStream(ctx context.Context, collectionName string,
 // It accepts both a resumeToken and a cdcStartTime:
 // - If resumeToken is provided, it takes precedence and instructs the driver to resume from a specific checkpoint.
 // - If resumeToken is nil but cdcStartTime is specified, it configures SetStartAtOperationTime to begin reading changes from that exact historical moment.
-func (m *MongoDB) CreateClientLevelChangeStream(ctx context.Context, resumeToken interface{}, cdcStartTime *primitive.Timestamp, batchSize int) (*mongo.ChangeStream, error) {
-	// Set pipeline for full document lookup on updates
-	pipeline := mongo.Pipeline{}
+func (m *MongoDB) CreateClientLevelChangeStream(ctx context.Context, resumeToken interface{}, cdcStartTime *primitive.Timestamp, batchSize int, pipeline mongo.Pipeline) (*mongo.ChangeStream, error) {
+	if pipeline == nil {
+		pipeline = mongo.Pipeline{}
+	}
 
 	// Set options
 	opts := options.ChangeStream().SetFullDocument(options.UpdateLookup)

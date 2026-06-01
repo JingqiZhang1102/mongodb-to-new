@@ -24,7 +24,7 @@ func main() {
 	mode := flag.String("mode", "migrate", "Operation mode: 'migrate', 'live', or 'live-only'")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	logFile := flag.String("log-file", "", "Path to log file (logs to both stdout and file when specified)")
-	cdcStartTimeStr := flag.String("cdc-start-timestamp", "", "Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)")
+	liveStartTimeStr := flag.String("live-start-timestamp", "", "Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)")
 	dontApply := flag.Bool("dont-apply", false, "Don't apply mode (live-only migrations only, drops all target writes)")
 	dryRun := flag.Bool("dry-run", false, "Dry run mode (live-only migrations only, drops all events in reader)")
 	help := flag.Bool("help", false, "Display help information")
@@ -81,21 +81,21 @@ func main() {
 		log.Fatal("Error: -dont-apply and -dry-run are mutually exclusive")
 	}
 
-	// Parse and validate cdc-start-timestamp option.
+	// Parse and validate -live-start-timestamp option.
 	// This flag specifies a custom historical starting point (Unix epoch seconds or RFC3339 date)
 	// from which the incremental change stream/oplog replication should begin.
 	// Note: This is only valid in "live-only" mode because standard migration modes always
 	// automatically capture the starting position prior to performing the initial copy phase.
-	var cdcStartTime *primitive.Timestamp
-	if *cdcStartTimeStr != "" {
+	var liveStartTime *primitive.Timestamp
+	if *liveStartTimeStr != "" {
 		if *mode != "live-only" {
-			log.Fatal("Error: -cdc-start-timestamp can only be specified when -mode is 'live-only'")
+			log.Fatal("Error: -live-start-timestamp can only be specified when -mode is 'live-only'")
 		}
-		ts, err := parseStartTimestamp(*cdcStartTimeStr)
+		ts, err := parseStartTimestamp(*liveStartTimeStr)
 		if err != nil {
-			log.Fatalf("Failed to parse -cdc-start-timestamp: %v", err)
+			log.Fatalf("Failed to parse -live-start-timestamp: %v", err)
 		}
-		cdcStartTime = ts
+		liveStartTime = ts
 	}
 
 	// Create context with cancellation
@@ -118,7 +118,7 @@ func main() {
 
 	// Create migrator
 	migrator := migration.NewMigrator(cfg, log)
-	migrator.CdcStartTime = cdcStartTime
+	migrator.LiveStartTime = liveStartTime
 	migrator.DontApply = *dontApply
 	migrator.DryRun = *dryRun
 
@@ -165,12 +165,12 @@ func displayUsage() {
 	fmt.Println("            Perform real-time incremental replication only. Skips the initial data")
 	fmt.Println("            copy phase. Starts streaming real-time changes from the last saved resume token")
 	fmt.Println("            (or current moment if none exists), or from a custom position when")
-	fmt.Println("            -cdc-start-timestamp is specified.")
+	fmt.Println("            -live-start-timestamp is specified.")
 	fmt.Println("  -log-level string")
 	fmt.Println("        Log level: debug, info, warn, error (default \"info\")")
 	fmt.Println("  -log-file string")
 	fmt.Println("        Path to log file (logs to both stdout and file when specified)")
-	fmt.Println("  -cdc-start-timestamp string")
+	fmt.Println("  -live-start-timestamp string")
 	fmt.Println("        Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)")
 	fmt.Println("        Debian command-line examples to get 'now':")
 	fmt.Printf("          * Unix epoch seconds:             date +%%s\n")
@@ -186,9 +186,9 @@ func displayUsage() {
 	fmt.Println("  migrate -mode=live-only")
 	fmt.Println("  migrate -mode=live-only -dont-apply")
 	fmt.Println("  migrate -mode=live-only -dry-run")
-	fmt.Println("  migrate -mode=live-only -cdc-start-timestamp=1716234000")
-	fmt.Println("  migrate -mode=live-only -cdc-start-timestamp=2026-05-20T21:00:00Z -dont-apply")
-	fmt.Println("  migrate -mode=live-only -cdc-start-timestamp=2026-05-20T21:00:00Z -dry-run")
+	fmt.Println("  migrate -mode=live-only -live-start-timestamp=1716234000")
+	fmt.Println("  migrate -mode=live-only -live-start-timestamp=2026-05-20T21:00:00Z -dont-apply")
+	fmt.Println("  migrate -mode=live-only -live-start-timestamp=2026-05-20T21:00:00Z -dry-run")
 	fmt.Println("  migrate -config=custom_config.json -mode=migrate -log-level=debug")
 	fmt.Println("  migrate -mode=live -log-file=migration.log")
 }

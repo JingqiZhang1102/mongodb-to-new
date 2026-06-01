@@ -73,7 +73,7 @@ func (r *OplogReplicator) AddCollection(sourceDB, targetDB string, collConfig co
 }
 
 // StartReplication starts the oplog-based replication
-func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp interface{}, timestampPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, liveOnly bool, cdcStartTime *primitive.Timestamp, migrator *Migrator) error {
+func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp interface{}, timestampPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, liveOnly bool, liveStartTime *primitive.Timestamp, migrator *Migrator) error {
 	// Abort if the initial migration state was completed with failures, or if DLQ has entries
 	if initialMigrationState != nil && initialMigrationState.Status == StatusCompletedWithFailures {
 		return fmt.Errorf("cannot start replication: initial migration completed with failures in a previous run")
@@ -87,11 +87,11 @@ func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp 
 	}
 
 	// Enforce safety invariants between Initial Migration State and Oplog Timestamp Checkpoint
-	if cdcStartTime != nil && globalTimestamp != nil {
-		return fmt.Errorf("safety violation: a custom cdc-start-timestamp is specified, but a global oplog timestamp checkpoint already exists. Clean up checkpoint file or omit cdc-start-timestamp to resume from the last checkpoint")
+	if liveStartTime != nil && globalTimestamp != nil {
+		return fmt.Errorf("safety violation: a custom live-start-timestamp is specified, but a global oplog timestamp checkpoint already exists. Clean up checkpoint file or omit live-start-timestamp to resume from the last checkpoint")
 	}
 
-	if cdcStartTime == nil {
+	if liveStartTime == nil {
 		if initialMigrationState == nil {
 			if globalTimestamp != nil {
 				return fmt.Errorf("safety violation: initial migration state file does not exist, but a global oplog timestamp checkpoint exists. Clean up checkpoint file or ensure state is in sync before proceeding")
@@ -140,13 +140,13 @@ func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp 
 	}
 
 	// If no saved timestamp is found in the checkpoint files, determine the starting point:
-	// - If the user passed a custom historical cdcStartTime, use that as our starting tailing position.
+	// - If the user passed a custom historical liveStartTime, use that as our starting tailing position.
 	// - Otherwise, fetch the current cluster time from the primary to replicate starting from "now".
 	if savedTimestamp == nil {
-		if cdcStartTime != nil {
-			r.log.Infof("Using user-provided cdcStartTime: %s", time.Unix(int64(cdcStartTime.T), 0).UTC().Format(time.RFC3339))
-			afterTimestamp = *cdcStartTime
-			savedTimestamp = &OplogTimestamp{Timestamp: *cdcStartTime}
+		if liveStartTime != nil {
+			r.log.Infof("Using user-provided liveStartTime: %s", time.Unix(int64(liveStartTime.T), 0).UTC().Format(time.RFC3339))
+			afterTimestamp = *liveStartTime
+			savedTimestamp = &OplogTimestamp{Timestamp: *liveStartTime}
 		} else {
 			if liveOnly {
 				r.log.Info("No oplog timestamp found in live-only mode. Obtaining current cluster time to start incremental replication.")
@@ -550,5 +550,5 @@ func (r *OplogReplicator) distributeOplogEvent(ctx context.Context, op *gtm.Op, 
 	changeEvent["readTime"] = time.Now()
 
 	// Send raw event to appropriate worker concurrently
-	workers[workerIndex].incomingQueue <- changeEvent
+	workers[workerIndex].batchingQueue <- changeEvent
 }

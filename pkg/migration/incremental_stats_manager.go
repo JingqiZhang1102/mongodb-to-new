@@ -38,7 +38,7 @@ func opIndex(opType string) int {
 }
 
 type opStats struct {
-	received              int64
+	workerReceived        int64
 	processed             int64
 	failed                int64
 	dlq                   int64
@@ -58,8 +58,18 @@ type poolMonitorStats struct {
 	waitDuration int64
 }
 
-// StatsManager coordinates statistics and replication lag tracking thread-safely
-type StatsManager struct {
+// PartitionReadStats stores incremental read latency and byte metrics for a specific thread partition.
+// It includes manual struct alignment padding to exactly 64 bytes to prevent CPU Cache Line Bouncing (False Sharing)
+// when multiple reader goroutines are concurrently writing to adjacent memory sectors!
+type PartitionReadStats struct {
+	TotalReadLatencyNs int64    // 8 bytes
+	ReadCount          int64    // 8 bytes
+	TotalReadSizeBytes int64    // 8 bytes
+	_                  [40]byte // Padding to align to exactly 64-byte CPU cache lines
+}
+
+// IncrementalStatsManager coordinates statistics and replication lag tracking thread-safely
+type IncrementalStatsManager struct {
 	mu                   sync.Mutex
 	lastStatsTime        time.Time
 	lagTracker           *LagTracker
@@ -68,6 +78,11 @@ type StatsManager struct {
 	groupOpsByDistinctId bool
 	DontApply            bool
 	DryRun               bool
+
+	bulkWriteLatenciesHistogram [30000]int64
+
+	// Partition-level read performance statistics (flat array of size 128 for lock-free max speeds!)
+	partitionReadStats [128]PartitionReadStats
 
 	// Unified operation statistics
 	opsStats [5]opStats
@@ -87,7 +102,6 @@ type StatsManager struct {
 	readCount          int64
 	totalReadSizeBytes int64
 
-
 	// Group flush reasons (atomically tracked)
 	groupFlushesOpType    int64
 	groupFlushesBatchFull int64
@@ -105,29 +119,148 @@ type StatsManager struct {
 	failureMu        sync.Mutex
 	failureBreakdown map[string]map[string]int64 // opType -> simplified error message -> count
 
+	skippedEventsMu sync.Mutex
+	skippedEvents   map[string]int64 // opType -> count (resets every reporting interval)
+
 	// Connection Pool stats (atomically tracked)
 	sourcePool poolMonitorStats
 	targetPool poolMonitorStats
+
+	// Queue snapshot support (protected by mu lock)
+	workers     []*Worker
+	ingestQueue chan QueueEvent
+
+	// Stall / Backpressure stats (atomically tracked)
+	batchingQueueStallNs   int64
+	batchWriteQueueStallNs int64
+
+	// Queue latency delays (atomically tracked)
+	ingestQueueWaitNs      int64
+	ingestQueueWaitCount   int64
+	batchingQueueWaitNs    int64
+	batchingQueueWaitCount int64
 }
 
-// NewStatsManager creates a new StatsManager
-func NewStatsManager(log *logger.Logger, interval time.Duration, groupOpsByDistinctId ...bool) *StatsManager {
+// RegisterQueues registers the worker pool and ingest queue for monitoring in the IncrementalStatsManager
+func (sm *IncrementalStatsManager) RegisterQueues(workers []*Worker, ingestQueue chan QueueEvent) {
+	if sm == nil {
+		return
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.workers = workers
+	sm.ingestQueue = ingestQueue
+}
+
+// RecordBatchingQueueStall increments the cumulative distributor channel block stall duration
+func (sm *IncrementalStatsManager) RecordBatchingQueueStall(d time.Duration) {
+	if sm == nil {
+		return
+	}
+	atomic.AddInt64(&sm.batchingQueueStallNs, int64(d))
+}
+
+// RecordBatchWriteQueueStall increments the cumulative worker batch write queue block stall duration
+func (sm *IncrementalStatsManager) RecordBatchWriteQueueStall(d time.Duration) {
+	if sm == nil {
+		return
+	}
+	atomic.AddInt64(&sm.batchWriteQueueStallNs, int64(d))
+}
+
+// RecordQueueDelays tracks individual ingest and batching queue wait latencies
+func (sm *IncrementalStatsManager) RecordQueueDelays(ingestDelay time.Duration, batchingDelay time.Duration) {
+	if sm == nil {
+		return
+	}
+	atomic.AddInt64(&sm.ingestQueueWaitNs, int64(ingestDelay))
+	atomic.AddInt64(&sm.ingestQueueWaitCount, 1)
+	atomic.AddInt64(&sm.batchingQueueWaitNs, int64(batchingDelay))
+	atomic.AddInt64(&sm.batchingQueueWaitCount, 1)
+}
+
+// getQueueDepthsSnapshot returns a formatted string of queue depths and utilization percentages safely
+func (sm *IncrementalStatsManager) getQueueDepthsSnapshot() string {
+	if sm == nil {
+		return "N/A"
+	}
+	sm.mu.Lock()
+	workers := sm.workers
+	ingestQueue := sm.ingestQueue
+	sm.mu.Unlock()
+
+	if len(workers) == 0 {
+		return "N/A"
+	}
+
+	var totalBatchingLen, totalBatchingCap int64
+	var totalBatchWriteLen, totalBatchWriteCap int64
+	var maxBatchingUtil float64
+	var maxBatchingWorkerID int
+
+	for _, w := range workers {
+		if w == nil {
+			continue
+		}
+		incLen := int64(len(w.batchingQueue))
+		incCap := int64(cap(w.batchingQueue))
+		procLen := int64(len(w.batchWriteQueue))
+		procCap := int64(cap(w.batchWriteQueue))
+
+		totalBatchingLen += incLen
+		totalBatchingCap += incCap
+		totalBatchWriteLen += procLen
+		totalBatchWriteCap += procCap
+
+		if incCap > 0 {
+			util := float64(incLen) / float64(incCap)
+			if util > maxBatchingUtil {
+				maxBatchingUtil = util
+				maxBatchingWorkerID = w.id
+			}
+		}
+	}
+
+	ingestUtil := 0.0
+	if ingestQueue != nil && cap(ingestQueue) > 0 {
+		ingestUtil = float64(len(ingestQueue)) / float64(cap(ingestQueue)) * 100
+	}
+
+	avgBatchingUtil := 0.0
+	if totalBatchingCap > 0 {
+		avgBatchingUtil = float64(totalBatchingLen) / float64(totalBatchingCap) * 100
+	}
+
+	avgBatchWriteUtil := 0.0
+	if totalBatchWriteCap > 0 {
+		avgBatchWriteUtil = float64(totalBatchWriteLen) / float64(totalBatchWriteCap) * 100
+	}
+
+	return fmt.Sprintf(
+		"Ingest: %.1f%% | Batching: [avg: %.1f%%, max: %.1f%% on Worker %d] | Batch Write: [avg: %.1f%%]",
+		ingestUtil, avgBatchingUtil, maxBatchingUtil*100, maxBatchingWorkerID, avgBatchWriteUtil,
+	)
+}
+
+// NewIncrementalStatsManager creates a new IncrementalStatsManager
+func NewIncrementalStatsManager(log *logger.Logger, interval time.Duration, groupOpsByDistinctId ...bool) *IncrementalStatsManager {
 	distinctId := false
 	if len(groupOpsByDistinctId) > 0 {
 		distinctId = groupOpsByDistinctId[0]
 	}
-	return &StatsManager{
+	return &IncrementalStatsManager{
 		lastStatsTime:        time.Now(),
 		lagTracker:           NewLagTracker(),
 		log:                  log,
 		statsInterval:        interval,
 		groupOpsByDistinctId: distinctId,
 		failureBreakdown:     make(map[string]map[string]int64),
+		skippedEvents:        make(map[string]int64),
 	}
 }
 
 // RecordLags records processing lag for a batch of operations and increments processed events count
-func (sm *StatsManager) RecordLags(ops []WriteOperation) {
+func (sm *IncrementalStatsManager) RecordLags(ops []WriteOperation) {
 	if sm == nil {
 		return
 	}
@@ -147,7 +280,7 @@ func (sm *StatsManager) RecordLags(ops []WriteOperation) {
 }
 
 // Start begins the periodic statistics reporting loop
-func (sm *StatsManager) Start(ctx context.Context) {
+func (sm *IncrementalStatsManager) Start(ctx context.Context) {
 	ticker := time.NewTicker(sm.statsInterval)
 	go func() {
 		defer ticker.Stop()
@@ -167,7 +300,7 @@ func (sm *StatsManager) Start(ctx context.Context) {
 }
 
 // IncrementUpdatedThenDeleted increments the count of updates skipped due to missing fullDocument thread-safely and lock-freely, and counts it in worker processed QPS.
-func (sm *StatsManager) IncrementUpdatedThenDeleted(workerID int) {
+func (sm *IncrementalStatsManager) IncrementUpdatedThenDeleted(workerID int) {
 	if sm == nil {
 		return
 	}
@@ -179,7 +312,7 @@ func (sm *StatsManager) IncrementUpdatedThenDeleted(workerID int) {
 }
 
 // GetUpdatedThenDeleted returns the updatedThenDeleted count thread-safely and lock-freely
-func (sm *StatsManager) GetUpdatedThenDeleted() int {
+func (sm *IncrementalStatsManager) GetUpdatedThenDeleted() int {
 	if sm == nil {
 		return 0
 	}
@@ -187,7 +320,7 @@ func (sm *StatsManager) GetUpdatedThenDeleted() int {
 }
 
 // GetGroupFlushReasonCount returns the count of group flushes for a specific reason thread-safely and lock-freely
-func (sm *StatsManager) GetGroupFlushReasonCount(reason string) int {
+func (sm *IncrementalStatsManager) GetGroupFlushReasonCount(reason string) int {
 	if sm == nil {
 		return 0
 	}
@@ -206,7 +339,7 @@ func (sm *StatsManager) GetGroupFlushReasonCount(reason string) int {
 }
 
 // IncrementSequentialRetries increments the count of sequential retries thread-safely and lock-freely
-func (sm *StatsManager) IncrementSequentialRetries(opType string, count int) {
+func (sm *IncrementalStatsManager) IncrementSequentialRetries(opType string, count int) {
 	if sm == nil {
 		return
 	}
@@ -219,7 +352,7 @@ func (sm *StatsManager) IncrementSequentialRetries(opType string, count int) {
 }
 
 // GetSequentialRetries returns the sequential retries count thread-safely and lock-freely
-func (sm *StatsManager) GetSequentialRetries() int {
+func (sm *IncrementalStatsManager) GetSequentialRetries() int {
 	if sm == nil {
 		return 0
 	}
@@ -227,7 +360,7 @@ func (sm *StatsManager) GetSequentialRetries() int {
 }
 
 // GetOrderedBulkWrites returns the ordered bulk writes count thread-safely and lock-freely
-func (sm *StatsManager) GetOrderedBulkWrites() int {
+func (sm *IncrementalStatsManager) GetOrderedBulkWrites() int {
 	if sm == nil {
 		return 0
 	}
@@ -235,7 +368,7 @@ func (sm *StatsManager) GetOrderedBulkWrites() int {
 }
 
 // GetOrderedBulkWritesSize returns the ordered bulk writes total size thread-safely and lock-freely
-func (sm *StatsManager) GetOrderedBulkWritesSize() int {
+func (sm *IncrementalStatsManager) GetOrderedBulkWritesSize() int {
 	if sm == nil {
 		return 0
 	}
@@ -243,7 +376,7 @@ func (sm *StatsManager) GetOrderedBulkWritesSize() int {
 }
 
 // GetUnorderedBulkWrites returns the unordered bulk writes count thread-safely and lock-freely
-func (sm *StatsManager) GetUnorderedBulkWrites() int {
+func (sm *IncrementalStatsManager) GetUnorderedBulkWrites() int {
 	if sm == nil {
 		return 0
 	}
@@ -251,7 +384,7 @@ func (sm *StatsManager) GetUnorderedBulkWrites() int {
 }
 
 // GetUnorderedBulkWritesSize returns the unordered bulk writes total size thread-safely and lock-freely
-func (sm *StatsManager) GetUnorderedBulkWritesSize() int {
+func (sm *IncrementalStatsManager) GetUnorderedBulkWritesSize() int {
 	if sm == nil {
 		return 0
 	}
@@ -259,7 +392,7 @@ func (sm *StatsManager) GetUnorderedBulkWritesSize() int {
 }
 
 // RecordBulkWrite records a bulk write execution with the given size and ordered status thread-safely and lock-freely
-func (sm *StatsManager) RecordBulkWrite(size int, isOrdered bool) {
+func (sm *IncrementalStatsManager) RecordBulkWrite(size int, isOrdered bool) {
 	if sm == nil {
 		return
 	}
@@ -283,10 +416,18 @@ func (sm *StatsManager) RecordBulkWrite(size int, isOrdered bool) {
 }
 
 // RecordLatency records operation execution latency metrics thread-safely and lock-freely
-func (sm *StatsManager) RecordLatency(opType string, ops []WriteOperation, bulkOpLatency time.Duration, workerID int, success bool) {
+func (sm *IncrementalStatsManager) RecordLatency(opType string, ops []WriteOperation, bulkOpLatency time.Duration, workerID int, success bool) {
 	if sm == nil || len(ops) == 0 {
 		return
 	}
+
+	latencyMs := int64(bulkOpLatency / time.Millisecond)
+	if latencyMs < 0 {
+		latencyMs = 0
+	} else if latencyMs >= 30000 {
+		latencyMs = 29999
+	}
+	atomic.AddInt64(&sm.bulkWriteLatenciesHistogram[latencyMs], 1)
 
 	dbLatency := int64(bulkOpLatency)
 	if sm.groupOpsByDistinctId {
@@ -308,7 +449,7 @@ func (sm *StatsManager) RecordLatency(opType string, ops []WriteOperation, bulkO
 }
 
 // GetAvgBulkWriteLatency returns the average bulk write execution latency for a specific operation type thread-safely and lock-freely
-func (sm *StatsManager) GetAvgBulkWriteLatency(opType string) time.Duration {
+func (sm *IncrementalStatsManager) GetAvgBulkWriteLatency(opType string) time.Duration {
 	if sm == nil {
 		return 0
 	}
@@ -325,7 +466,7 @@ func (sm *StatsManager) GetAvgBulkWriteLatency(opType string) time.Duration {
 }
 
 // IncrementTimeoutFlushes increments the count of timeout flushes thread-safely and lock-freely
-func (sm *StatsManager) IncrementTimeoutFlushes() {
+func (sm *IncrementalStatsManager) IncrementTimeoutFlushes() {
 	if sm == nil {
 		return
 	}
@@ -333,7 +474,7 @@ func (sm *StatsManager) IncrementTimeoutFlushes() {
 }
 
 // GetTimeoutFlushes returns the timeout flushes count thread-safely and lock-freely
-func (sm *StatsManager) GetTimeoutFlushes() int {
+func (sm *IncrementalStatsManager) GetTimeoutFlushes() int {
 	if sm == nil {
 		return 0
 	}
@@ -341,7 +482,7 @@ func (sm *StatsManager) GetTimeoutFlushes() int {
 }
 
 // IncrementDuplicateKeys increments the count of duplicate key errors thread-safely and lock-freely
-func (sm *StatsManager) IncrementDuplicateKeys(count int64) {
+func (sm *IncrementalStatsManager) IncrementDuplicateKeys(count int64) {
 	if sm == nil {
 		return
 	}
@@ -349,7 +490,7 @@ func (sm *StatsManager) IncrementDuplicateKeys(count int64) {
 }
 
 // GetDuplicateKeys returns the duplicate keys count thread-safely and lock-freely
-func (sm *StatsManager) GetDuplicateKeys() int {
+func (sm *IncrementalStatsManager) GetDuplicateKeys() int {
 	if sm == nil {
 		return 0
 	}
@@ -357,7 +498,7 @@ func (sm *StatsManager) GetDuplicateKeys() int {
 }
 
 // IncrementGroupFlushReason increments the count of group flushes by reason thread-safely and lock-freely
-func (sm *StatsManager) IncrementGroupFlushReason(reason string) {
+func (sm *IncrementalStatsManager) IncrementGroupFlushReason(reason string) {
 	if sm == nil {
 		return
 	}
@@ -374,7 +515,7 @@ func (sm *StatsManager) IncrementGroupFlushReason(reason string) {
 }
 
 // IncrementWorkerProcessed increments the count of successfully processed events by a specific worker thread-safely
-func (sm *StatsManager) IncrementWorkerProcessed(workerID int, count int) {
+func (sm *IncrementalStatsManager) IncrementWorkerProcessed(workerID int, count int) {
 	if sm == nil {
 		return
 	}
@@ -383,29 +524,39 @@ func (sm *StatsManager) IncrementWorkerProcessed(workerID int, count int) {
 	}
 }
 
-// IncrementEventsReceived increments the count of received input events by operation type thread-safely and lock-freely
-func (sm *StatsManager) IncrementEventsReceived(opType string) {
+// IncrementEventsWorkerReceived increments the count of worker received input events by operation type thread-safely and lock-freely
+func (sm *IncrementalStatsManager) IncrementEventsWorkerReceived(opType string) {
 	if sm == nil {
 		return
 	}
 	idx := opIndex(opType)
 	if idx >= 0 {
-		atomic.AddInt64(&sm.opsStats[idx].received, 1)
+		atomic.AddInt64(&sm.opsStats[idx].workerReceived, 1)
 	}
 }
 
-// RecordReadMetric records changeStream.Next latency and document size metrics thread-safely and lock-freely
-func (sm *StatsManager) RecordReadMetric(latency time.Duration, sizeBytes int) {
+// RecordReadMetric records changeStream.Next latency and document size metrics thread-safely and lock-freely by partition stream index.
+func (sm *IncrementalStatsManager) RecordReadMetric(streamIndex int, latency time.Duration, sizeBytes int) {
 	if sm == nil {
 		return
 	}
+
+	// Update legacy/global counters first to maintain full global telemetry compatibility
 	atomic.AddInt64(&sm.totalReadLatencyNs, int64(latency))
 	atomic.AddInt64(&sm.readCount, 1)
 	atomic.AddInt64(&sm.totalReadSizeBytes, int64(sizeBytes))
+
+	// Guard boundaries to protect the fixed-size partition array allocation limits
+	if streamIndex >= 0 && streamIndex < 128 {
+		stats := &sm.partitionReadStats[streamIndex]
+		atomic.AddInt64(&stats.TotalReadLatencyNs, int64(latency))
+		atomic.AddInt64(&stats.ReadCount, 1)
+		atomic.AddInt64(&stats.TotalReadSizeBytes, int64(sizeBytes))
+	}
 }
 
 // IncrementEventsProcessed increments the count of successfully processed events by operation type thread-safely and lock-freely
-func (sm *StatsManager) IncrementEventsProcessed(opType string, count int64) {
+func (sm *IncrementalStatsManager) IncrementEventsProcessed(opType string, count int64) {
 	if sm == nil {
 		return
 	}
@@ -413,6 +564,33 @@ func (sm *StatsManager) IncrementEventsProcessed(opType string, count int64) {
 	if idx >= 0 {
 		atomic.AddInt64(&sm.opsStats[idx].processed, count)
 	}
+}
+
+// RecordSkippedEvent records a skipped change event of a specific type thread-safely.
+// This supports tracking skipped DDL, non-DML, or unprocessable events.
+func (sm *IncrementalStatsManager) RecordSkippedEvent(opType string) {
+	if sm == nil {
+		return
+	}
+	sm.skippedEventsMu.Lock()
+	defer sm.skippedEventsMu.Unlock()
+	if sm.skippedEvents == nil {
+		sm.skippedEvents = make(map[string]int64)
+	}
+	sm.skippedEvents[opType]++
+}
+
+// GetSkippedEventsCount returns the count of skipped events of the given type thread-safely
+func (sm *IncrementalStatsManager) GetSkippedEventsCount(opType string) int64 {
+	if sm == nil {
+		return 0
+	}
+	sm.skippedEventsMu.Lock()
+	defer sm.skippedEventsMu.Unlock()
+	if sm.skippedEvents == nil {
+		return 0
+	}
+	return sm.skippedEvents[opType]
 }
 
 func simplifyError(errStr string) string {
@@ -429,7 +607,7 @@ func simplifyError(errStr string) string {
 }
 
 // IncrementEventsFailed increments the count of failed write operations by operation type thread-safely and lock-freely
-func (sm *StatsManager) IncrementEventsFailed(opType string, dlqed bool, err error) {
+func (sm *IncrementalStatsManager) IncrementEventsFailed(opType string, dlqed bool, err error) {
 	if sm == nil {
 		return
 	}
@@ -458,7 +636,7 @@ func (sm *StatsManager) IncrementEventsFailed(opType string, dlqed bool, err err
 }
 
 // GetDLQCount returns the count of DLQ'ed documents of the given type thread-safely and lock-freely
-func (sm *StatsManager) GetDLQCount(opType string) int {
+func (sm *IncrementalStatsManager) GetDLQCount(opType string) int {
 	if sm == nil {
 		return 0
 	}
@@ -470,7 +648,7 @@ func (sm *StatsManager) GetDLQCount(opType string) int {
 }
 
 // GetSourcePoolMonitor returns a MongoDB client PoolMonitor for the source connection pool.
-func (sm *StatsManager) GetSourcePoolMonitor() *event.PoolMonitor {
+func (sm *IncrementalStatsManager) GetSourcePoolMonitor() *event.PoolMonitor {
 	if sm == nil {
 		return nil
 	}
@@ -478,14 +656,14 @@ func (sm *StatsManager) GetSourcePoolMonitor() *event.PoolMonitor {
 }
 
 // GetTargetPoolMonitor returns a MongoDB client PoolMonitor for the target connection pool.
-func (sm *StatsManager) GetTargetPoolMonitor() *event.PoolMonitor {
+func (sm *IncrementalStatsManager) GetTargetPoolMonitor() *event.PoolMonitor {
 	if sm == nil {
 		return nil
 	}
 	return sm.createPoolMonitor(&sm.targetPool)
 }
 
-func (sm *StatsManager) createPoolMonitor(stats *poolMonitorStats) *event.PoolMonitor {
+func (sm *IncrementalStatsManager) createPoolMonitor(stats *poolMonitorStats) *event.PoolMonitor {
 	return &event.PoolMonitor{
 		Event: func(evt *event.PoolEvent) {
 			switch evt.Type {
@@ -510,7 +688,7 @@ func (sm *StatsManager) createPoolMonitor(stats *poolMonitorStats) *event.PoolMo
 	}
 }
 
-func (sm *StatsManager) formatPoolStats(stats *poolMonitorStats, name string, duration time.Duration) string {
+func (sm *IncrementalStatsManager) formatPoolStats(stats *poolMonitorStats, name string, duration time.Duration) string {
 	opened := atomic.SwapInt64(&stats.opened, 0)
 	closed := atomic.SwapInt64(&stats.closed, 0)
 	open := atomic.LoadInt64(&stats.open)
@@ -546,7 +724,7 @@ func (sm *StatsManager) formatPoolStats(stats *poolMonitorStats, name string, du
 }
 
 // GetProcessedCount returns the count of processed events of the given type thread-safely and lock-freely
-func (sm *StatsManager) GetProcessedCount(opType string) int {
+func (sm *IncrementalStatsManager) GetProcessedCount(opType string) int {
 	if sm == nil {
 		return 0
 	}
@@ -557,21 +735,20 @@ func (sm *StatsManager) GetProcessedCount(opType string) int {
 	return 0
 }
 
-
-// GetReceivedCount returns the count of received events of the given type thread-safely and lock-freely
-func (sm *StatsManager) GetReceivedCount(opType string) int {
+// GetWorkerReceivedCount returns the count of worker received events of the given type thread-safely and lock-freely
+func (sm *IncrementalStatsManager) GetWorkerReceivedCount(opType string) int {
 	if sm == nil {
 		return 0
 	}
 	idx := opIndex(opType)
 	if idx >= 0 {
-		return int(atomic.LoadInt64(&sm.opsStats[idx].received))
+		return int(atomic.LoadInt64(&sm.opsStats[idx].workerReceived))
 	}
 	return 0
 }
 
 // GetFailedCount returns the count of failed events of the given type thread-safely and lock-freely
-func (sm *StatsManager) GetFailedCount(opType string) int {
+func (sm *IncrementalStatsManager) GetFailedCount(opType string) int {
 	if sm == nil {
 		return 0
 	}
@@ -583,7 +760,7 @@ func (sm *StatsManager) GetFailedCount(opType string) int {
 }
 
 // ReportStats logs the accumulated change stream and lag statistics, resetting internal counters
-func (sm *StatsManager) ReportStats() {
+func (sm *IncrementalStatsManager) ReportStats() {
 	// Reset and load atomic counters atomically using atomic.SwapInt64
 	updatedThenDeleted := atomic.SwapInt64(&sm.updatedThenDeletedSinceLastStats, 0)
 	sequentialRetries := atomic.SwapInt64(&sm.sequentialRetriesSinceLastStats, 0)
@@ -598,6 +775,25 @@ func (sm *StatsManager) ReportStats() {
 	readCount := atomic.SwapInt64(&sm.readCount, 0)
 	totalReadSizeBytes := atomic.SwapInt64(&sm.totalReadSizeBytes, 0)
 
+	batchingQueueStall := time.Duration(atomic.SwapInt64(&sm.batchingQueueStallNs, 0))
+	batchWriteQueueStall := time.Duration(atomic.SwapInt64(&sm.batchWriteQueueStallNs, 0))
+
+	ingestQueueWaitNs := atomic.SwapInt64(&sm.ingestQueueWaitNs, 0)
+	ingestQueueWaitCount := atomic.SwapInt64(&sm.ingestQueueWaitCount, 0)
+	batchingQueueWaitNs := atomic.SwapInt64(&sm.batchingQueueWaitNs, 0)
+	batchingQueueWaitCount := atomic.SwapInt64(&sm.batchingQueueWaitCount, 0)
+
+	var latenciesSnapshot [30000]int64
+	var totalWriteCount int64
+	for i := 0; i < 30000; i++ {
+		val := atomic.SwapInt64(&sm.bulkWriteLatenciesHistogram[i], 0)
+		latenciesSnapshot[i] = val
+		totalWriteCount += val
+	}
+
+	// Atomically swap and snapshot partition-specific metrics lock-freely from flat array
+	partitionSnapshot, partitionIndices := sm.swapPartitionStats()
+
 	groupFlushesOpType := atomic.SwapInt64(&sm.groupFlushesOpType, 0)
 	groupFlushesBatchFull := atomic.SwapInt64(&sm.groupFlushesBatchFull, 0)
 	groupFlushesNamespace := atomic.SwapInt64(&sm.groupFlushesNamespace, 0)
@@ -608,9 +804,14 @@ func (sm *StatsManager) ReportStats() {
 	sm.failureBreakdown = make(map[string]map[string]int64)
 	sm.failureMu.Unlock()
 
+	sm.skippedEventsMu.Lock()
+	intervalSkipped := sm.skippedEvents
+	sm.skippedEvents = make(map[string]int64)
+	sm.skippedEventsMu.Unlock()
+
 	var swapped [5]opStats
 	for i := 0; i < 5; i++ {
-		swapped[i].received = atomic.SwapInt64(&sm.opsStats[i].received, 0)
+		swapped[i].workerReceived = atomic.SwapInt64(&sm.opsStats[i].workerReceived, 0)
 		swapped[i].processed = atomic.SwapInt64(&sm.opsStats[i].processed, 0)
 		swapped[i].failed = atomic.SwapInt64(&sm.opsStats[i].failed, 0)
 		swapped[i].dlq = atomic.SwapInt64(&sm.opsStats[i].dlq, 0)
@@ -647,12 +848,22 @@ func (sm *StatsManager) ReportStats() {
 	}
 	sm.mu.Unlock()
 
-	eventsReceived := swapped[opInsert].received + swapped[opUpdate].received + swapped[opDelete].received + swapped[opReplace].received + swapped[opMixed].received
+	avgIngestQueueDelay := time.Duration(0)
+	if ingestQueueWaitCount > 0 {
+		avgIngestQueueDelay = time.Duration(ingestQueueWaitNs / ingestQueueWaitCount)
+	}
+	avgBatchingQueueDelay := time.Duration(0)
+	if batchingQueueWaitCount > 0 {
+		avgBatchingQueueDelay = time.Duration(batchingQueueWaitNs / batchingQueueWaitCount)
+	}
+	queueDepthsStr := sm.getQueueDepthsSnapshot()
+
+	eventsWorkerReceived := swapped[opInsert].workerReceived + swapped[opUpdate].workerReceived + swapped[opDelete].workerReceived + swapped[opReplace].workerReceived + swapped[opMixed].workerReceived
 	eventsFailed := swapped[opInsert].failed + swapped[opUpdate].failed + swapped[opDelete].failed + swapped[opReplace].failed + swapped[opMixed].failed
 
-	insertsReceived := swapped[opInsert].received
-	updatesReceived := swapped[opUpdate].received + swapped[opReplace].received
-	deletesReceived := swapped[opDelete].received
+	insertsWorkerReceived := swapped[opInsert].workerReceived
+	updatesWorkerReceived := swapped[opUpdate].workerReceived + swapped[opReplace].workerReceived
+	deletesWorkerReceived := swapped[opDelete].workerReceived
 
 	insertsFailed := swapped[opInsert].failed
 	updatesFailed := swapped[opUpdate].failed + swapped[opReplace].failed
@@ -675,17 +886,17 @@ func (sm *StatsManager) ReportStats() {
 		avgReadSize = float64(totalReadSizeBytes) / float64(readCount)
 	}
 
-	var rateReceived, rateProcessed, rateApplied, rateFailed, rateUpdatedThenDeleted float64
+	var rateWorkerReceived, rateProcessed, rateApplied, rateFailed, rateUpdatedThenDeleted float64
 	var rateInsertsProcessed, rateUpdatesProcessed, rateDeletesProcessed float64
 	var rateInsertsFailed, rateUpdatesFailed, rateDeletesFailed float64
 	var rateSequentialRetries, rateOrderedWrites, rateUnorderedWrites float64
 	var rateTimeoutFlushes, rateGroupFlushesOpType, rateGroupFlushesBatchFull, rateGroupFlushesNamespace, rateGroupFlushesCollision float64
 	var rateDuplicateKeys float64
 
-	var rateInsertsReceived, rateUpdatesReceived, rateDeletesReceived float64
+	var rateInsertsWorkerReceived, rateUpdatesWorkerReceived, rateDeletesWorkerReceived float64
 
 	if duration.Seconds() > 0 {
-		rateReceived = float64(eventsReceived) / duration.Seconds()
+		rateWorkerReceived = float64(eventsWorkerReceived) / duration.Seconds()
 		rateProcessed = float64(eventsProcessed) / duration.Seconds()
 		rateApplied = float64(eventsApplied) / duration.Seconds()
 		rateFailed = float64(eventsFailed) / duration.Seconds()
@@ -701,9 +912,9 @@ func (sm *StatsManager) ReportStats() {
 		rateGroupFlushesNamespace = float64(groupFlushesNamespace) / duration.Seconds()
 		rateGroupFlushesCollision = float64(groupFlushesCollision) / duration.Seconds()
 
-		rateInsertsReceived = float64(insertsReceived) / duration.Seconds()
-		rateUpdatesReceived = float64(updatesReceived) / duration.Seconds()
-		rateDeletesReceived = float64(deletesReceived) / duration.Seconds()
+		rateInsertsWorkerReceived = float64(insertsWorkerReceived) / duration.Seconds()
+		rateUpdatesWorkerReceived = float64(updatesWorkerReceived) / duration.Seconds()
+		rateDeletesWorkerReceived = float64(deletesWorkerReceived) / duration.Seconds()
 
 		rateInsertsProcessed = float64(insertsProcessed) / duration.Seconds()
 		rateUpdatesProcessed = float64(updatesProcessed) / duration.Seconds()
@@ -714,15 +925,12 @@ func (sm *StatsManager) ReportStats() {
 		rateDeletesFailed = float64(deletesFailed) / duration.Seconds()
 	}
 
-	// Calculate ordered and unordered write percentiles
-	var orderedSizesInt []int
-	var unorderedSizesInt []int
-	for i := 0; i < 4096; i++ {
-		orderedSizesInt = append(orderedSizesInt, int(orderedSizes[i]))
-		unorderedSizesInt = append(unorderedSizesInt, int(unorderedSizes[i]))
-	}
-	p50Ordered, p90Ordered, p100Ordered := calculatePercentiles(orderedSizesInt)
-	p50Unordered, p90Unordered, p100Unordered := calculatePercentiles(unorderedSizesInt)
+	// Calculate ordered and unordered write percentiles lock-freely and allocation-freely
+	orderedRes := calculatePercentilesFromHistogram(orderedSizes[:], []float64{0.50, 0.90, 1.00})
+	p50Ordered, p90Ordered, p100Ordered := orderedRes[0], orderedRes[1], orderedRes[2]
+
+	unorderedRes := calculatePercentilesFromHistogram(unorderedSizes[:], []float64{0.50, 0.90, 1.00})
+	p50Unordered, p90Unordered, p100Unordered := unorderedRes[0], unorderedRes[1], unorderedRes[2]
 
 	avgOrderedSizeStr := ""
 	if orderedWrites > 0 {
@@ -762,14 +970,27 @@ func (sm *StatsManager) ReportStats() {
 	}
 	activeWorkers := len(workerQps)
 
-	var wQpsP50, wQpsP70, wQpsP90, wQpsP100 float64
+	var wQpsP50, wQpsP90, wQpsP99, wQpsP100 float64
 	if activeWorkers > 0 {
 		sort.Float64s(workerQps)
 		wQpsP50 = workerQps[int(float64(activeWorkers)*0.50)]
-		wQpsP70 = workerQps[int(float64(activeWorkers)*0.70)]
 		wQpsP90 = workerQps[int(float64(activeWorkers)*0.90)]
+		wQpsP99 = workerQps[int(float64(activeWorkers)*0.99)]
 		wQpsP100 = workerQps[activeWorkers-1]
 	}
+
+	// Calculate bulk write latency percentiles (p50/p90/p99/p100)
+	latencyRes := calculatePercentilesFromHistogram(latenciesSnapshot[:], []float64{0.50, 0.90, 0.99, 1.00})
+	formatMs := func(ms int) string {
+		if ms == -1 {
+			return "N/A"
+		}
+		return (time.Duration(ms) * time.Millisecond).String()
+	}
+	p50Latency := formatMs(latencyRes[0])
+	p90Latency := formatMs(latencyRes[1])
+	p99Latency := formatMs(latencyRes[2])
+	p100Latency := formatMs(latencyRes[3])
 
 	var dbLatencyMsg string
 	if sm.groupOpsByDistinctId {
@@ -793,7 +1014,7 @@ func (sm *StatsManager) ReportStats() {
 	}
 
 	// Format DLQ stats
-	dlqStatsStr := "  - DLQ'ed:"
+	dlqStatsStr := "      * DLQ'ed:"
 	var dlqOps []string
 	opNames := []string{"insert", "update", "delete", "replace", "mixed"}
 	for _, op := range opNames {
@@ -816,21 +1037,42 @@ func (sm *StatsManager) ReportStats() {
 		"      * %s\n"+
 		"      * %s", sourcePoolStr, targetPoolStr)
 
-	// Format Failure Breakdown
-	failureBreakdownStr := "  - Failure Details (Error/Op):"
-	var hasBreakdown bool
-	for op, errors := range breakdown {
+	// Format Failure Breakdown succinctly
+	failureBreakdownStr := "      * Failure Details (Error/Op):"
+	var opBreakdowns []string
+	var opsSorted []string
+	for op := range breakdown {
+		opsSorted = append(opsSorted, op)
+	}
+	sort.Strings(opsSorted)
+
+	for _, op := range opsSorted {
+		errors := breakdown[op]
 		if len(errors) > 0 {
-			hasBreakdown = true
-			failureBreakdownStr += fmt.Sprintf("\n      * %s:", op)
-			for errText, count := range errors {
-				failureBreakdownStr += fmt.Sprintf("\n          - %s: %d", errText, count)
+			var errParts []string
+			var errTextsSorted []string
+			for errText := range errors {
+				errTextsSorted = append(errTextsSorted, errText)
 			}
+			sort.Strings(errTextsSorted)
+
+			for _, errText := range errTextsSorted {
+				count := errors[errText]
+				errParts = append(errParts, fmt.Sprintf("%s: %d", errText, count))
+			}
+			opBreakdowns = append(opBreakdowns, fmt.Sprintf("%s: {%s}", op, strings.Join(errParts, ", ")))
 		}
 	}
-	if !hasBreakdown {
+	if len(opBreakdowns) > 0 {
+		failureBreakdownStr += " [" + strings.Join(opBreakdowns, ", ") + "]"
+	} else {
 		failureBreakdownStr += " 0"
 	}
+
+	_ = intervalSkipped
+
+	// Build a detailed partition-scoped read statistics telemetry log block
+	partitionReadStr := formatPartitionStats(partitionSnapshot, partitionIndices, duration, time.Millisecond)
 
 	headerStr := "Change stream statistics"
 	if sm.DontApply {
@@ -839,14 +1081,14 @@ func (sm *StatsManager) ReportStats() {
 
 	var processedLine string
 	if sm.DontApply {
-		processedLine = fmt.Sprintf("  - Processed: %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]",
+		processedLine = fmt.Sprintf("  - Processed:      %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]",
 			eventsProcessed, rateProcessed,
 			insertsProcessed, rateInsertsProcessed,
 			deletesProcessed, rateDeletesProcessed,
 			updatesProcessed, rateUpdatesProcessed,
 			updatedThenDeleted, rateUpdatedThenDeleted)
 	} else {
-		processedLine = fmt.Sprintf("  - Processed: %d (%.2f events/sec) (applied: %d (%.2f/sec)) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]",
+		processedLine = fmt.Sprintf("  - Processed:      %d (%.2f events/sec) (applied: %d (%.2f/sec)) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]",
 			eventsProcessed, rateProcessed,
 			eventsApplied, rateApplied,
 			insertsProcessed, rateInsertsProcessed,
@@ -855,56 +1097,82 @@ func (sm *StatsManager) ReportStats() {
 			updatedThenDeleted, rateUpdatedThenDeleted)
 	}
 
+	var rateRead float64
+	if duration.Seconds() > 0 {
+		rateRead = float64(readCount) / duration.Seconds()
+	}
+
 	msg := fmt.Sprintf(headerStr+" (last %v):\n"+
-		"  - Received:  %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec)]\n"+
+		"  - Read:           %d (%.2f events/sec)\n"+
+		"  - WorkerReceived: %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec)]\n"+
 		"%s\n"+
-		"  - Failed:    %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec)]\n"+
+		"  - Failed:         %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec)]\n"+
+		"  - BulkWrite Latency: [p50: %s, p90: %s, p99: %s, p100: %s] (avg detail: %s)\n"+
+		"  - Worker QPS: [Active: %d] [p50: %.2f, p90: %.2f, p99: %.2f, p100: %.2f]\n"+
+		"  - Lags:\n"+
+		"      * Event-to-Read:         %s\n"+
+		"      * Read-to-worker-receive: %s\n"+
+		"      * Receive-to-Apply:      %s\n"+
+		"      * End-to-end:            %s\n"+
+		"      * End-to-end-with-retry: %s\n"+
 		"  - Ordered BulkWrites: %d (%.2f/sec)%s\n"+
 		"  - Unordered BulkWrites: %d (%.2f/sec)%s\n"+
-		"  - Sequential Retries: %d (%.2f/sec)%s\n"+
-		"  - Duplicate Key Errors: %d (%.2f/sec)\n"+
 		"  - Group Flushes: [optype: %d (%.2f/sec), namespace: %d (%.2f/sec), batchfull: %d (%.2f/sec), id collision: %d (%.2f/sec), timeout: %d (%.2f/sec)]\n"+
-		"  - BulkWrite Execution Latency: %s\n"+
-		"  - Worker QPS: [Active: %d] [p50: %.2f, p70: %.2f, p90: %.2f, p100: %.2f]\n"+
-		"  - Lags:\n"+
-		"      * ReadToEventTimeLag: %s | WorkerReceivedToReadTimeLag: %s\n"+
-		"      * SuccessWithRetryLag: [from received  : %s, from event time: %s]\n"+
-		"      * SuccessLag: [from received  : %s, from event time: %s]\n"+
+		"  - Sequential Retries: %d (%.2f/sec)%s\n"+
+		"  - Errors\n"+
+		"      * Duplicate Key Errors: %d (%.2f/sec)\n"+
+		"%s\n"+
+		"%s\n"+
+		"  - Queue Performance:\n"+
+		"      * Queue Fullness: %s\n"+
+		"      * Queue Delays: [Ingest Queue: %s, Batching Queue: %s]\n"+
+		"      * Queue Stalls (Backpressure): [Batching Queue Stall (Distributor blocked): %s, Batch Write Queue Stall (Worker blocked): %s]\n"+
 		"  - ChangeStream Read Performance:\n"+
-		"      * Next Latency: %s | Event Size: avg %.1f bytes (total %s)\n"+
-		"%s\n"+
-		"%s\n"+
+		"      * Global Next Latency: %s | Event Size: avg %.1f bytes (total %s)%s\n"+
 		"%s",
 		duration.Round(time.Second),
-		eventsReceived, rateReceived, insertsReceived, rateInsertsReceived, deletesReceived, rateDeletesReceived, updatesReceived, rateUpdatesReceived,
+		readCount, rateRead,
+		eventsWorkerReceived, rateWorkerReceived, insertsWorkerReceived, rateInsertsWorkerReceived, deletesWorkerReceived, rateDeletesWorkerReceived, updatesWorkerReceived, rateUpdatesWorkerReceived,
 		processedLine,
 		eventsFailed, rateFailed, insertsFailed, rateInsertsFailed, deletesFailed, rateDeletesFailed, updatesFailed, rateUpdatesFailed,
-		orderedWrites, rateOrderedWrites, avgOrderedSizeStr, unorderedWrites, rateUnorderedWrites, avgUnorderedSizeStr, sequentialRetries, rateSequentialRetries, sequentialRetriesBreakdown, duplicateKeys, rateDuplicateKeys, groupFlushesOpType, rateGroupFlushesOpType, groupFlushesNamespace, rateGroupFlushesNamespace, groupFlushesBatchFull, rateGroupFlushesBatchFull, groupFlushesCollision, rateGroupFlushesCollision, timeoutFlushes, rateTimeoutFlushes,
-		dbLatencyMsg,
+		p50Latency, p90Latency, p99Latency, p100Latency, dbLatencyMsg,
 		activeWorkers,
-		wQpsP50, wQpsP70, wQpsP90, wQpsP100,
-		formatLag(lagRes.ReadToEventTimeLag),
-		formatLag(lagRes.WorkerReceivedToReadTimeLag),
-		formatLag(lagRes.SuccessWithRetryLagToWorkerReceivedTime),
-		formatLag(lagRes.SuccessWithRetryTimeToEventTime),
-		formatLag(lagRes.SuccessTimeToWorkerReceivedLag),
-		formatLag(lagRes.SuccessTimeToEventTimeLag),
+		wQpsP50, wQpsP90, wQpsP99, wQpsP100,
+		formatLag(lagRes.EventToReadLag),
+		formatLag(lagRes.ReadToWorkerReceiveLag),
+		formatLag(lagRes.ReceiveToApplyLag),
+		formatLag(lagRes.EndToEndLag),
+		formatLag(lagRes.EndToEndWithRetryLag),
+		orderedWrites, rateOrderedWrites, avgOrderedSizeStr,
+		unorderedWrites, rateUnorderedWrites, avgUnorderedSizeStr,
+		groupFlushesOpType, rateGroupFlushesOpType, groupFlushesNamespace, rateGroupFlushesNamespace, groupFlushesBatchFull, rateGroupFlushesBatchFull, groupFlushesCollision, rateGroupFlushesCollision, timeoutFlushes, rateTimeoutFlushes,
+		sequentialRetries, rateSequentialRetries, sequentialRetriesBreakdown,
+		duplicateKeys, rateDuplicateKeys,
+		failureBreakdownStr,
+		dlqStatsStr,
+		queueDepthsStr,
+		formatLag(avgIngestQueueDelay),
+		formatLag(avgBatchingQueueDelay),
+		formatLag(batchingQueueStall),
+		formatLag(batchWriteQueueStall),
 		avgReadLatency.Round(time.Microsecond),
 		avgReadSize,
 		formatBytes(totalReadSizeBytes),
-		dlqStatsStr,
-		failureBreakdownStr,
+		partitionReadStr,
 		poolStatsStr)
 
 	sm.log.Info(msg)
 }
 
 // ReportDryRunStats logs the dry-run statistics, resetting dry-run specific counters.
-func (sm *StatsManager) ReportDryRunStats() {
+func (sm *IncrementalStatsManager) ReportDryRunStats() {
 	// Reset and load dry-run atomic counters atomically
 	totalReadLatencyNs := atomic.SwapInt64(&sm.totalReadLatencyNs, 0)
 	readCount := atomic.SwapInt64(&sm.readCount, 0)
 	totalReadSizeBytes := atomic.SwapInt64(&sm.totalReadSizeBytes, 0)
+
+	// Atomically swap and snapshot partition-specific metrics lock-freely from flat array
+	partitionSnapshot, partitionIndices := sm.swapPartitionStats()
 
 	sm.mu.Lock()
 	now := time.Now()
@@ -924,12 +1192,15 @@ func (sm *StatsManager) ReportDryRunStats() {
 		avgSize = float64(totalReadSizeBytes) / float64(readCount)
 	}
 
+	// Build a detailed partition-scoped read statistics telemetry log block for dry-run mode
+	partitionReadStr := formatPartitionStats(partitionSnapshot, partitionIndices, duration, time.Microsecond)
+
 	// Format connection pool stats
 	sourcePoolStr := sm.formatPoolStats(&sm.sourcePool, "Source", duration)
 	targetPoolStr := sm.formatPoolStats(&sm.targetPool, "Target", duration)
 
 	msg := fmt.Sprintf("Change stream statistics in dry-run live-only mode (last %v):\n"+
-		"  - Read: %d (%.2f events/sec) | Next Latency: avg %s | Event Size: avg %.1f bytes (total %s)\n"+
+		"  - Read: %d (%.2f events/sec) | Global Next Latency: avg %s | Event Size: avg %.1f bytes (total %s)%s\n"+
 		"  - Connection Pool:\n"+
 		"      * %s\n"+
 		"      * %s",
@@ -938,34 +1209,11 @@ func (sm *StatsManager) ReportDryRunStats() {
 		avgLatency.Round(time.Microsecond),
 		avgSize,
 		formatBytes(totalReadSizeBytes),
+		partitionReadStr,
 		sourcePoolStr,
 		targetPoolStr)
 
 	sm.log.Info(msg)
-}
-
-func calculatePercentiles(values []int) (int, int, int) {
-	if len(values) == 0 {
-		return 0, 0, 0
-	}
-
-	var activeValues []int
-	for i, count := range values {
-		for j := 0; j < count; j++ {
-			activeValues = append(activeValues, i)
-		}
-	}
-
-	if len(activeValues) == 0 {
-		return 0, 0, 0
-	}
-
-	sort.Ints(activeValues)
-	p50 := activeValues[int(float64(len(activeValues))*0.50)]
-	p90 := activeValues[int(float64(len(activeValues))*0.90)]
-	p100 := activeValues[len(activeValues)-1]
-
-	return p50, p90, p100
 }
 
 func formatBytes(bytes int64) string {
@@ -979,4 +1227,106 @@ func formatBytes(bytes int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// calculatePercentilesFromHistogram returns the values at specified percentile thresholds from an integer-indexed histogram
+func calculatePercentilesFromHistogram(histogram []int64, thresholds []float64) []int {
+	if len(thresholds) == 0 {
+		return nil
+	}
+
+	var totalCount int64
+	for _, count := range histogram {
+		totalCount += count
+	}
+
+	results := make([]int, len(thresholds))
+	for i := range results {
+		results[i] = -1
+	}
+
+	if totalCount <= 0 {
+		return results
+	}
+
+	// Pre-calculate target counts for each threshold to avoid float conversion overhead inside the hot loop
+	targets := make([]int64, len(thresholds))
+	for i, t := range thresholds {
+		targets[i] = int64(float64(totalCount) * t)
+	}
+
+	var cumulativeCount int64
+	for idx, count := range histogram {
+		if count == 0 {
+			continue
+		}
+		cumulativeCount += count
+
+		for i, target := range targets {
+			if results[i] == -1 && cumulativeCount >= target {
+				results[i] = idx
+			}
+		}
+	}
+
+	// For thresholds not met due to float rounding or trailing zero-sized bins, fill with the last active index
+	lastActiveIdx := -1
+	for i := len(histogram) - 1; i >= 0; i-- {
+		if histogram[i] > 0 {
+			lastActiveIdx = i
+			break
+		}
+	}
+	for i, res := range results {
+		if res == -1 {
+			results[i] = lastActiveIdx
+		}
+	}
+
+	return results
+}
+
+// swapPartitionStats atomically swaps and returns active partition statistics snapshot and indices lock-freely
+func (sm *IncrementalStatsManager) swapPartitionStats() ([]PartitionReadStats, []int) {
+	var partitionSnapshot []PartitionReadStats
+	var partitionIndices []int
+	for i := 0; i < 128; i++ {
+		stats := &sm.partitionReadStats[i]
+		latency := atomic.SwapInt64(&stats.TotalReadLatencyNs, 0)
+		count := atomic.SwapInt64(&stats.ReadCount, 0)
+		size := atomic.SwapInt64(&stats.TotalReadSizeBytes, 0)
+		if count > 0 {
+			partitionSnapshot = append(partitionSnapshot, PartitionReadStats{
+				TotalReadLatencyNs: latency,
+				ReadCount:          count,
+				TotalReadSizeBytes: size,
+			})
+			partitionIndices = append(partitionIndices, i)
+		}
+	}
+	return partitionSnapshot, partitionIndices
+}
+
+// formatPartitionStats builds a detailed partition-scoped read statistics telemetry log block string
+func formatPartitionStats(snapshot []PartitionReadStats, indices []int, duration time.Duration, roundResolution time.Duration) string {
+	var partitionReadStr string
+	for idx, stats := range snapshot {
+		i := indices[idx]
+		avgLatency := time.Duration(0)
+		avgSize := 0.0
+		if stats.ReadCount > 0 {
+			avgLatency = time.Duration(stats.TotalReadLatencyNs / stats.ReadCount)
+			avgSize = float64(stats.TotalReadSizeBytes) / float64(stats.ReadCount)
+		}
+		var qps float64
+		if duration.Seconds() > 0 {
+			qps = float64(stats.ReadCount) / duration.Seconds()
+		}
+		partitionReadStr += fmt.Sprintf("      * [Partition %d] Next Latency: %s | Event Size: avg %.1f bytes (reads: %d, %.2f events/sec, total %s)\n",
+			i, avgLatency.Round(roundResolution).String(), avgSize, stats.ReadCount, qps, formatBytes(stats.TotalReadSizeBytes))
+	}
+	if len(partitionReadStr) > 0 {
+		partitionReadStr = "\n" + strings.TrimSuffix(partitionReadStr, "\n")
+	}
+	return partitionReadStr
 }

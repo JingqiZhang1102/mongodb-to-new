@@ -23,7 +23,7 @@ import (
 type Migrator struct {
 	config       *config.Config
 	log          *logger.Logger
-	CdcStartTime *primitive.Timestamp
+	LiveStartTime *primitive.Timestamp
 	DontApply    bool
 	DryRun       bool
 }
@@ -155,9 +155,9 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 
 	// Initialize shared stats tracking for this database pair
 	statsInterval := time.Duration(m.config.StatsIntervalMinutes) * time.Minute
-	statsManager := NewStatsManager(m.log, statsInterval, m.config.GroupOpsByDistinctId)
-	statsManager.DontApply = m.DontApply
-	statsManager.DryRun = m.DryRun
+	incrementalStatsManager := NewIncrementalStatsManager(m.log, statsInterval, m.config.GroupOpsByDistinctId)
+	incrementalStatsManager.DontApply = m.DontApply
+	incrementalStatsManager.DryRun = m.DryRun
 
 	// Check if this is legacy mode - if so, handle it separately
 	if (mode == "live" || mode == "live-only") && pair.Source.ReplicationMethod == "oplog-legacy" {
@@ -192,7 +192,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 
 	// Connect to source MongoDB (modern driver)
 	m.log.Infof("Connecting to source MongoDB at %s (MinPoolSize: 128, MaxPoolSize: 256)", pair.Source.ConnectionString)
-	sourceDB, err := db.NewMongoDB(pair.Source.ConnectionString, pair.Source.Database, 128, 256, 0, statsManager.GetSourcePoolMonitor(), m.log) // Source uses static pool size (min 128, max 256)
+	sourceDB, err := db.NewMongoDB(pair.Source.ConnectionString, pair.Source.Database, 128, 256, 0, incrementalStatsManager.GetSourcePoolMonitor(), m.log) // Source uses static pool size (min 128, max 256)
 	if err != nil {
 		return fmt.Errorf("failed to connect to source MongoDB: %w", err)
 	}
@@ -202,7 +202,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 
 	// Connect to target MongoDB
 	m.log.Infof("Connecting to target MongoDB at %s (MinPoolSize: %d, MaxPoolSize: %d, MaxIdleTime: %v)", pair.Target.ConnectionString, m.config.TargetMinPoolSize, m.config.TargetMaxPoolSize, maxConnIdleTimeTarget)
-	targetDB, err := db.NewMongoDB(pair.Target.ConnectionString, pair.Target.Database, uint64(m.config.TargetMinPoolSize), uint64(m.config.TargetMaxPoolSize), maxConnIdleTimeTarget, statsManager.GetTargetPoolMonitor(), m.log)
+	targetDB, err := db.NewMongoDB(pair.Target.ConnectionString, pair.Target.Database, uint64(m.config.TargetMinPoolSize), uint64(m.config.TargetMaxPoolSize), maxConnIdleTimeTarget, incrementalStatsManager.GetTargetPoolMonitor(), m.log)
 	if err != nil {
 		return fmt.Errorf("failed to connect to target MongoDB: %w", err)
 	}
@@ -273,7 +273,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 		wg.Wait()
 	} else if mode == "live" || mode == "live-only" {
 		// Use client-level change stream for live replication
-		if err := m.startClientLevelReplication(ctx, sourceDB, targetDB, pair.Source.Database, pair.Target.Database, collections, pair, pairIndex, liveOnly, statsManager); err != nil {
+		if err := m.startClientLevelReplication(ctx, sourceDB, targetDB, pair.Source.Database, pair.Target.Database, collections, pair, pairIndex, liveOnly, incrementalStatsManager); err != nil {
 			// We don't need to check for context.Canceled here anymore as it's handled in the lower layers
 			return fmt.Errorf("error starting client-level replication: %w", err)
 		}
@@ -293,7 +293,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 }
 
 // startClientLevelReplication starts replication using either change streams or oplog
-func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool, statsManager *StatsManager) error {
+func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool, incrementalStatsManager *IncrementalStatsManager) error {
 	// Determine replication method
 	replicationMethod := pair.Source.ReplicationMethod
 	if replicationMethod == "" {
@@ -307,17 +307,17 @@ func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, ta
 		return m.startOplogReplication(ctx, sourceDB, targetDB, sourceDBName, targetDBName, collections, pair, pairIndex, liveOnly)
 	} else {
 		// Use change stream-based replication (default)
-		return m.startChangeStreamReplication(ctx, sourceDB, targetDB, sourceDBName, targetDBName, collections, pair, pairIndex, liveOnly, statsManager)
+		return m.startChangeStreamReplication(ctx, sourceDB, targetDB, sourceDBName, targetDBName, collections, pair, pairIndex, liveOnly, incrementalStatsManager)
 	}
 }
 
 // startChangeStreamReplication starts replication using change streams
-func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool, statsManager *StatsManager) error {
+func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool, incrementalStatsManager *IncrementalStatsManager) error {
 	m.log.Info("Starting change stream-based replication for all collections")
 
 	// Create client-level replicator
 	replicator := NewClientLevelReplicator(sourceDB, targetDB, m.config, m.log)
-	replicator.SetStatsManager(statsManager)
+	replicator.SetIncrementalStatsManager(incrementalStatsManager)
 	replicator.DontApply = m.DontApply
 	replicator.DryRun = m.DryRun
 
@@ -359,7 +359,7 @@ func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, t
 	replicator.SetDLQ(dlqInterface)
 
 	// Start client-level replication (which will handle index sync during initial migration)
-	return replicator.StartReplication(ctx, globalResumeToken, globalResumeTokenPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m.CdcStartTime, m)
+	return replicator.StartReplication(ctx, globalResumeToken, globalResumeTokenPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m.LiveStartTime, m)
 }
 
 // startOplogReplication starts replication using oplog tailing
@@ -414,7 +414,7 @@ func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB
 	replicator.SetDLQ(dlqInterface)
 
 	// Start oplog replication (which will handle index sync during initial migration)
-	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m.CdcStartTime, m)
+	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m.LiveStartTime, m)
 }
 
 // startOplogReplicationLegacy starts replication using legacy GTM + mgo for old MongoDB versions
@@ -488,7 +488,7 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 	replicator.SetDLQ(dlqInterface)
 
 	// Start legacy oplog replication
-	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m.CdcStartTime, m)
+	return replicator.StartReplication(ctx, globalTimestamp, oplogTimestampPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m.LiveStartTime, m)
 }
 
 // getCollectionsToProcess determines which collections to process

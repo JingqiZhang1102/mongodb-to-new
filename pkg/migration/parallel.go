@@ -1,5 +1,15 @@
 package migration
 
+/*
+Pipeline Architecture & Thread Lifecycle Map (Who Produces & Consumes):
+
+| Queue Stage     | Added to by (Producers)                                 | Removed from by (Consumers)                               | Role in the Pipeline |
+| :-------------- | :------------------------------------------------------ | :-------------------------------------------------------- | :------------------- |
+| ingestQueue     | source readers (1 per change stream source)             | partition router (1 central thread)                       | Buffers raw change stream events fetched from TCP sockets, waiting to be sorted and partitioned. |
+| batchingQueue   | partition router (1 central thread)                       | transformer and batcher (1 per active worker)             | Buffers partitioned events routed to a specific worker, waiting to be batched and grouped. |
+| batchWriteQueue | transformer and batcher (1 per active worker)             | target writers (1 per active worker)                       | Buffers finalized, ready-to-write batch task payloads (OperationGroup), waiting to be committed to target DB. |
+*/
+
 import (
 	"context"
 	"fmt"
@@ -24,7 +34,7 @@ type EventDistributor struct {
 	sourceDB                  *db.MongoDB
 	targetDB                  *db.MongoDB
 	collectionConfigs         map[string]map[string]config.CollectionConfig
-	changeStream              *mongo.ChangeStream
+	changeStreams             []*mongo.ChangeStream
 	ctx                       context.Context
 	log                       *logger.Logger
 	resumeTokenPath           string
@@ -37,22 +47,28 @@ type EventDistributor struct {
 	retryManager              *RetryManager // Retry manager for transient errors
 
 	// Statistics tracking
-	statsManager *StatsManager // Manager for statistics and replication lag
+	incrementalStatsManager *IncrementalStatsManager // Manager for statistics and replication lag
 	cfg          *config.Config
 	DontApply    bool // Don't apply flag
 	DryRun       bool // Dry run flag
+
+	partitionTracker *PartitionTracker // Thread-safe ack-based progress checkpoint tracker
 }
 
 // NewEventDistributor creates a new event distributor
 func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 	collectionConfigs map[string]map[string]config.CollectionConfig,
-	changeStream *mongo.ChangeStream, log *logger.Logger,
+	changeStreams []*mongo.ChangeStream, log *logger.Logger,
 	resumeTokenPath string, checkpointInterval time.Duration,
 	saveThreshold, incrementalWorkerCount, incrementalWriteBatchSize int,
-	forceOrderedOperations bool, flushInterval time.Duration, cfg *config.Config, dlq DLQ, statsManager *StatsManager) *EventDistributor {
+	forceOrderedOperations bool, flushInterval time.Duration, cfg *config.Config, dlq DLQ, incrementalStatsManager *IncrementalStatsManager) *EventDistributor {
 
 	// Create retry manager from config
 	retryMgr := NewRetryManagerFromConfig(cfg, log)
+
+	tracker := NewPartitionTracker(log, resumeTokenPath, checkpointInterval, saveThreshold, len(changeStreams))
+	// Start the periodic checkpoint flush loop
+	tracker.Start(ctx)
 
 	return &EventDistributor{
 		workers:                   make([]*Worker, incrementalWorkerCount),
@@ -60,7 +76,7 @@ func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 		sourceDB:                  sourceDB,
 		targetDB:                  targetDB,
 		collectionConfigs:         collectionConfigs,
-		changeStream:              changeStream,
+		changeStreams:             changeStreams,
 		ctx:                       ctx,
 		log:                       log,
 		resumeTokenPath:           resumeTokenPath,
@@ -72,9 +88,8 @@ func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 		dlq:                       dlq,
 		retryManager:              retryMgr,
 		cfg:                       cfg,
-
-		// Use the shared statistics tracking
-		statsManager: statsManager,
+		incrementalStatsManager:              incrementalStatsManager,
+		partitionTracker:          tracker,
 	}
 }
 
@@ -122,145 +137,278 @@ func (d *EventDistributor) getWorkerIndex(docID interface{}) int {
 }
 
 // Start begins the event distribution process
+// Start begins the event distribution process
 func (d *EventDistributor) Start() error {
-	d.log.Infof("Starting event distributor with %d workers (GroupOpsByDistinctId: %t)", d.incrementalWorkerCount, d.cfg.GroupOpsByDistinctId)
+	d.log.Infof("Starting event distributor with %d workers (GroupOpsByDistinctId: %t, changeStreams: %d)", d.incrementalWorkerCount, d.cfg.GroupOpsByDistinctId, len(d.changeStreams))
+
+	// Concurrency Architecture (Sub-Context Coordination for Fail-Fast Partitioning):
+	// We establish a cancelCtx child context linked to a thread-safe terminal error store (termErr).
+	// If any sharded partition change stream reader background thread encounters a connection drop, cursor
+	// invalidation, or EOF, it triggers cancel() via the setError helper. This fail-fast design immediately
+	// signals exit paths across all concurrent readers (unblocking changeStream.Next) and the central distributor
+	// consumer routing loop (unblocking select <-cancelCtx.Done()), preventing quiet data loss or silent freezes.
+	cancelCtx, cancel := context.WithCancel(d.ctx)
+	defer cancel()
+
+	var errOnce sync.Once
+	var termErr error
+	setError := func(err error) {
+		errOnce.Do(func() {
+			termErr = err
+		})
+		cancel()
+	}
 
 	// Start the statistics manager periodic reporting
-	if d.statsManager != nil {
-		d.statsManager.Start(d.ctx)
+	if d.incrementalStatsManager != nil {
+		d.incrementalStatsManager.Start(cancelCtx)
 	}
 
 	// Initialize workers with retry manager and stats manager
 	for i := 0; i < d.incrementalWorkerCount; i++ {
-		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionConfigs, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.statsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval, d.cfg.IncrementalIncomingQueueSize, d.cfg.IncrementalProcessingQueueSize, d.DontApply)
+		d.workers[i] = NewWorker(i, cancelCtx, d.log, d.targetDB, d.collectionConfigs, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.incrementalStatsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval, d.cfg.IncrementalIncomingQueueSize, d.cfg.IncrementalProcessingQueueSize, d.DontApply)
+		d.workers[i].SetPartitionTracker(d.partitionTracker)
 	}
 
 	// Ensure all workers are shut down sequentially and safely upon exit
 	defer func() {
+		if d.incrementalStatsManager != nil {
+			d.incrementalStatsManager.RegisterQueues(nil, nil)
+		}
 		d.log.Info("Shutting down workers...")
 		for _, worker := range d.workers {
 			if worker != nil {
 				worker.Shutdown()
 			}
 		}
+		if d.partitionTracker != nil {
+			d.log.Info("Flushing final resume tokens...")
+			d.partitionTracker.Close()
+		}
 	}()
 
-	// Main loop to read from change stream and distribute events
-	var changeCount int
-	lastCheckpointTime := time.Now()
+	// Ingest queue for concurrent reader threads to publish events.
+	// Capacity scales with the number of streams to avoid memory lockups and hold multiple batches safely.
+	ingestQueue := make(chan QueueEvent, d.cfg.IncrementalIncomingQueueSize*len(d.changeStreams))
+	if d.incrementalStatsManager != nil {
+		d.incrementalStatsManager.RegisterQueues(d.workers, ingestQueue)
+	}
+	var readerWg sync.WaitGroup
 
-	for {
-		// Try to get next change event
-		startTime := time.Now()
-		ok := d.changeStream.Next(d.ctx)
-		readTime := time.Now()
-		if !ok {
-			// Check if this is due to an error or end of stream
-			if err := d.changeStream.Err(); err != nil {
-				// Check if the error is due to context cancellation
-				if err == context.Canceled {
-					d.log.Info("Change stream interrupted due to context cancellation")
-					return nil
+	// Spawn concurrent background reader threads (Producer routines) for each sharded change stream.
+	// This implements Asynchronous Prefetching (overlapping CPU allocation/routing and Network I/O):
+	// while the distributor is routing batch A, these background loops are already prefetching batch B
+	// over their respective TCP sockets, delivering a massive throughput/WPS scale-out!
+	for idx, stream := range d.changeStreams {
+		readerWg.Add(1)
+		go func(streamIndex int, changeStream *mongo.ChangeStream) {
+			defer readerWg.Done()
+
+			for {
+				// Block on network socket until the next batch is fetched/returned by the driver
+				startTime := time.Now()
+				ok := changeStream.Next(cancelCtx)
+				latency := time.Since(startTime)
+				readTime := time.Now()
+
+				if !ok {
+					// Reader EOF/Error Assessment:
+					// Next returning false indicates the stream partition has terminated. We analyze the root cause:
+					if err := changeStream.Err(); err != nil {
+						if err == context.Canceled {
+							// Normal shutdown path coordinated by cancelCtx sub-context
+							d.log.Infof("[Reader %d] Change stream interrupted by cancellation", streamIndex)
+							return
+						}
+						// Shard connection drop or database partition error: log and bubble up to pipeline controller
+						d.log.Errorf("[Reader %d] Change stream error: %v", streamIndex, err)
+						setError(err)
+					} else {
+						// Unexpected empty return (EOF cursor closure without explicit driver error string):
+						// Bubble up custom error so supervisor knows this partition has stopped feeding events.
+						d.log.Errorf("[Reader %d] Change stream cursor closed unexpectedly", streamIndex)
+						setError(fmt.Errorf("change stream reader %d closed unexpectedly", streamIndex))
+					}
+					return
 				}
-				d.log.Errorf("Change stream error: %v", err)
-				return err
+
+				rawEvent := changeStream.Current
+				size := len(rawEvent)
+
+				if d.incrementalStatsManager != nil {
+					d.incrementalStatsManager.RecordReadMetric(streamIndex, latency, size)
+				}
+
+				if d.DryRun {
+					continue
+				}
+
+				// Deep copy BSON raw bytes safely for cross-thread channel transfers
+				rawCopy := make(bson.Raw, len(rawEvent))
+				copy(rawCopy, rawEvent)
+
+				resumeToken := changeStream.ResumeToken()
+				eventTime := ExtractEventTimeFromRaw(rawCopy)
+				var seqNum uint64
+				if d.partitionTracker != nil {
+					seqNum = d.partitionTracker.Register(streamIndex, resumeToken, eventTime)
+				}
+
+				event := QueueEvent{
+					Event:       rawCopy,
+					ReadTime:    readTime,
+					StreamIndex: streamIndex,
+					SeqNum:      seqNum,
+				}
+
+				select {
+				case ingestQueue <- event:
+				case <-cancelCtx.Done():
+					if d.partitionTracker != nil {
+						d.partitionTracker.Ack(streamIndex, seqNum)
+					}
+					return
+				}
 			}
-			// End of stream, break out of the loop
-			break
-		}
-
-		// Get raw change event bytes
-		rawEvent := d.changeStream.Current
-		size := len(rawEvent)
-
-		if d.statsManager != nil {
-			d.statsManager.RecordReadMetric(readTime.Sub(startTime), size)
-		}
-
-		if d.DryRun {
-			continue
-		}
-
-		// Extract operationType via fast binary lookup
-		opTypeVal, err := rawEvent.LookupErr("operationType")
-		if err != nil {
-			d.log.Errorf("Invalid raw change event: missing operationType")
-			continue
-		}
-		opType := opTypeVal.StringValue()
-
-		if d.statsManager != nil {
-			d.statsManager.IncrementEventsReceived(opType)
-		}
-
-		// Extract documentKey._id via fast binary lookup
-		docKeyVal, err := rawEvent.LookupErr("documentKey")
-		if err != nil {
-			d.log.Errorf("Invalid raw change event: missing documentKey")
-			continue
-		}
-		docKeyRaw := docKeyVal.Document()
-		docIDVal, err := docKeyRaw.LookupErr("_id")
-		if err != nil {
-			d.log.Errorf("Invalid raw change event: missing documentKey._id")
-			continue
-		}
-
-		// Determine worker lock-freely and allocation-freely by hashing raw BSON bytes directly.
-		// By hashing the raw `_id` BSON value slice directly, we completely avoid calling Unmarshal
-		// on the single-threaded distributor loop. This shifts 100% of the CPU-heavy BSON decoding
-		// load into parallel worker goroutines, enabling linear CPU scale-out and 0 heap allocations.
-		hash := hashBytes(docIDVal.Value)
-		workerIndex := ((hash % d.incrementalWorkerCount) + d.incrementalWorkerCount) % d.incrementalWorkerCount
-
-		// Safe concurrent deep copy of raw BSON bytes to prevent mutation races
-		rawCopy := make(bson.Raw, len(rawEvent))
-		copy(rawCopy, rawEvent)
-
-		// Send raw event copy to appropriate worker concurrently
-		select {
-		case d.workers[workerIndex].incomingQueue <- QueueEvent{Event: rawCopy, ReadTime: readTime}:
-		case <-d.ctx.Done():
-			return nil
-		}
-
-		// Handle resume token checkpointing
-		changeCount++
-		now := time.Now()
-		timeBasedCheckpoint := now.Sub(lastCheckpointTime) >= d.checkpointInterval
-		countBasedCheckpoint := changeCount >= d.saveThreshold
-
-		if timeBasedCheckpoint || countBasedCheckpoint {
-			d.saveResumeToken(d.changeStream.ResumeToken())
-
-			// Reset counters
-			lastCheckpointTime = now
-			changeCount = 0
-		}
+		}(idx, stream)
 	}
 
-	return nil
+	// Spin up cleanup supervisor to close the queue once all threads have terminated
+	go func() {
+		readerWg.Wait()
+		close(ingestQueue)
+	}()
+
+	// Main loop (Consumer routine) to distribute events from the shared pre-fetched queue to workers.
+	// Since background threads keep this shared queue populated, the main distributor thread loop
+	// experiences near-zero wait I/O delay and can route events lock-freely at top speeds!
+	for {
+		select {
+		case event, ok := <-ingestQueue:
+			if !ok {
+				// All reader threads completed. If there was a termination error, return it!
+				if termErr != nil {
+					return termErr
+				}
+				return nil
+			}
+			event.DistributorTime = time.Now()
+
+			rawEvent, ok := event.Event.(bson.Raw)
+			if !ok {
+				if d.partitionTracker != nil {
+					d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
+				}
+				continue
+			}
+
+			// Non-DML / Control Event Graceful Filtering (Prevent Log Pollution):
+			// Change streams report DDL/system events (like drops, invalidations, index changes) that do not have
+			// a documentKey payload. We identify these via fast BSON type-validated binary lookup.
+			// Safety Boundary: If the event is a collection drop ("drop"), we treat it as a terminal failure to prevent silent data loss.
+			// For other harmless/unsupported non-DML events, we skip them cleanly with partition progress sequence ACKs.
+			opTypeVal, err := rawEvent.LookupErr("operationType")
+			if err == nil && opTypeVal.Type == bson.TypeString {
+				opType := opTypeVal.StringValue()
+				if opType == "drop" {
+					var nsCtx string
+					if ns := ExtractNamespaceFromRawEvent(rawEvent); ns != "" {
+						nsCtx = " " + ns
+					}
+					return fmt.Errorf("terminal failure: collection drop event detected in partition %d%s", event.StreamIndex, nsCtx)
+				}
+				if opType != "insert" && opType != "update" && opType != "replace" && opType != "delete" {
+					d.log.Warnf("Skipping unsupported change stream event type %q", opType)
+					if d.incrementalStatsManager != nil {
+						d.incrementalStatsManager.RecordSkippedEvent(opType)
+					}
+					if d.partitionTracker != nil {
+						d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
+					}
+					continue
+				}
+			}
+
+			// Extract documentKey._id via fast binary lookup
+			docKeyVal, err := rawEvent.LookupErr("documentKey")
+			if err != nil {
+				d.log.Errorf("Invalid raw change event: missing documentKey")
+				if d.partitionTracker != nil {
+					d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
+				}
+				continue
+			}
+			docKeyRaw := docKeyVal.Document()
+			docIDVal, err := docKeyRaw.LookupErr("_id")
+			if err != nil {
+				d.log.Errorf("Invalid raw change event: missing documentKey._id")
+				if d.partitionTracker != nil {
+					d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
+				}
+				continue
+			}
+
+			// Determine worker index deterministically by key hashing
+			hash := hashBytes(docIDVal.Value)
+			workerIndex := ((hash % d.incrementalWorkerCount) + d.incrementalWorkerCount) % d.incrementalWorkerCount
+
+			// Dispatch event to the target worker channel
+			event.DistributorPushTime = time.Now()
+			pushStart := time.Now()
+			select {
+			case d.workers[workerIndex].batchingQueue <- event:
+				stall := time.Since(pushStart)
+				if stall > 1*time.Millisecond && d.incrementalStatsManager != nil {
+					d.incrementalStatsManager.RecordBatchingQueueStall(stall)
+				}
+			case <-cancelCtx.Done():
+				if d.partitionTracker != nil {
+					d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
+				}
+				if termErr != nil {
+					return termErr
+				}
+				return nil
+			}
+
+		case <-cancelCtx.Done():
+			if termErr != nil {
+				return termErr
+			}
+			return nil
+		}
+	}
 }
 
-// saveResumeToken saves the current resume token
+// saveResumeToken is left as a legacy stub for single-stream compatibility
 func (d *EventDistributor) saveResumeToken(resumeToken bson.Raw) {
+	d.savePartitionResumeToken(0, resumeToken)
+}
+
+// savePartitionResumeToken saves the resume token for a specific stream partition
+func (d *EventDistributor) savePartitionResumeToken(partitionIndex int, resumeToken bson.Raw) {
 	var resumeTokenDoc bson.M
 	if err := bson.Unmarshal(resumeToken, &resumeTokenDoc); err != nil {
-		d.log.Errorf("Error unmarshaling resume token: %v", err)
+		d.log.Errorf("[Reader %d] Error unmarshaling resume token: %v", partitionIndex, err)
 		return
 	}
 
-	if err := SaveResumeToken(d.resumeTokenPath, resumeTokenDoc); err != nil {
-		d.log.Errorf("Error saving resume token: %v", err)
+	path := GetPartitionResumeTokenPath(d.resumeTokenPath, partitionIndex, len(d.changeStreams))
+	if err := SaveResumeToken(path, resumeTokenDoc); err != nil {
+		d.log.Errorf("[Reader %d] Error saving resume token to %s: %v", partitionIndex, path, err)
 	} else {
-		d.log.Infof("Saved resume token successfully")
+		d.log.Debugf("[Reader %d] Saved resume token successfully to %s", partitionIndex, path)
 	}
 }
 
 // QueueEvent wraps the raw change stream or oplog event with metadata like read time
 type QueueEvent struct {
-	Event    interface{} // bson.M or bson.Raw
-	ReadTime time.Time
+	Event               interface{} // bson.M or bson.Raw
+	ReadTime            time.Time
+	DistributorTime     time.Time
+	DistributorPushTime time.Time
+	StreamIndex         int
+	SeqNum              uint64
 }
 
 // WriteOperation represents a single write operation
@@ -278,6 +426,8 @@ type WriteOperation struct {
 	SuccessAfterRetry bool      // Set to true if the operation succeeded after a retry
 	DLQed             bool      // Track if the operation was routed to the DLQ
 	Error             error     // Track the exact write failure error
+	StreamIndex       int
+	SeqNum            uint64
 }
 
 // OperationGroup represents a group of operations of the same type and namespace
@@ -295,16 +445,16 @@ type Worker struct {
 	log               *workerLogger
 	targetDB          *db.MongoDB
 	collectionConfigs map[string]map[string]config.CollectionConfig
-	statsManager      *StatsManager
+	incrementalStatsManager      *IncrementalStatsManager
 
 	// Queue of raw change events waiting to be partitioned and batched concurrently
-	incomingQueue chan interface{}
+	batchingQueue chan interface{}
 
 	// Current group being built
 	currentGroup *OperationGroup
 
 	// Queue of groups waiting to be processed
-	processingQueue chan *OperationGroup
+	batchWriteQueue chan *OperationGroup
 
 	// Maximum group size
 	incrementalWriteBatchSize int
@@ -332,9 +482,27 @@ type Worker struct {
 	groupOpsByDistinctId bool
 	currentGroupIDs      map[int]bool
 	flushInterval        time.Duration
+	partitionTracker     *PartitionTracker
 }
 
-// flushCurrentGroup moves the current group to the processing queue if it exists
+// SetPartitionTracker sets the PartitionTracker for this worker
+func (w *Worker) SetPartitionTracker(tracker *PartitionTracker) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.partitionTracker = tracker
+}
+
+// pushToBatchWriteQueue sends a completed group to the batch write queue while tracking any block/stall durations
+func (w *Worker) pushToBatchWriteQueue(group *OperationGroup) {
+	start := time.Now()
+	w.batchWriteQueue <- group
+	stall := time.Since(start)
+	if stall > 1*time.Millisecond && w.incrementalStatsManager != nil {
+		w.incrementalStatsManager.RecordBatchWriteQueueStall(stall)
+	}
+}
+
+// flushCurrentGroup moves the current group to the batch write queue if it exists
 func (w *Worker) flushCurrentGroup() bool {
 	// Must be called with lock held
 	if w.currentGroup != nil && len(w.currentGroup.Operations) > 0 {
@@ -342,8 +510,9 @@ func (w *Worker) flushCurrentGroup() bool {
 			w.currentGroup.Namespace, w.currentGroup.OpType,
 			len(w.currentGroup.Operations))
 
-		w.processingQueue <- w.currentGroup
+		w.pushToBatchWriteQueue(w.currentGroup)
 		w.currentGroup = nil
+		w.currentGroupIDs = make(map[int]bool)
 		return true
 	}
 	return false
@@ -351,12 +520,12 @@ func (w *Worker) flushCurrentGroup() bool {
 
 type statsTrackingDLQ struct {
 	underlyingDlq DLQ
-	statsManager  *StatsManager
+	incrementalStatsManager  *IncrementalStatsManager
 }
 
 func (s *statsTrackingDLQ) WriteFailed(sourceDB, sourceCollection string, documentID interface{}, err error, phase, opType string, document interface{}) {
 	s.underlyingDlq.WriteFailed(sourceDB, sourceCollection, documentID, err, phase, opType, document)
-	// Incremented in statsManager.RecordLags to prevent double counting and maintain context
+	// Incremented in incrementalStatsManager.RecordLags to prevent double counting and maintain context
 }
 
 func (s *statsTrackingDLQ) Count() int64 {
@@ -370,14 +539,14 @@ func (s *statsTrackingDLQ) Close() {
 // NewWorker creates a new worker
 func NewWorker(id int, ctx context.Context, log *logger.Logger,
 	targetDB *db.MongoDB, collectionConfigs map[string]map[string]config.CollectionConfig,
-	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager, statsManager *StatsManager, groupOpsByDistinctId bool, flushInterval time.Duration,
-	incomingQueueSize int, processingQueueSize int, dontApply bool) *Worker {
+	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager, incrementalStatsManager *IncrementalStatsManager, groupOpsByDistinctId bool, flushInterval time.Duration,
+	batchingQueueSize int, batchWriteQueueSize int, dontApply bool) *Worker {
 
 	var workerDLQ DLQ = dlq
-	if dlq != nil && statsManager != nil {
+	if dlq != nil && incrementalStatsManager != nil {
 		workerDLQ = &statsTrackingDLQ{
 			underlyingDlq: dlq,
-			statsManager:  statsManager,
+			incrementalStatsManager:  incrementalStatsManager,
 		}
 	}
 
@@ -387,29 +556,31 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 		log:                       &workerLogger{workerID: id, logger: log},
 		targetDB:                  targetDB,
 		collectionConfigs:         collectionConfigs,
-		incomingQueue:             make(chan interface{}, incomingQueueSize),
-		processingQueue:           make(chan *OperationGroup, processingQueueSize),
+		batchingQueue:             make(chan interface{}, batchingQueueSize),
+		batchWriteQueue:           make(chan *OperationGroup, batchWriteQueueSize),
 		incrementalWriteBatchSize: incrementalWriteBatchSize,
 		forceOrderedOperations:    forceOrderedOperations,
 		dontApply:                 dontApply,
 		dlq:                       workerDLQ,
 		retryManager:              retryManager,
-		statsManager:              statsManager,
+		incrementalStatsManager:              incrementalStatsManager,
 		groupOpsByDistinctId:      groupOpsByDistinctId,
 		currentGroupIDs:           make(map[int]bool),
 		flushInterval:             flushInterval,
 	}
 
+	// Increment WaitGroup count for both background goroutines on the parent constructor thread
+	w.wg.Add(2)
+
 	// Statically spawn the worker and eventLoop threads at startup
-	go w.processGroups()
+	go w.processBatchWriteQueue()
 	go w.eventLoop()
 
 	return w
 }
 
-// eventLoop concurrently drains raw change events from the incomingQueue, partitioning and batching them lock-freely
+// eventLoop concurrently drains raw change events from the batchingQueue, partitioning and batching them lock-freely
 func (w *Worker) eventLoop() {
-	w.wg.Add(1)
 	defer w.wg.Done()
 
 	// Local worker-level ticker to flush groups that time out
@@ -418,12 +589,12 @@ func (w *Worker) eventLoop() {
 
 	for {
 		select {
-		case event, ok := <-w.incomingQueue:
+		case event, ok := <-w.batchingQueue:
 			if !ok {
 				// Queue closed, flush any remaining operations
 				w.mu.Lock()
 				w.flushCurrentGroup()
-				close(w.processingQueue) // Signal processGroups to drain and exit
+				close(w.batchWriteQueue) // Signal processBatchWriteQueue to drain and exit
 				w.mu.Unlock()
 				return
 			}
@@ -433,8 +604,8 @@ func (w *Worker) eventLoop() {
 			w.mu.Lock()
 			if w.currentGroup != nil && len(w.currentGroup.Operations) > 0 {
 				if time.Since(w.currentGroup.CreatedAt) >= w.flushInterval {
-					if w.statsManager != nil {
-						w.statsManager.IncrementTimeoutFlushes()
+					if w.incrementalStatsManager != nil {
+						w.incrementalStatsManager.IncrementTimeoutFlushes()
 					}
 					w.flushCurrentGroup()
 				}
@@ -445,7 +616,7 @@ func (w *Worker) eventLoop() {
 			// Context canceled, flush remaining and shut down
 			w.mu.Lock()
 			w.flushCurrentGroup()
-			close(w.processingQueue)
+			close(w.batchWriteQueue)
 			w.mu.Unlock()
 			return
 		}
@@ -459,20 +630,35 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 
 	var event bson.M
 	var readTime time.Time
+	var streamIndex int
+	var seqNum uint64
 
 	switch e := eventArg.(type) {
 	case QueueEvent:
 		readTime = e.ReadTime
+		streamIndex = e.StreamIndex
+		seqNum = e.SeqNum
+		if w.incrementalStatsManager != nil && !e.DistributorTime.IsZero() && !e.DistributorPushTime.IsZero() {
+			ingestQueueDelay := e.DistributorTime.Sub(e.ReadTime)
+			batchingQueueDelay := time.Since(e.DistributorPushTime)
+			w.incrementalStatsManager.RecordQueueDelays(ingestQueueDelay, batchingQueueDelay)
+		}
 		switch inner := e.Event.(type) {
 		case bson.M:
 			event = inner
 		case bson.Raw:
 			if err := bson.Unmarshal(inner, &event); err != nil {
 				w.log.Errorf("Failed to unmarshal raw BSON change event: %v", err)
+				if w.partitionTracker != nil {
+					w.partitionTracker.Ack(streamIndex, seqNum)
+				}
 				return
 			}
 		default:
 			w.log.Errorf("Invalid inner event type: %T", e.Event)
+			if w.partitionTracker != nil {
+				w.partitionTracker.Ack(streamIndex, seqNum)
+			}
 			return
 		}
 	case bson.M:
@@ -498,6 +684,9 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 
 	// Extract operation details
 	opType, _ := event["operationType"].(string)
+	if w.incrementalStatsManager != nil {
+		w.incrementalStatsManager.IncrementEventsWorkerReceived(opType)
+	}
 	ns, _ := event["ns"].(bson.M)
 	dbName, _ := ns["db"].(string)
 	collName, _ := ns["coll"].(string)
@@ -510,9 +699,20 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 	// This is needed because legacy oplog replicator returns map[string]interface{}
 	fullDocument := event["fullDocument"]
 
-	// If this is an update operation in the change stream path and fullDocument is nil, skip it and record metric
-	if opType == "update" && fullDocument == nil && w.statsManager != nil {
-		w.statsManager.IncrementUpdatedThenDeleted(w.id)
+	// Graceful Null Document Update Skipping (Decoupled Logic Fix):
+	// In MongoDB change streams, an update event that is immediately followed by a delete can arrive with a nil
+	// fullDocument payload. Because we process updates using complete document replacements, we cannot process
+	// the operation without a payload. We skip these events gracefully. Crucially: This check is decoupled from the
+	// incrementalStatsManager check: previously, a nil incrementalStatsManager bypassed the skip block, causing key transformation failures
+	// and unnecessary DLQ errors.
+	if opType == "update" && fullDocument == nil {
+		if w.incrementalStatsManager != nil {
+			w.incrementalStatsManager.IncrementUpdatedThenDeleted(w.id)
+			w.incrementalStatsManager.RecordSkippedEvent("update-doc-missing")
+		}
+		if w.partitionTracker != nil {
+			w.partitionTracker.Ack(streamIndex, seqNum)
+		}
 		return
 	}
 
@@ -536,6 +736,8 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 		EventTime:         eventTime,
 		ReadTime:          readTime,
 		WorkerReceiveTime: time.Now(),
+		StreamIndex:       streamIndex,
+		SeqNum:            seqNum,
 	}
 
 	docHash := hashDocumentID(docID)
@@ -555,21 +757,21 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 	}
 
 	if needNewGroup && w.currentGroup != nil {
-		if w.statsManager != nil {
+		if w.incrementalStatsManager != nil {
 			// Determine the reason the group had to be flushed
 			if w.groupOpsByDistinctId && w.currentGroupIDs[docHash] {
-				w.statsManager.IncrementGroupFlushReason("collision")
+				w.incrementalStatsManager.IncrementGroupFlushReason("collision")
 			} else if w.currentGroup.Namespace != namespace {
-				w.statsManager.IncrementGroupFlushReason("namespace")
+				w.incrementalStatsManager.IncrementGroupFlushReason("namespace")
 			} else if len(w.currentGroup.Operations) >= w.incrementalWriteBatchSize {
-				w.statsManager.IncrementGroupFlushReason("batchfull")
+				w.incrementalStatsManager.IncrementGroupFlushReason("batchfull")
 			} else if w.currentGroup.OpType != opType {
-				w.statsManager.IncrementGroupFlushReason("optype")
+				w.incrementalStatsManager.IncrementGroupFlushReason("optype")
 			}
 		}
 
 		// Add current group to processing queue
-		w.processingQueue <- w.currentGroup
+		w.pushToBatchWriteQueue(w.currentGroup)
 		w.currentGroup = nil
 		w.currentGroupIDs = make(map[int]bool)
 	}
@@ -596,39 +798,46 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 
 	// If current group has reached max size, add it to the queue
 	if len(w.currentGroup.Operations) >= w.incrementalWriteBatchSize {
-		if w.statsManager != nil {
-			w.statsManager.IncrementGroupFlushReason("batchfull")
+		if w.incrementalStatsManager != nil {
+			w.incrementalStatsManager.IncrementGroupFlushReason("batchfull")
 		}
-		w.processingQueue <- w.currentGroup
+		w.pushToBatchWriteQueue(w.currentGroup)
 		w.currentGroup = nil
 	}
 }
 
-// processGroups processes groups in the queue sequentially
-func (w *Worker) processGroups() {
-	w.wg.Add(1)
+// processBatchWriteQueue processes groups in the batch write queue sequentially
+func (w *Worker) processBatchWriteQueue() {
 	defer w.wg.Done()
 
 	for {
 		select {
-		case group, ok := <-w.processingQueue:
+		case group, ok := <-w.batchWriteQueue:
 			if !ok {
 				// Channel closed, shutdown worker
-				if w.shutdownInProgress {
+				if w.isShutdownInProgress() {
 					w.log.Debugf("Completed processing all groups during shutdown")
 				}
 				return
 			}
 			// Process the group
-			w.processGroup(*group)
+			w.executeBatchWrite(*group)
 		case <-w.ctx.Done():
 			return
 		}
 	}
 }
 
-// processGroup processes a single operation group
-func (w *Worker) processGroup(group OperationGroup) {
+// executeBatchWrite processes a single operation group
+func (w *Worker) executeBatchWrite(group OperationGroup) {
+	if w.partitionTracker != nil {
+		defer func() {
+			for _, op := range group.Operations {
+				w.partitionTracker.Ack(op.StreamIndex, op.SeqNum)
+			}
+		}()
+	}
+
 	w.log.Debugf("Processing group: %s.%s with %d operations",
 		group.Namespace, group.OpType, len(group.Operations))
 
@@ -649,8 +858,8 @@ func (w *Worker) processGroup(group OperationGroup) {
 			group.Operations[i].SuccessTime = now
 		}
 		w.log.Debugf("[%s.%s] Don't apply: dropped batch of %d %s operations", dbName, targetCollName, len(group.Operations), group.OpType)
-		if w.statsManager != nil {
-			w.statsManager.RecordLags(group.Operations)
+		if w.incrementalStatsManager != nil {
+			w.incrementalStatsManager.RecordLags(group.Operations)
 		}
 		return
 	}
@@ -669,8 +878,8 @@ func (w *Worker) processGroup(group OperationGroup) {
 	// Determine if we should use ordered operations
 	useOrdered := group.OpType == "update" || group.OpType == "replace" || w.forceOrderedOperations
 
-	if w.statsManager != nil {
-		w.statsManager.RecordBulkWrite(len(group.Operations), useOrdered)
+	if w.incrementalStatsManager != nil {
+		w.incrementalStatsManager.RecordBulkWrite(len(group.Operations), useOrdered)
 	}
 
 	// Process based on operation type
@@ -693,8 +902,8 @@ func (w *Worker) processGroup(group OperationGroup) {
 		if len(models) > 0 {
 			startTime := time.Now()
 			_, err := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
-			if w.statsManager != nil {
-				w.statsManager.RecordLatency(group.OpType, group.Operations, time.Since(startTime), w.id, err == nil)
+			if w.incrementalStatsManager != nil {
+				w.incrementalStatsManager.RecordLatency(group.OpType, group.Operations, time.Since(startTime), w.id, err == nil)
 			}
 			w.handleBulkWriteResult(writeCtx, &group, err, targetCollection, dbName, collName, func() error {
 				_, retryBulkErr := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
@@ -717,8 +926,8 @@ func (w *Worker) processGroup(group OperationGroup) {
 		if len(docs) > 0 {
 			startTime := time.Now()
 			_, err := targetCollection.InsertMany(writeCtx, docs, options.InsertMany().SetOrdered(useOrdered))
-			if w.statsManager != nil {
-				w.statsManager.RecordLatency("insert", group.Operations, time.Since(startTime), w.id, err == nil)
+			if w.incrementalStatsManager != nil {
+				w.incrementalStatsManager.RecordLatency("insert", group.Operations, time.Since(startTime), w.id, err == nil)
 			}
 			w.handleBulkWriteResult(writeCtx, &group, err, targetCollection, dbName, collName, func() error {
 				_, retryInsertErr := targetCollection.InsertMany(writeCtx, docs, options.InsertMany().SetOrdered(useOrdered))
@@ -728,8 +937,8 @@ func (w *Worker) processGroup(group OperationGroup) {
 	}
 
 	// Record replication lag for successfully processed operations
-	if w.statsManager != nil {
-		w.statsManager.RecordLags(group.Operations)
+	if w.incrementalStatsManager != nil {
+		w.incrementalStatsManager.RecordLags(group.Operations)
 	}
 }
 
@@ -781,8 +990,8 @@ func (w *Worker) handleBulkWriteResult(ctx context.Context, group *OperationGrou
 
 			isDup := isDuplicateKeyError(writeErr.Code, writeErr.Message)
 			if isDup {
-				if w.statsManager != nil {
-					w.statsManager.IncrementDuplicateKeys(1)
+				if w.incrementalStatsManager != nil {
+					w.incrementalStatsManager.IncrementDuplicateKeys(1)
 				}
 				w.log.Debugf("[%s.%s] Duplicate key occurrence at index %d (opType=%s), _id=%v: %v. Gracefully falling back.", dbName, collName, writeErr.Index, op.OpType, failedDocID, writeErr.Message)
 			} else {
@@ -845,6 +1054,13 @@ func (w *Worker) getTargetCollectionName(dbName, collName string) string {
 	return collName
 }
 
+// isShutdownInProgress returns if a shutdown task is currently in progress thread-safely
+func (w *Worker) isShutdownInProgress() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.shutdownInProgress
+}
+
 // WaitForCompletion waits for all processing to complete
 func (w *Worker) WaitForCompletion() {
 	w.wg.Wait()
@@ -857,8 +1073,8 @@ func (w *Worker) Shutdown() {
 	w.shutdownInProgress = true
 	w.mu.Unlock()
 
-	// Close raw incoming queue to signal eventLoop to drain and close processingQueue
-	close(w.incomingQueue)
+	// Close raw incoming queue to signal eventLoop to drain and close batchWriteQueue
+	close(w.batchingQueue)
 
 	// Wait for both eventLoop and processGroups goroutines to complete
 	w.WaitForCompletion()
@@ -867,8 +1083,8 @@ func (w *Worker) Shutdown() {
 // retryIndividualOperation retries a single failed write operation of a batch using fallback execution.
 func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection *mongo.Collection, op *WriteOperation, dbName, collName string, originalErrorMsg string) {
 	filter := bson.M{"_id": op.DocumentID}
-	if w.statsManager != nil {
-		w.statsManager.IncrementSequentialRetries(op.OpType, 1)
+	if w.incrementalStatsManager != nil {
+		w.incrementalStatsManager.IncrementSequentialRetries(op.OpType, 1)
 	}
 
 	// Check if this error represents a duplicate key/already exists constraint failure
@@ -899,8 +1115,8 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 			if _, err := targetCollection.InsertOne(ctx, transformed); err != nil {
 				// If it actually already exists (e.g. concurrent write or socket retry pre-exist), fallback to ReplaceOne upsert
 				if isDuplicateKeyError(0, err.Error()) {
-					if w.statsManager != nil {
-						w.statsManager.IncrementDuplicateKeys(1)
+					if w.incrementalStatsManager != nil {
+						w.incrementalStatsManager.IncrementDuplicateKeys(1)
 					}
 					w.log.Debugf("[%s.%s] Fallback InsertOne got duplicate key, retrying with upsert overwrite for _id=%v", dbName, collName, op.DocumentID)
 					if _, replaceErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true)); replaceErr != nil {
@@ -936,8 +1152,8 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 
 				// If it failed because the document already exists (concurrent upsert collision), retry with upsert=false
 				if isDuplicateKeyError(0, err.Error()) {
-					if w.statsManager != nil {
-						w.statsManager.IncrementDuplicateKeys(1)
+					if w.incrementalStatsManager != nil {
+						w.incrementalStatsManager.IncrementDuplicateKeys(1)
 					}
 					w.log.Debugf("[%s.%s] Concurrent upsert collision detected for replace document _id=%v, retrying without upsert", dbName, collName, op.DocumentID)
 					if _, retryErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(false)); retryErr != nil {
@@ -975,8 +1191,8 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 
 			// If it failed because the document already exists (concurrent upsert collision), retry with upsert=false
 			if isDuplicateKeyError(0, err.Error()) {
-				if w.statsManager != nil {
-					w.statsManager.IncrementDuplicateKeys(1)
+				if w.incrementalStatsManager != nil {
+					w.incrementalStatsManager.IncrementDuplicateKeys(1)
 				}
 				w.log.Debugf("[%s.%s] Concurrent upsert collision detected for replace document _id=%v, retrying without upsert", dbName, collName, op.DocumentID)
 				if _, retryErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(false)); retryErr != nil {
@@ -1153,4 +1369,185 @@ func StartPeriodicFlushLoop(ctx context.Context, workers []*Worker, flushInterva
 			}
 		}
 	}()
+}
+
+// InFlightEvent represents a change stream event that is currently in-flight/processing
+type InFlightEvent struct {
+	SeqNum      uint64
+	ResumeToken bson.Raw
+	Acked       bool
+	EventTime   time.Time
+}
+
+// PartitionTracker coordinates safe, backlogged-aware checkpointing of multi-partition change streams
+type PartitionTracker struct {
+	mu                 sync.Mutex
+	log                *logger.Logger
+	resumeTokenPath    string
+	unackedEvents      map[int]map[uint64]*InFlightEvent
+	pendingSeqs        map[int][]uint64
+	nextSeqNum         map[int]uint64
+	lastCheckpointSeq  map[int]uint64
+	ackCountSinceSave  int
+	saveThreshold      int
+	checkpointInterval time.Duration
+	lastSaveTime       time.Time
+	totalPartitions    int
+}
+
+// NewPartitionTracker creates a new PartitionTracker
+func NewPartitionTracker(log *logger.Logger, resumeTokenPath string, checkpointInterval time.Duration, saveThreshold int, totalPartitions int) *PartitionTracker {
+	if checkpointInterval <= 0 {
+		checkpointInterval = time.Minute
+	}
+	if saveThreshold <= 0 {
+		saveThreshold = 1000
+	}
+	return &PartitionTracker{
+		log:                log,
+		resumeTokenPath:    resumeTokenPath,
+		unackedEvents:      make(map[int]map[uint64]*InFlightEvent),
+		pendingSeqs:        make(map[int][]uint64),
+		nextSeqNum:         make(map[int]uint64),
+		lastCheckpointSeq:  make(map[int]uint64),
+		saveThreshold:      saveThreshold,
+		checkpointInterval: checkpointInterval,
+		lastSaveTime:       time.Now(),
+		totalPartitions:    totalPartitions,
+	}
+}
+
+// Start spawns a background periodic flush goroutine for PartitionTracker checkpoints
+func (t *PartitionTracker) Start(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(t.checkpointInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				t.mu.Lock()
+				if t.ackCountSinceSave > 0 || time.Since(t.lastSaveTime) >= t.checkpointInterval {
+					t.saveCheckpointsLocked()
+				}
+				t.mu.Unlock()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// Register registers a newly read event for the given partition/streamIndex, returns its unique sequence number
+func (t *PartitionTracker) Register(streamIndex int, resumeToken bson.Raw, eventTime time.Time) uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	seq := t.nextSeqNum[streamIndex]
+	if seq == 0 {
+		seq = 1
+	}
+	t.nextSeqNum[streamIndex] = seq + 1
+
+	event := &InFlightEvent{
+		SeqNum:      seq,
+		ResumeToken: resumeToken,
+		Acked:       false,
+		EventTime:   eventTime,
+	}
+
+	if t.unackedEvents[streamIndex] == nil {
+		t.unackedEvents[streamIndex] = make(map[uint64]*InFlightEvent)
+	}
+	t.unackedEvents[streamIndex][seq] = event
+	t.pendingSeqs[streamIndex] = append(t.pendingSeqs[streamIndex], seq)
+
+	return seq
+}
+
+// Ack marks the given sequence number in the partition/streamIndex as successfully processed/completed
+func (t *PartitionTracker) Ack(streamIndex int, seq uint64) {
+	if seq == 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if events, ok := t.unackedEvents[streamIndex]; ok {
+		if event, ok := events[seq]; ok {
+			if !event.Acked {
+				event.Acked = true
+				t.ackCountSinceSave++
+			}
+		}
+	}
+
+	if t.ackCountSinceSave >= t.saveThreshold || time.Since(t.lastSaveTime) >= t.checkpointInterval {
+		t.saveCheckpointsLocked()
+	}
+}
+
+// Close flushes final checkpoints and logs outstanding in-flight warnings
+func (t *PartitionTracker) Close() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.saveCheckpointsLocked()
+
+	for streamIndex, seqs := range t.pendingSeqs {
+		if len(seqs) > 0 {
+			t.log.Warnf("[PartitionTracker] Shutdown complete with %d unacknowledged events in partition %d (first unacked seq: %d)", 
+				len(seqs), streamIndex, seqs[0])
+		}
+	}
+}
+
+// saveCheckpointsLocked evaluates the consecutive ACK boundary and advances checkpoints on disk
+func (t *PartitionTracker) saveCheckpointsLocked() {
+	t.lastSaveTime = time.Now()
+	t.ackCountSinceSave = 0
+
+	for streamIndex, seqs := range t.pendingSeqs {
+		var prunedCount int
+		var highestSafeToken bson.Raw
+		var highestSafeTime time.Time
+		var highestSafeSeq uint64
+
+		for _, seq := range seqs {
+			event := t.unackedEvents[streamIndex][seq]
+			if event != nil && event.Acked {
+				highestSafeToken = event.ResumeToken
+				highestSafeTime = event.EventTime
+				highestSafeSeq = seq
+				delete(t.unackedEvents[streamIndex], seq)
+				prunedCount++
+			} else {
+				break
+			}
+		}
+
+		if prunedCount > 0 {
+			t.pendingSeqs[streamIndex] = t.pendingSeqs[streamIndex][prunedCount:]
+		}
+
+		if highestSafeSeq > 0 && highestSafeSeq > t.lastCheckpointSeq[streamIndex] {
+			t.lastCheckpointSeq[streamIndex] = highestSafeSeq
+			t.savePartitionResumeToken(streamIndex, highestSafeToken, highestSafeTime)
+		}
+	}
+}
+
+// savePartitionResumeToken persists the partition-specific resume token with rotation backups
+func (t *PartitionTracker) savePartitionResumeToken(partitionIndex int, resumeToken bson.Raw, eventTime time.Time) {
+	var resumeTokenDoc bson.M
+	if err := bson.Unmarshal(resumeToken, &resumeTokenDoc); err != nil {
+		t.log.Errorf("[PartitionTracker %d] Error unmarshaling resume token: %v", partitionIndex, err)
+		return
+	}
+
+	path := GetPartitionResumeTokenPath(t.resumeTokenPath, partitionIndex, t.totalPartitions)
+	if err := SaveResumeToken(path, resumeTokenDoc, eventTime); err != nil {
+		t.log.Errorf("[PartitionTracker %d] Error saving resume token to %s: %v", partitionIndex, path, err)
+	} else {
+		t.log.Debugf("[PartitionTracker %d] Saved resume token successfully to %s (seq: %d)", partitionIndex, path, t.lastCheckpointSeq[partitionIndex])
+	}
 }

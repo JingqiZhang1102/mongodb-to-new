@@ -28,6 +28,7 @@ type Config struct {
 
 	// Parameters for incremental replication
 	IncrementalReadBatchSize  int `json:"incrementalReadBatchSize"`  // Number of change events to read at once
+	IncrementalStreamPartitions int `json:"incrementalStreamPartitions"` // Number of parallel change stream partitions
 	IncrementalWriteBatchSize int `json:"incrementalWriteBatchSize"` // Maximum size of operation groups
 	IncrementalWorkerCount    int `json:"incrementalWorkerCount"`    // Number of worker goroutines
 	StatsIntervalMinutes      int `json:"statsIntervalMinutes"`      // Interval for reporting change stream statistics in minutes
@@ -133,6 +134,10 @@ func LoadConfig(configPath string) (*Config, error) {
 	// Set default values for incremental replication parameters
 	if config.IncrementalReadBatchSize <= 0 {
 		config.IncrementalReadBatchSize = 8192 // Default to 8192 change events
+	}
+
+	if config.IncrementalStreamPartitions <= 0 {
+		config.IncrementalStreamPartitions = 1
 	}
 
 	if config.IncrementalWriteBatchSize <= 0 {

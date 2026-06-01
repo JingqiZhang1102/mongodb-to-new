@@ -186,6 +186,7 @@ If you want to migrate only specific collections or rename collections during mi
 - **initialMigrationWorkers**: Number of worker goroutines for batch processing during standard migration (default: 5).
 - **concurrentCollections**: Number of collections to process concurrently (default: 4).
 - **incrementalReadBatchSize**: Number of change events to read at once (default: 8192).
+- **incrementalStreamPartitions**: Number of parallel sharded change stream readers at MongoDB source level (default: 1).
 - **incrementalWriteBatchSize**: Maximum size of operation groups (default: 128).
 - **incrementalWorkerCount**: Number of worker goroutines for incremental replication (default: number of CPU cores).
 - **statsIntervalMinutes**: Interval for reporting change stream statistics in minutes (default: 5).
@@ -463,19 +464,25 @@ When no `collections` are specified (as above), the tool will automatically dete
    ./migrate -help
    ```
 
-   This will display all available command-line options:
+    This will display all available command-line options:
 
-   ```
-   Options:
-     -config string
-           Path to configuration file (default "mongodb_replication_config.json")
-     -mode string
-           Operation mode: 'migrate' or 'live' (default "migrate")
-     -log-level string
-           Log level: debug, info, warn, error (default "info")
-     -help
-           Display this help information
-   ```
+    ```
+    Options:
+      -config string
+            Path to configuration file (default "mongodb_replication_config.json")
+      -mode string
+            Operation mode: 'migrate', 'live', or 'live-only' (default "migrate")
+      -log-level string
+            Log level: debug, info, warn, error (default "info")
+      -log-file string
+            Path to log file (logs to both stdout and file when specified)
+      -live-start-timestamp string
+            Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)
+      -dry-run
+            Dry run mode (live-only migrations only, drops all events in reader)
+      -help
+            Display this help information
+    ```
 
 ## Key Features
 
@@ -510,10 +517,12 @@ The application implements parallelism at multiple levels to maximize performanc
    - Provides an additional level of parallelism for large collections
 
 5. **Change Stream Parallelism** (Live Mode):
-   - In live mode, a client-level change stream watches all collections
-   - Change events are distributed to workers based on document ID hash
-   - Controlled by the `incrementalWorkerCount` parameter (default: CPU cores)
-   - Ensures operations for the same document are always processed by the same worker
+   - **Sharded Ingestion Partitions**: Controlled by `incrementalStreamPartitions`. The system spawns parallel sharded change streams at the MongoDB source level
+   - **Hashing-based Server-Side Filtering**: At ingestion time, the system splits the change streams lock-freely using a server-side modulo hash filter on document ID values:
+     `hash(documentKey._id) % totalPartitions == partitionIndex`
+     This ensures that each of the parallel change streams receives a completely disjoint, non-overlapping subset of oplog events, enabling parallelized high-throughput ingestion
+   - **Worker Hash Distribution**: Within the replicator, the `partition router` further distributes events across `transformer and batcher` worker threads (controlled by `incrementalWorkerCount`) using document ID key hashing
+   - **Sequential Consistency**: This ensures that all operations for the same document ID always go to the same worker and are processed in their strict chronological sequence
 
 ### Tuning Parallelism Parameters
 
