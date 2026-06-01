@@ -1354,10 +1354,14 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 
 						if id != nil {
 							filter := bson.M{"_id": id}
-							if _, err := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); err != nil {
-								m.log.Errorf("[%s.%s] Retry upsert failed for document _id=%v: %v", sourceDB, sourceCollection, id, err)
+							retryErr := retryManager.RetryWithBackoff(ctx, func() error {
+								_, replaceErr := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true))
+								return replaceErr
+							})
+							if retryErr != nil {
+								m.log.Errorf("[%s.%s] Retry upsert failed for document _id=%v after retries: %v", sourceDB, sourceCollection, id, retryErr)
 								batchFailed++
-								opts.DLQ.WriteFailed(sourceDB, sourceCollection, id, err, "initial", "insert", doc)
+								opts.DLQ.WriteFailed(sourceDB, sourceCollection, id, retryErr, "initial", "insert", doc)
 							}
 						} else {
 							batchFailed++
@@ -1391,14 +1395,18 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 							docID := extractDocID(doc)
 							if docID != nil {
 								filter := bson.M{"_id": docID}
-								if _, err := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); err != nil {
-									if err == context.Canceled {
+								retryErr := retryManager.RetryWithBackoff(ctx, func() error {
+									_, replaceErr := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true))
+									return replaceErr
+								})
+								if retryErr != nil {
+									if retryErr == context.Canceled {
 										m.log.Debugf("Upserting document %v in %s.%s canceled due to context cancellation", docID, sourceDB, sourceCollection)
 									} else {
-										m.log.Errorf("Error upserting document %v in %s.%s: %v", docID, sourceDB, sourceCollection, err)
+										m.log.Errorf("Error upserting document %v in %s.%s after retries: %v", docID, sourceDB, sourceCollection, retryErr)
 										batchFailed++
 										if opts.DLQ != nil {
-											opts.DLQ.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
+											opts.DLQ.WriteFailed(sourceDB, sourceCollection, docID, retryErr, "initial", "insert", doc)
 										}
 									}
 								}
