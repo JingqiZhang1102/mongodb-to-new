@@ -338,19 +338,120 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		if err := SaveInitialMigrationState(initialMigrationStatePath, StatusInProgress, 0); err != nil {
 			return fmt.Errorf("failed to save initial migration state as incomplete: %w", err)
 		}
+		initialMigrationStart := time.Now()
+		r.log.Info("Performing initial migration for all collections")
 
-		retryManager := NewRetryManagerFromConfig(r.config, r.log)
-		initialMigrator := NewInitialMigrator(r.sourceDB, r.targetDB, r.config, r.log, r.collectionConfigs, r.dlq, retryManager)
-		initialMigrator.DontApply = r.DontApply
-		initialMigrator.DryRun = r.DryRun
+		// Sync indexes before migrating data if configured
+		if pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0 {
+			r.log.Info("Syncing indexes before initial migration")
+			var collections []config.CollectionConfig
+			for _, colls := range r.collectionConfigs {
+				for _, collConfig := range colls {
+					collections = append(collections, collConfig)
+				}
+			}
+			if err := migrator.syncIndexes(ctx, r.sourceDB, r.targetDB, pair, collections); err != nil {
+				r.log.Warnf("Index sync encountered issues: %v (continuing with migration)", err)
+			}
 
-		_, totalFailedCount, err := initialMigrator.Run(ctx, pair, migrator)
-		if err != nil {
-			return fmt.Errorf("initial migration failed: %w", err)
+			// Index-Only mode: wait for all async index builds then return without migrating data
+			if pair.Target.IndexOnly {
+				r.log.Info("IndexOnly mode enabled. Waiting for all async index creation to complete...")
+				r.targetDB.WaitForIndexCreation()
+				r.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration.")
+
+				// Determine if initial migration completed with failures (none in IndexOnly since no data migrated)
+				if err := SaveInitialMigrationState(initialMigrationStatePath, StatusCompleted, 0); err != nil {
+					r.log.Errorf("Error saving initial migration state as complete: %v", err)
+				}
+				return nil
+			}
 		}
 
-		if pair.Target.IndexOnly {
-			return nil
+		// Use a semaphore to limit the number of concurrent collection migrations
+		concurrentCollections := r.config.ConcurrentCollections
+		if concurrentCollections <= 0 {
+			concurrentCollections = 4
+		}
+		r.log.Infof("Processing up to %d collections concurrently", concurrentCollections)
+		semaphore := make(chan struct{}, concurrentCollections)
+		var wg sync.WaitGroup
+
+		// Track overall statistics
+		var totalMigratedCount int64
+		var totalFailedCount int64
+		var completedCollections int64
+		var mu sync.Mutex // Mutex for thread-safe updates to statistics
+
+		// Track critical errors
+		var criticalErr error
+		var errOnce sync.Once
+
+		totalCollections := 0
+		for _, colls := range r.collectionConfigs {
+			totalCollections += len(colls)
+		}
+
+		// Iterate through all collections in the map
+		for sourceDB, collections := range r.collectionConfigs {
+			for sourceCollection, collConfig := range collections {
+				wg.Add(1)
+				semaphore <- struct{}{}
+
+				go func(sourceDB, sourceCollection string, collConfig config.CollectionConfig) {
+					defer wg.Done()
+					defer func() { <-semaphore }()
+
+					r.log.Infof("Starting initial migration for %s.%s to %s", sourceDB, sourceCollection, collConfig.TargetCollection)
+
+					opts := MigrateOptions{
+						DLQ:          r.dlq,
+						StatsManager: r.incrementalStatsManager,
+						UpsertMode:   true, // resilient mode always performs upserts on duplicates
+					}
+
+					succeeded, failed, err := migrator.migrateCollection(ctx, r.sourceDB, r.targetDB, collConfig, opts)
+					if err != nil {
+						errOnce.Do(func() {
+							criticalErr = fmt.Errorf("critical error during migration of collection %s.%s: %w", sourceDB, sourceCollection, err)
+						})
+					}
+
+					// Update overall statistics and log overall progress
+					mu.Lock()
+					totalMigratedCount += succeeded + failed
+					totalFailedCount += failed
+					completedCollections++
+					r.log.Infof("Overall progress: %d/%d collections completed", completedCollections, totalCollections)
+					mu.Unlock()
+				}(sourceDB, sourceCollection, collConfig)
+			}
+		}
+
+		// Wait for all collection migrations to complete
+		wg.Wait()
+
+		if criticalErr != nil {
+			return criticalErr
+		}
+
+		initialMigrationDuration := time.Since(initialMigrationStart)
+		var failurePercentage float64
+		if totalMigratedCount > 0 {
+			failurePercentage = (float64(totalFailedCount) * 100.0) / float64(totalMigratedCount)
+		}
+		r.log.Infof("Initial migration completed in %.2f seconds. Total collections: %d, Total documents: %d (Success: %d, Failed: %d, Failure Rate: %.2f%%)",
+			initialMigrationDuration.Seconds(), totalCollections, totalMigratedCount, totalMigratedCount-totalFailedCount, totalFailedCount, failurePercentage)
+
+		// Issue warning if the sum of all failed collections does not match actual DLQ write count
+		if r.dlq != nil {
+			if _, isNop := r.dlq.(*NopDLQWriter); !isNop {
+				dlqCount := r.dlq.Count()
+				if totalFailedCount != dlqCount {
+					r.log.Warnf("DLQ Metric mismatch: sum of failed counts across collections (%d) does not match DLQ written count (%d)",
+						totalFailedCount, dlqCount)
+				}
+			}
 		}
 
 		// Determine if initial migration completed with failures
@@ -530,3 +631,5 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 	}
 	return err
 }
+
+

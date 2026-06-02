@@ -428,9 +428,15 @@ func (m *MongoDB) createIndexOnCollection(ctx context.Context, collection *mongo
 
 	indexModel.Options = opts
 
+	m.log.Infof("[async] Sending index creation request for '%s' on collection '%s' to Firestore...", indexName, collectionName)
+	startTime := time.Now()
 	_, err := collection.Indexes().CreateOne(ctx, indexModel)
 	if err != nil {
+		m.log.Infof("[async] Received ERROR response for index '%s' on collection '%s' after %v: %v", 
+			indexName, collectionName, time.Since(startTime).Round(time.Second), err)
 		return fmt.Errorf("failed to create index '%s' on collection %s: %w", indexName, collectionName, err)
 	}
+	m.log.Infof("[async] Received SUCCESS response for index '%s' on collection '%s' after %v", 
+		indexName, collectionName, time.Since(startTime).Round(time.Second))
 	return nil
 }
