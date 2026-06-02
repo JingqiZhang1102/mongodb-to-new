@@ -51,35 +51,35 @@ func TestLagTrackerAccumulationAndFlush(t *testing.T) {
 	res := tracker.Flush()
 
 	// readToEventTimeLag: (100ms + 100ms) / 2 = 100ms
-	if res.ReadToEventTimeLag != 100*time.Millisecond {
-		t.Errorf("expected ReadToEventTimeLag 100ms, got %v", res.ReadToEventTimeLag)
+	if res.EventToReadLag != 100*time.Millisecond {
+		t.Errorf("expected EventToReadLag 100ms, got %v", res.EventToReadLag)
 	}
 	// workerReceivedToReadTimeLag: (200ms + 200ms) / 2 = 200ms
-	if res.WorkerReceivedToReadTimeLag != 200*time.Millisecond {
-		t.Errorf("expected WorkerReceivedToReadTimeLag 200ms, got %v", res.WorkerReceivedToReadTimeLag)
+	if res.ReadToWorkerReceiveLag != 200*time.Millisecond {
+		t.Errorf("expected ReadToWorkerReceiveLag 200ms, got %v", res.ReadToWorkerReceiveLag)
 	}
 	
 	// successTimeToWorkerReceivedLag (from op3 only): 100ms
-	if res.SuccessTimeToWorkerReceivedLag != 100*time.Millisecond {
-		t.Errorf("expected SuccessTimeToWorkerReceivedLag 100ms, got %v", res.SuccessTimeToWorkerReceivedLag)
+	if res.ReceiveToApplyLag != 100*time.Millisecond {
+		t.Errorf("expected ReceiveToApplyLag 100ms, got %v", res.ReceiveToApplyLag)
 	}
 	// successTimeToEventTimeLag (from op3 only): 400ms
-	if res.SuccessTimeToEventTimeLag != 400*time.Millisecond {
-		t.Errorf("expected SuccessTimeToEventTimeLag 400ms, got %v", res.SuccessTimeToEventTimeLag)
+	if res.EndToEndLag != 400*time.Millisecond {
+		t.Errorf("expected EndToEndLag 400ms, got %v", res.EndToEndLag)
 	}
 	
 	// successWithRetryTimeToEventTime (from op1 only): 400ms
-	if res.SuccessWithRetryTimeToEventTime != 400*time.Millisecond {
-		t.Errorf("expected SuccessWithRetryTimeToEventTime 400ms, got %v", res.SuccessWithRetryTimeToEventTime)
+	if res.EndToEndWithRetryLag != 400*time.Millisecond {
+		t.Errorf("expected EndToEndWithRetryLag 400ms, got %v", res.EndToEndWithRetryLag)
 	}
 	// successWithRetryLagToWorkerReceivedTime (from op1 only): 100ms
-	if res.SuccessWithRetryLagToWorkerReceivedTime != 100*time.Millisecond {
-		t.Errorf("expected SuccessWithRetryLagToWorkerReceivedTime 100ms, got %v", res.SuccessWithRetryLagToWorkerReceivedTime)
+	if res.ReceiveToApplyWithRetryLag != 100*time.Millisecond {
+		t.Errorf("expected ReceiveToApplyWithRetryLag 100ms, got %v", res.ReceiveToApplyWithRetryLag)
 	}
 
 	// Verify counters reset after Flush
 	res2 := tracker.Flush()
-	if res2.ReadToEventTimeLag != 0 || res2.WorkerReceivedToReadTimeLag != 0 || res2.SuccessTimeToWorkerReceivedLag != 0 || res2.SuccessTimeToEventTimeLag != 0 || res2.SuccessWithRetryTimeToEventTime != 0 || res2.SuccessWithRetryLagToWorkerReceivedTime != 0 {
+	if res2.EventToReadLag != 0 || res2.ReadToWorkerReceiveLag != 0 || res2.ReceiveToApplyLag != 0 || res2.EndToEndLag != 0 || res2.EndToEndWithRetryLag != 0 || res2.ReceiveToApplyWithRetryLag != 0 {
 		t.Errorf("expected flushed metrics to reset to 0, got %+v", res2)
 	}
 }

@@ -73,6 +73,13 @@ func (w *DLQWriter) WriteFailed(sourceDB, sourceCollection string, documentID in
 	data = append(data, '\n')
 
 	w.mu.Lock()
+	// Thread-Safety Check: If the DLQ writer has been closed (e.g., during active worker shutdown or test cleanup),
+	// w.file is nil. Writing to a nil file raises a nil pointer panic. We check this under the lock and abort safely.
+	if w.file == nil {
+		w.mu.Unlock()
+		w.log.Errorf("DLQ: Attempted to write to a closed DLQ writer [db=%s, collection=%s, _id=%v]", sourceDB, sourceCollection, documentID)
+		return
+	}
 	_, writeErr := w.file.Write(data)
 	w.mu.Unlock()
 

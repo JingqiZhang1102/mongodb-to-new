@@ -110,7 +110,7 @@ func (r *OplogReplicatorLegacy) getCurrentOplogTimestamp() (*primitive.Timestamp
 }
 
 // StartReplication starts the oplog-based replication using GTM legacy
-func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTimestamp interface{}, timestampPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, liveOnly bool, cdcStartTime *primitive.Timestamp, migrator *Migrator) error {
+func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTimestamp interface{}, timestampPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, liveOnly bool, liveStartTime *primitive.Timestamp, migrator *Migrator) error {
 	// Abort if the initial migration state was completed with failures, or if DLQ has entries
 	if initialMigrationState != nil && initialMigrationState.Status == StatusCompletedWithFailures {
 		return fmt.Errorf("cannot start replication: initial migration completed with failures in a previous run")
@@ -124,11 +124,11 @@ func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTime
 	}
 
 	// Enforce safety invariants between Initial Migration State and Oplog Timestamp Checkpoint
-	if cdcStartTime != nil && globalTimestamp != nil {
-		return fmt.Errorf("safety violation: a custom cdc-start-timestamp is specified, but a global oplog timestamp checkpoint already exists. Clean up checkpoint file or omit cdc-start-timestamp to resume from the last checkpoint")
+	if liveStartTime != nil && globalTimestamp != nil {
+		return fmt.Errorf("safety violation: a custom live-start-timestamp is specified, but a global oplog timestamp checkpoint already exists. Clean up checkpoint file or omit live-start-timestamp to resume from the last checkpoint")
 	}
 
-	if cdcStartTime == nil {
+	if liveStartTime == nil {
 		if initialMigrationState == nil {
 			if globalTimestamp != nil {
 				return fmt.Errorf("safety violation: initial migration state file does not exist, but a global oplog timestamp checkpoint exists. Clean up checkpoint file or ensure state is in sync before proceeding")
@@ -174,17 +174,17 @@ func (r *OplogReplicatorLegacy) StartReplication(ctx context.Context, globalTime
 	}
 
 	// If no saved legacy timestamp checkpoint is found on disk:
-	// - If a custom cdcStartTime was supplied, initialize the legacy Tail afterTimestamp
+	// - If a custom liveStartTime was supplied, initialize the legacy Tail afterTimestamp
 	//   by shifting the seconds (T) 32 bits to the left and bitwise-ORing with the increment (I).
 	// - Otherwise, fallback to fetching the current oplog timestamp from the source DB.
 	if savedTimestamp == nil {
-		if cdcStartTime != nil {
-			r.log.Infof("Using user-provided cdcStartTime: %s", time.Unix(int64(cdcStartTime.T), 0).UTC().Format(time.RFC3339))
-			initialOplogTimestamp := &primitive.Timestamp{T: cdcStartTime.T, I: cdcStartTime.I}
+		if liveStartTime != nil {
+			r.log.Infof("Using user-provided liveStartTime: %s", time.Unix(int64(liveStartTime.T), 0).UTC().Format(time.RFC3339))
+			initialOplogTimestamp := &primitive.Timestamp{T: liveStartTime.T, I: liveStartTime.I}
 			savedTimestamp = &OplogTimestamp{Timestamp: *initialOplogTimestamp}
 			// Legacy bson.MongoTimestamp is represented as a 64-bit int where the upper 32 bits
 			// are the Unix epoch seconds and the lower 32 bits are the increment counter.
-			afterTimestamp = bson.MongoTimestamp((int64(cdcStartTime.T) << 32) | int64(cdcStartTime.I))
+			afterTimestamp = bson.MongoTimestamp((int64(liveStartTime.T) << 32) | int64(liveStartTime.I))
 		} else {
 			if liveOnly {
 				r.log.Info("No oplog timestamp found in live-only mode. Obtaining current oplog position to start incremental replication.")
@@ -1043,7 +1043,7 @@ func (r *OplogReplicatorLegacy) distributeOplogEvent(ctx context.Context, op *gt
 	changeEvent["readTime"] = time.Now()
 
 	// Send raw event to appropriate worker concurrently
-	workers[workerIndex].incomingQueue <- changeEvent
+	workers[workerIndex].batchingQueue <- changeEvent
 }
 
 // syncIndexesLegacy syncs indexes from the legacy mgo source to the modern driver target.

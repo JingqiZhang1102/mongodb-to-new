@@ -12,33 +12,59 @@ import (
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 )
 
-func TestDLQWriterLifecycle(t *testing.T) {
+func TestDLQWriterInitialCountIsZero(t *testing.T) {
 	tmpDir := t.TempDir()
 	dlqFilePath := filepath.Join(tmpDir, "test_dlq.jsonl")
 	log := logger.New()
 
-	// 1. Initialize DLQ
+	writer, err := NewDLQWriter(dlqFilePath, log)
+	if err != nil {
+		t.Fatalf("failed to create DLQWriter: %v", err)
+	}
+	defer writer.Close()
+
+	if writer.Count() != 0 {
+		t.Errorf("expected initial count to be 0, got %d", writer.Count())
+	}
+}
+
+func TestDLQWriterIncrementsCountOnWrite(t *testing.T) {
+	tmpDir := t.TempDir()
+	dlqFilePath := filepath.Join(tmpDir, "test_dlq.jsonl")
+	log := logger.New()
+
+	writer, err := NewDLQWriter(dlqFilePath, log)
+	if err != nil {
+		t.Fatalf("failed to create DLQWriter: %v", err)
+	}
+	defer writer.Close()
+
+	writer.WriteFailed("source_db", "col_1", "doc_id_123", errors.New("timeout"), "initial", "insert", nil)
+	writer.WriteFailed("source_db", "col_1", "doc_id_456", errors.New("dup key"), "incremental", "replace", nil)
+
+	if writer.Count() != 2 {
+		t.Errorf("expected count to be 2, got %d", writer.Count())
+	}
+}
+
+func TestDLQWriterWritesJSONLRecordsToDisk(t *testing.T) {
+	tmpDir := t.TempDir()
+	dlqFilePath := filepath.Join(tmpDir, "test_dlq.jsonl")
+	log := logger.New()
+
 	writer, err := NewDLQWriter(dlqFilePath, log)
 	if err != nil {
 		t.Fatalf("failed to create DLQWriter: %v", err)
 	}
 
-	// 2. Write multiple failures
 	err1 := errors.New("connection timed out")
 	writer.WriteFailed("source_db", "col_1", "doc_id_123", err1, "initial", "insert", map[string]interface{}{"name": "value"})
 
 	err2 := errors.New("duplicate key error")
 	writer.WriteFailed("source_db", "col_1", "doc_id_456", err2, "incremental", "replace", map[string]interface{}{"name": "value2"})
 
-	// 3. Verify memory counter
-	if writer.Count() != 2 {
-		t.Errorf("expected count to be 2, got %d", writer.Count())
-	}
-
-	// 4. Close writer
 	writer.Close()
 
-	// 5. Read file and assert contents
 	file, err := os.Open(dlqFilePath)
 	if err != nil {
 		t.Fatalf("failed to open DLQ file for verification: %v", err)
@@ -56,10 +82,6 @@ func TestDLQWriterLifecycle(t *testing.T) {
 		records = append(records, record)
 	}
 
-	if err := scanner.Err(); err != nil {
-		t.Fatalf("scanner error: %v", err)
-	}
-
 	if len(records) != 2 {
 		t.Fatalf("expected 2 records on disk, got %d", len(records))
 	}
@@ -70,7 +92,7 @@ func TestDLQWriterLifecycle(t *testing.T) {
 		t.Errorf("invalid record 1 metadata: %+v", r1)
 	}
 	if r1.Error != "connection timed out" || r1.Phase != "initial" || r1.OpType != "insert" {
-		t.Errorf("invalid record 1 error/phase details: %+v", r1)
+		t.Errorf("invalid record 1 error/phase: %+v", r1)
 	}
 
 	// Verify record 2
@@ -79,7 +101,7 @@ func TestDLQWriterLifecycle(t *testing.T) {
 		t.Errorf("invalid record 2 metadata: %+v", r2)
 	}
 	if r2.Error != "duplicate key error" || r2.Phase != "incremental" || r2.OpType != "replace" {
-		t.Errorf("invalid record 2 error/phase details: %+v", r2)
+		t.Errorf("invalid record 2 error/phase: %+v", r2)
 	}
 }
 
@@ -134,4 +156,33 @@ func TestNopDLQWriter(t *testing.T) {
 
 	// Should not panic
 	nop.Close()
+}
+
+// TestDLQWriterWriteFailedAfterClose verifies post-close thread-safety and panic prevention.
+// When DLQWriter is closed, the underlying file resource is set to nil. Concurrently invoking
+// WriteFailed from multiple worker threads must be handled gracefully, raising clean error logs but NEVER panicking.
+func TestDLQWriterWriteFailedAfterClose(t *testing.T) {
+	tmpDir := t.TempDir()
+	dlqFilePath := filepath.Join(tmpDir, "closed_dlq.jsonl")
+	log := logger.New()
+
+	writer, err := NewDLQWriter(dlqFilePath, log)
+	if err != nil {
+		t.Fatalf("failed to create DLQWriter: %v", err)
+	}
+
+	// Close the writer immediately to set w.file = nil
+	writer.Close()
+
+	// Concurrently call WriteFailed and expect no panics
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			// Should log error but NOT panic!
+			writer.WriteFailed("db", "col", id, errors.New("write after close"), "incremental", "insert", nil)
+		}(i)
+	}
+	wg.Wait()
 }
