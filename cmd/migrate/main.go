@@ -27,6 +27,8 @@ func main() {
 	liveStartTimeStr := flag.String("live-start-timestamp", "", "Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)")
 	dontApply := flag.Bool("dont-apply", false, "Don't apply mode (live-only migrations only, drops all target writes)")
 	dryRun := flag.Bool("dry-run", false, "Dry run mode (live-only migrations only, drops all events in reader)")
+	verifySampleSize := flag.Int("verify-sample-size", 1000, "Number of random documents to verify per collection when mode is 'verify'")
+	verifyReportFile := flag.String("verify-report-file", "verification_report.json", "Path to save the detailed JSON verification report")
 	help := flag.Bool("help", false, "Display help information")
 	flag.Parse()
 
@@ -65,8 +67,8 @@ func main() {
 
 
 	// Validate mode
-	if *mode != "migrate" && *mode != "live" && *mode != "live-only" {
-		log.Fatalf("Invalid mode: %s. Please choose either 'migrate', 'live', or 'live-only'", *mode)
+	if *mode != "migrate" && *mode != "live" && *mode != "live-only" && *mode != "verify" {
+		log.Fatalf("Invalid mode: %s. Please choose either 'migrate', 'live', 'live-only', or 'verify'", *mode)
 	}
 
 	// Validate dry-run and read-only options
@@ -122,9 +124,20 @@ func main() {
 	migrator.DontApply = *dontApply
 	migrator.DryRun = *dryRun
 
-	// Start migration/replication
+	// Start migration/replication/verification
 	startTime := time.Now()
 	log.Infof("Starting MongoDB to MongoDB %s process", *mode)
+
+	if *mode == "verify" {
+		verifier := migration.NewVerifier(cfg, log, *verifySampleSize, *verifyReportFile)
+		_, err := verifier.Verify(ctx)
+		if err != nil {
+			log.Fatalf("Verification failed: %v", err)
+		}
+		duration := time.Since(startTime)
+		log.Infof("Verification completed in %.2f seconds", duration.Seconds())
+		os.Exit(0)
+	}
 
 	if err := migrator.Start(ctx, *mode); err != nil {
 		// Check if the error is due to context cancellation (Ctrl+C)
