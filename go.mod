@@ -1,6 +1,6 @@
 module github.com/gsbingo17/mongodb-migration
 
-go 1.21
+go 1.25.0
 
 require (
 	github.com/globalsign/mgo v0.0.0-20181015135952-eeefdecb41b8
@@ -25,4 +25,5 @@ require (
 	golang.org/x/sync v0.8.0 // indirect
 	golang.org/x/sys v0.23.0 // indirect
 	golang.org/x/text v0.17.0 // indirect
+	golang.org/x/time v0.15.0 // indirect
 )

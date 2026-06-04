@@ -488,6 +488,7 @@ func TestWorkerTimeoutTickerFlush(t *testing.T) {
 func TestWorkerContextCancellationFlush(t *testing.T) {
 	log := logger.New()
 	ctx, cancel := context.WithCancel(context.Background())
+	statsMgr := NewIncrementalStatsManager(log, 0, false)
 
 	worker := NewWorker(
 		1,
@@ -499,7 +500,7 @@ func TestWorkerContextCancellationFlush(t *testing.T) {
 		false,
 		nil,
 		nil,
-		nil,
+		statsMgr,
 		false,
 		5*time.Minute, // very large interval so it won't timeout flush
 		8192,
@@ -520,9 +521,9 @@ func TestWorkerContextCancellationFlush(t *testing.T) {
 	cancel()
 
 	// Give background eventLoop thread a microsecond to detect cancellation and exit
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 
-	// Verify group has been successfully flushed and batchWriteQueue closed upon cancellation!
+	// Verify group has been successfully flushed upon cancellation!
 	worker.mu.Lock()
 	isNil := worker.currentGroup == nil
 	worker.mu.Unlock()
@@ -530,16 +531,12 @@ func TestWorkerContextCancellationFlush(t *testing.T) {
 		t.Errorf("expected currentGroup to be nil/flushed upon context cancellation")
 	}
 
-	// Verify queue has been closed and group is available
-	select {
-	case group, ok := <-worker.batchWriteQueue:
-		if !ok {
-			t.Errorf("expected group to be available before channel closure")
-		} else if len(group.Operations) != 1 || group.Operations[0].DocumentID != "doc_cancel_123" {
-			t.Errorf("expected flushed group with doc_cancel_123, got %+v", group)
-		}
-	default:
-		t.Errorf("expected group to be flushed to batchWriteQueue")
+	// Give background consumer thread a moment to drain and process the group
+	time.Sleep(50 * time.Millisecond)
+
+	processedCount := statsMgr.GetProcessedCount("insert")
+	if processedCount != 1 {
+		t.Errorf("expected processed group count to be 1, got %d", processedCount)
 	}
 }
 

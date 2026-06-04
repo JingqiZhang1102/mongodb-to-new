@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
+	"golang.org/x/time/rate"
 )
 
 // BackfillStatsManager tracks and logs performance metrics specifically for the one-time backfill phase.
@@ -55,6 +56,9 @@ type BackfillStatsManager struct {
 
 	// Ingestion backpressure
 	ingestQueueStallNs int64
+
+	// Write Throttler (optional reference for stats reporting)
+	throttler *WriteThrottler
 }
 
 // NewBackfillStatsManager creates a new BackfillStatsManager
@@ -67,6 +71,16 @@ func NewBackfillStatsManager(log *logger.Logger, interval time.Duration, incStat
 		lastStatsTime: now,
 		incStats:      incStats,
 	}
+}
+
+// SetThrottler sets the write throttler reference for metrics reporting.
+func (sm *BackfillStatsManager) SetThrottler(wt *WriteThrottler) {
+	if sm == nil {
+		return
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.throttler = wt
 }
 
 // Start runs the periodic statistics reporting loop.
@@ -246,6 +260,7 @@ func (sm *BackfillStatsManager) ReportStats(isFinal bool) {
 	now := time.Now()
 	duration := now.Sub(sm.lastStatsTime)
 	sm.lastStatsTime = now
+	wt := sm.throttler
 	sm.mu.Unlock()
 
 	if duration.Seconds() <= 0 {
@@ -356,6 +371,16 @@ func (sm *BackfillStatsManager) ReportStats(isFinal bool) {
 			pct, cumulativeProcessed, targetCount, remainingStr)
 	}
 
+	throttlerStr := ""
+	if wt != nil {
+		limit := wt.Limit()
+		if limit == rate.Inf {
+			throttlerStr = "  - Throttler:      Inactive (Limit: Inf QPS)\n"
+		} else {
+			throttlerStr = fmt.Sprintf("  - Throttler:      Active (Limit: %.2f QPS)\n", float64(limit))
+		}
+	}
+
 	backpressureStr := fmt.Sprintf("  - Ingestion Stalls: [Cursor blocked waiting for workers: %s]\n",
 		formatLag(ingestQueueStall))
 
@@ -370,6 +395,7 @@ func (sm *BackfillStatsManager) ReportStats(isFinal bool) {
 	rateBytesRead := float64(totalReadSizeBytes) / duration.Seconds()
 
 	msg := fmt.Sprintf(header+" (duration: %v):\n"+
+		"%s"+
 		"%s"+
 		"  - Read:           %d (%.2f docs/sec)\n"+
 		"  - WorkerReceived: %d (%.2f docs/sec) [Inserts: %d (%.2f/sec)]\n"+
@@ -387,6 +413,7 @@ func (sm *BackfillStatsManager) ReportStats(isFinal bool) {
 		"%s%s",
 		duration.Round(time.Second),
 		progressStr,
+		throttlerStr,
 		readCount, rateRead,
 		workerReceived, rateReceived, workerReceived, rateReceived,
 		successCount+failedCount, (rateSuccess + rateFailed), successCount, rateSuccess,

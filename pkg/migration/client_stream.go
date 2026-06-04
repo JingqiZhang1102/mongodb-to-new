@@ -373,6 +373,19 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 			}
 		}
 
+		throttlerCtx, throttlerCancel := context.WithCancel(ctx)
+		defer throttlerCancel()
+
+		// Initialize the throttler for backfill traffic writes
+		burstSize := 2 * r.config.InitialWriteBatchSize
+		throttler := NewWriteThrottler(r.config.BackfillRampUp, burstSize)
+		if throttler != nil {
+			throttler.StartRampUp(throttlerCtx)
+			if r.backfillStatsManager != nil {
+				r.backfillStatsManager.SetThrottler(throttler)
+			}
+		}
+
 		// Use a semaphore to limit the number of concurrent collection migrations
 		concurrentCollections := r.config.ConcurrentCollections
 		if concurrentCollections <= 0 {
@@ -414,6 +427,7 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 						StatsManager:         r.incrementalStatsManager,
 						BackfillStatsManager: r.backfillStatsManager,
 						UpsertMode:           true, // resilient mode always performs upserts on duplicates
+						Throttler:            throttler,
 					}
 
 					succeeded, failed, err := migrator.migrateCollection(ctx, r.sourceDB, r.targetDB, collConfig, opts)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -243,6 +244,17 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 		m.log.Infof("Processing up to %d collections concurrently", concurrentCollections)
 		semaphore := make(chan struct{}, concurrentCollections)
 
+		throttlerCtx, throttlerCancel := context.WithCancel(ctx)
+		defer throttlerCancel()
+
+		// Initialize the throttler for backfill traffic writes with burst size based on batch size
+		burstSize := 2 * m.config.InitialWriteBatchSize
+		throttler := NewWriteThrottler(m.config.BackfillRampUp, burstSize)
+		if throttler != nil {
+			throttler.StartRampUp(throttlerCtx)
+			backfillStatsManager.SetThrottler(throttler)
+		}
+
 		for _, collConfig := range collections {
 			wg.Add(1)
 			// Acquire semaphore
@@ -258,6 +270,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 					StatsManager:         nil,
 					BackfillStatsManager: backfillStatsManager,
 					UpsertMode:           collConfig.UpsertMode,
+					Throttler:            throttler,
 				}
 				if _, _, err := m.migrateCollection(ctx, sourceDB, targetDB, collConfig, opts); err != nil {
 					if err == context.Canceled {
@@ -527,6 +540,7 @@ type MigrateOptions struct {
 	StatsManager         *IncrementalStatsManager // If provided, statistics are updated thread-safely (live mode stats)
 	BackfillStatsManager *BackfillStatsManager    // If provided, backfill statistics are recorded thread-safely
 	UpsertMode           bool                     // Use upsert instead of insert (from CollectionConfig)
+	Throttler            *WriteThrottler          // Write throttler for initial backfill QPS ramp-up
 }
 
 // migrateCollection performs a one-time migration of a collection with parallel batch processing
@@ -567,7 +581,10 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 
 	m.log.Infof("Using read batch size: %d, write batch size: %d", readBatchSize, writeBatchSize)
 
-	// Create retry manager for batch processing
+	// Create retry manager for batch processing.
+	// [Safety Fix 8: Invalid ID Conversion] Firestore target APIs only support string, int64, or ObjectId document keys;
+	// arrays or nested subdocuments trigger terminal errors. Enabling ConvertInvalidIds
+	// transforms invalid types to strings to avoid write failures.
 	retryManager := NewRetryManager(
 		m.config.RetryConfig.MaxRetries,
 		time.Duration(m.config.RetryConfig.BaseDelayMs)*time.Millisecond,
@@ -578,10 +595,14 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		m.log,
 	)
 
-	cursor, err := sourceCollection.Find(ctx, bson.D{}, options.Find().SetBatchSize(int32(readBatchSize)))
+	// [Safety Fix 1: MongoDB Cursor Timeout] SetNoCursorTimeout(true) is used to prevent the MongoDB read cursor from timing out (default 10 minutes)
+	// when upstream readers are throttled or paused by write rate-limiting/backpressure downstream.
+	cursor, err := sourceCollection.Find(ctx, bson.D{}, options.Find().SetBatchSize(int32(readBatchSize)).SetNoCursorTimeout(true))
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to create cursor: %w", err)
 	}
+	// [Safety Fix 5: Memory Leak on Server] Ensure cursor is closed upon termination to prevent active server-side cursor leaks
+	// and connection starvation on the source MongoDB replica set.
 	defer cursor.Close(ctx)
 
 	// Set up parallel batch processing
@@ -1000,12 +1021,14 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 
 			m.log.Debugf("Starting partition %d with filter: %v", partitionIndex, filter)
 
-			// Create cursor for this partition
-			cursor, err := sourceCollection.Find(ctx, filter, options.Find().SetBatchSize(int32(m.config.InitialReadBatchSize)))
+			// [Safety Fix 1: MongoDB Cursor Timeout] SetNoCursorTimeout(true) is used to prevent the partitioned MongoDB read cursor from timing out
+			// when downstream write rate-limiting/backpressure pauses readers.
+			cursor, err := sourceCollection.Find(ctx, filter, options.Find().SetBatchSize(int32(m.config.InitialReadBatchSize)).SetNoCursorTimeout(true))
 			if err != nil {
 				errorChan <- fmt.Errorf("failed to create cursor for partition %d: %w", partitionIndex, err)
 				return
 			}
+			// [Safety Fix 5: Memory Leak on Server] Ensure partition cursor is closed on exit to prevent server-side resource leakage.
 			defer cursor.Close(ctx)
 
 			// Set up parallel batch processing within this partition
@@ -1353,6 +1376,15 @@ func max(a, b int) int {
 // - If opts.DLQ is provided, it uses resilient writes (upsert fallback + DLQ routing) and returns counts.
 // - If opts.DLQ is nil, it uses fail-fast writes (standard InsertMany + RetryManager) and aborts on errors.
 func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, batch []interface{}, sourceDB, sourceCollection string, opts MigrateOptions, retryManager *RetryManager, workerID int) (int64, int64, error) {
+	// [Safety Fix 2: Connection Pool Starvation] Wait on Rate Limiting BEFORE checking out connections/sessions from target database pool.
+	// This prevents worker threads from holding onto checked-out sessions in an idle state while blocked by rate limits,
+	// which would starve other threads/replicators of available pool connections.
+	if opts.Throttler != nil {
+		if err := opts.Throttler.Wait(ctx, len(batch)); err != nil {
+			return 0, 0, err
+		}
+	}
+
 	enableTransform := m.config.EnableFieldTransformations != nil && *m.config.EnableFieldTransformations
 	transformer := NewFieldTransformer(enableTransform, m.log)
 
@@ -1383,10 +1415,14 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 		var duplicateKeys int64
 		var dlqCount int64
 
+		// [Safety Fix 3: Context Timeout Shrinkage] Construct the query-level timeout context AFTER returning from the throttler wait block.
+		// Constructing it beforehand would cause the rate-limit wait delay to count against the execution timeout
+		// (timeout shrinkage), leading to premature write context cancellation failures.
+		bulkCtx, cancelBulk := context.WithTimeout(ctx, 30*time.Second)
 		bulkStart := time.Now()
-		var insertErr error
-		_, insertErr = targetCol.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false))
+		_, insertErr := targetCol.InsertMany(bulkCtx, batch, options.InsertMany().SetOrdered(false))
 		bulkDuration := time.Since(bulkStart)
+		cancelBulk()
 
 		if insertErr == nil {
 			if opts.BackfillStatsManager != nil {
@@ -1402,120 +1438,121 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 
 		bulkWriteException, ok := insertErr.(mongo.BulkWriteException)
 		if ok {
-				m.log.Debugf("Bulk insert partially failed for %s.%s: %d failed",
-					sourceDB, sourceCollection, len(bulkWriteException.WriteErrors))
+			m.log.Debugf("Bulk insert partially failed for %s.%s: %d failed",
+				sourceDB, sourceCollection, len(bulkWriteException.WriteErrors))
 
-				for _, writeErr := range bulkWriteException.WriteErrors {
-					var errDocID interface{}
-					if writeErr.Index < len(batch) {
-						errDocID = extractDocID(batch[writeErr.Index])
-					}
-
-					m.log.Debugf("[%s.%s] Insert error at index %d, _id=%v: %v", sourceDB, sourceCollection, writeErr.Index, errDocID, writeErr.Message)
-
-					if writeErr.Code == 11000 && writeErr.Index < len(batch) {
-						// Case 1: The server responded successfully but flagged a duplicate key error (code 11000).
-						// Since we have 100% certainty that the document exists on the target and this is a backfill
-						// of identical data, we can safely skip overwriting it to optimize performance and disk writes.
-						m.log.Debugf("[%s.%s] Skipping duplicate document _id=%v at index %d", sourceDB, sourceCollection, errDocID, writeErr.Index)
-						duplicateKeys++
-					} else if writeErr.Index < len(batch) {
-						// Note: We do not classify the error here to decide whether to skip the fallback.
-						// Attempting fallback write first is safer: (1) if classification regexes are incomplete,
-						// we avoid dropping valid writes; (2) some errors are batch-specific and succeed individually.
-						doc := batch[writeErr.Index]
-						id := extractDocID(doc)
-
-						if id != nil {
-							filter := bson.M{"_id": id}
-							if opts.BackfillStatsManager != nil {
-								opts.BackfillStatsManager.IncrementSequentialRetries("replace", 1)
-							}
-							err := m.executeWithRetry(ctx, retryManager, func() error {
-								_, replaceErr := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true))
-								return replaceErr
-							})
-							if err != nil {
-								m.log.Errorf("[%s.%s] Retry upsert failed for document _id=%v: %v", sourceDB, sourceCollection, id, err)
-								batchFailed++
-								dlqCount++
-								opts.DLQ.WriteFailed(sourceDB, sourceCollection, id, err, "initial", "insert", originalBatch[writeErr.Index])
-							}
-						} else {
-							batchFailed++
-							dlqCount++
-							opts.DLQ.WriteFailed(sourceDB, sourceCollection, nil, fmt.Errorf("missing _id"), "initial", "insert", originalBatch[writeErr.Index])
-						}
-					}
-				}
-			} else {
-				// Handle non-bulk write errors (e.g. network partition or context timeout)
-				bulkRetrySucceeded := false
-				if retryManager != nil && err != context.Canceled {
-					errType := retryManager.ClassifyError(err)
-					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
-						m.log.Infof("Transient error detected for %s.%s. Retrying bulk insert with backoff...", sourceDB, sourceCollection)
-						retryErr := retryManager.RetryWithBackoff(ctx, func() error {
-							_, retryInsertErr := targetCol.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false))
-							return retryInsertErr
-						})
-						if retryErr == nil {
-							m.log.Infof("Bulk insert for %s.%s succeeded after retry", sourceDB, sourceCollection)
-							bulkRetrySucceeded = true
-						} else {
-							m.log.Warnf("Bulk insert for %s.%s still failed after retries: %v. Falling back to individual operations.", sourceDB, sourceCollection, retryErr)
-						}
-					}
+			for _, writeErr := range bulkWriteException.WriteErrors {
+				var errDocID interface{}
+				if writeErr.Index < len(batch) {
+					errDocID = extractDocID(batch[writeErr.Index])
 				}
 
-				if !bulkRetrySucceeded {
-					// Fall back to individual operations with upsert for all documents
-					for idx, doc := range batch {
+				m.log.Debugf("[%s.%s] Insert error at index %d, _id=%v: %v", sourceDB, sourceCollection, writeErr.Index, errDocID, writeErr.Message)
+
+				if writeErr.Code == 11000 && writeErr.Index < len(batch) {
+					// Case 1: The server responded successfully but flagged a duplicate key error (code 11000).
+					// Since we have 100% certainty that the document exists on the target and this is a backfill
+					// of identical data, we can safely skip overwriting it to optimize performance and disk writes.
+					m.log.Debugf("[%s.%s] Skipping duplicate document _id=%v at index %d", sourceDB, sourceCollection, errDocID, writeErr.Index)
+					duplicateKeys++
+				} else if writeErr.Index < len(batch) {
+					// Note: We do not classify the error here to decide whether to skip the fallback.
+					// Attempting fallback write first is safer: (1) if classification regexes are incomplete,
+					// we avoid dropping valid writes; (2) some errors are batch-specific and succeed individually.
+					doc := batch[writeErr.Index]
+					id := extractDocID(doc)
+
+					if id != nil {
+						filter := bson.M{"_id": id}
 						if opts.BackfillStatsManager != nil {
-							opts.BackfillStatsManager.IncrementSequentialRetries("insert", 1)
+							opts.BackfillStatsManager.IncrementSequentialRetries("replace", 1)
 						}
 						err := m.executeWithRetry(ctx, retryManager, func() error {
-							_, insertErr := targetCol.InsertOne(ctx, doc)
-							return insertErr
+							fallbackCtx, cancelFallback := context.WithTimeout(ctx, 10*time.Second)
+							defer cancelFallback()
+							_, replaceErr := targetCol.ReplaceOne(fallbackCtx, filter, doc, options.Replace().SetUpsert(true))
+							return replaceErr
 						})
 						if err != nil {
+							m.log.Errorf("[%s.%s] Retry upsert failed for document _id=%v: %v", sourceDB, sourceCollection, id, err)
+							batchFailed++
+							dlqCount++
+							opts.DLQ.WriteFailed(sourceDB, sourceCollection, id, err, "initial", "insert", originalBatch[writeErr.Index])
+						}
+					} else {
+						batchFailed++
+						dlqCount++
+						opts.DLQ.WriteFailed(sourceDB, sourceCollection, nil, fmt.Errorf("missing _id"), "initial", "insert", originalBatch[writeErr.Index])
+					}
+				}
+			}
+		} else {
+			// Handle non-bulk write errors (e.g. network partition or context timeout)
+			bulkRetrySucceeded := false
+			if retryManager != nil && insertErr != context.Canceled {
+				errType := retryManager.ClassifyError(insertErr)
+				if errType == ErrorTypeConnection || errType == ErrorTypeContention {
+					m.log.Infof("Transient error detected for %s.%s. Retrying bulk insert with backoff...", sourceDB, sourceCollection)
+					retryErr := retryManager.RetryWithBackoff(ctx, func() error {
+						retryCtx, cancelRetry := context.WithTimeout(ctx, 30*time.Second)
+						defer cancelRetry()
+						_, retryInsertErr := targetCol.InsertMany(retryCtx, batch, options.InsertMany().SetOrdered(false))
+						return retryInsertErr
+					})
+					if retryErr == nil {
+						m.log.Infof("Bulk insert for %s.%s succeeded after retry", sourceDB, sourceCollection)
+						bulkRetrySucceeded = true
+					} else {
+						m.log.Warnf("Bulk insert for %s.%s still failed after retries: %v. Falling back to individual operations.", sourceDB, sourceCollection, retryErr)
+					}
+				}
+			}
+
+			if !bulkRetrySucceeded {
+				// Fall back to individual operations with upsert for all documents
+				for idx, doc := range batch {
+					if opts.BackfillStatsManager != nil {
+						opts.BackfillStatsManager.IncrementSequentialRetries("insert", 1)
+					}
+					err := m.executeWithRetry(ctx, retryManager, func() error {
+						fallbackCtx, cancelFallback := context.WithTimeout(ctx, 10*time.Second)
+						defer cancelFallback()
+						_, insertErr := targetCol.InsertOne(fallbackCtx, doc)
+						return insertErr
+					})
+					if err != nil {
+						// [Safety Fix 4: Resilient Fallback Stale Overwrites]
+						// If the individual InsertOne fails with a duplicate key error (code 11000) during resilient fallback,
+						// we skip replacing it. Using ReplaceOne(upsert: true) here could revert newer updates or deletions
+						// applied concurrently by the live stream replicator.
+						isDup := false
+						if writeErr, ok := err.(mongo.WriteException); ok {
+							for _, we := range writeErr.WriteErrors {
+								if we.Code == 11000 {
+									isDup = true
+									break
+								}
+							}
+						}
+						if !isDup && (strings.Contains(err.Error(), "duplicate key error") || strings.Contains(err.Error(), "E11000")) {
+							isDup = true
+						}
+
+						if isDup {
+							m.log.Debugf("[%s.%s] Fallback insert found existing document _id=%v, skipping overwrite to prevent stale reversion", sourceDB, sourceCollection, extractDocID(doc))
+							duplicateKeys++
+						} else {
 							docID := extractDocID(doc)
-							if docID != nil {
-								filter := bson.M{"_id": docID}
-								// Case 2: The bulk request failed entirely at the connection/socket layer. We cannot
-								// know which documents were written before the crash. If individual InsertOne fails
-								// with a duplicate key, we must upsert (overwrite) it rather than skipping to guarantee
-								// that the target document is fully synchronized with the correct, latest version.
-								if opts.BackfillStatsManager != nil {
-									opts.BackfillStatsManager.IncrementSequentialRetries("replace", 1)
-								}
-								replaceErr := m.executeWithRetry(ctx, retryManager, func() error {
-									_, repErr := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true))
-									return repErr
-								})
-								if replaceErr != nil {
-									if replaceErr == context.Canceled {
-										m.log.Debugf("Upserting document %v in %s.%s canceled due to context cancellation", docID, sourceDB, sourceCollection)
-									} else {
-										m.log.Errorf("Error upserting document %v in %s.%s: %v", docID, sourceDB, sourceCollection, replaceErr)
-										batchFailed++
-										dlqCount++
-										if opts.DLQ != nil {
-											opts.DLQ.WriteFailed(sourceDB, sourceCollection, docID, replaceErr, "initial", "insert", originalBatch[idx])
-										}
-									}
-								}
-							} else {
-								batchFailed++
-								dlqCount++
-								if opts.DLQ != nil {
-									opts.DLQ.WriteFailed(sourceDB, sourceCollection, nil, err, "initial", "insert", originalBatch[idx])
-								}
+							batchFailed++
+							dlqCount++
+							if opts.DLQ != nil {
+								opts.DLQ.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", originalBatch[idx])
 							}
 						}
 					}
 				}
 			}
+		}
 
 		successCount := int64(len(batch)) - batchFailed
 		if opts.BackfillStatsManager != nil {
@@ -1525,7 +1562,9 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 	} else {
 		// Fail-Fast Mode (standard mode=migrate behavior)
 		err := retryManager.RetryWithSplit(ctx, batch, sourceCollection, func(b []interface{}) error {
-			return processBatch(ctx, targetCol, b, opts.UpsertMode, sourceDB, sourceCollection, transformer)
+			bulkCtx, cancelBulk := context.WithTimeout(ctx, 30*time.Second)
+			defer cancelBulk()
+			return processBatch(bulkCtx, targetCol, b, opts.UpsertMode, sourceDB, sourceCollection, transformer)
 		})
 		writeDuration := time.Since(writeStart)
 		if err != nil {

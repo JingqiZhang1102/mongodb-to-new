@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gsbingo17/mongodb-migration/pkg/config"
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 )
 
@@ -33,6 +34,28 @@ func TestBackfillStatsManager(t *testing.T) {
 	sm.IncrementSequentialRetries("replace", 1)
 
 	// Trigger manual stats report
+	sm.ReportStats(false)
+
+	// Test stats manager with a throttler (active)
+	cfgActive := config.BackfillRampUpConfig{
+		Enabled:          true,
+		StartQps:         500.0,
+		RampRatePerMin:   0,
+		UpdateIntervalMs: 100,
+	}
+	wtActive := NewWriteThrottler(cfgActive, 100)
+	sm.SetThrottler(wtActive)
+	sm.ReportStats(false)
+
+	// Test stats manager with a throttler (inactive/Inf QPS)
+	cfgHigh := config.BackfillRampUpConfig{
+		Enabled:          true,
+		StartQps:         100000.0,
+		RampRatePerMin:   0,
+		UpdateIntervalMs: 100,
+	}
+	wtHigh := NewWriteThrottler(cfgHigh, 100)
+	sm.SetThrottler(wtHigh)
 	sm.ReportStats(false)
 
 	// Wait a bit to ensure ticker fires (doesn't fail/panic)

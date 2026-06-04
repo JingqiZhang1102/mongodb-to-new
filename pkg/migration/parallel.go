@@ -813,25 +813,22 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 	}
 }
 
-// processBatchWriteQueue processes groups in the batch write queue sequentially
+// processBatchWriteQueue processes groups in the batch write queue sequentially.
+// [Safety Fix 6: Graceful Worker Shutdown Data Loss]
+// This uses a direct range loop over batchWriteQueue instead of selecting on w.ctx.Done().
+// Selecting on w.ctx.Done() would cause the consumer thread to exit immediately upon cancellation,
+// losing any remaining flushed batches. Using range guarantees that all remaining records
+// in the queue are fully processed and drained before the goroutine exits on shutdown.
 func (w *Worker) processBatchWriteQueue() {
 	defer w.wg.Done()
 
-	for {
-		select {
-		case group, ok := <-w.batchWriteQueue:
-			if !ok {
-				// Channel closed, shutdown worker
-				if w.isShutdownInProgress() {
-					w.log.Debugf("Completed processing all groups during shutdown")
-				}
-				return
-			}
-			// Process the group
-			w.executeBatchWrite(*group)
-		case <-w.ctx.Done():
-			return
-		}
+	for group := range w.batchWriteQueue {
+		// Process the group
+		w.executeBatchWrite(*group)
+	}
+
+	if w.isShutdownInProgress() {
+		w.log.Debugf("Completed processing all groups during shutdown")
 	}
 }
 

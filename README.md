@@ -198,6 +198,13 @@ If you want to migrate only specific collections or rename collections during mi
 - **incrementalProcessingQueueSize**: Buffer size of the concurrent workers' writing batches queue channel (default: 4096). Bounding this to a small number (e.g. 2 or 4) applies strict in-memory backpressure, preventing memory backups and capping Queue Latency under slow writes.
 - **forceOrderedOperations**: Whether to force ordered operations for all operation types (default: false). When false, insert and delete operations use unordered bulk writes for better performance, while update and replace operations always use ordered bulk writes to ensure consistency.
 
+#### Write Ramp-Up Configuration (Initial Backfill Throttling)
+- **backfillRampUp**: Configuration for linear write QPS throttling during the initial migration (backfill) phase to prevent overloading target databases (e.g. Cloud Spanner) before autoscaling reacts.
+  - **enabled**: Set to `true` to enable write QPS throttling (default: `false`).
+  - **startQps**: The initial QPS rate limit from which the migration writes start (default: `0.0`).
+  - **rampRatePerMin**: The linear rate (QPS increase per minute) at which the throttler ceiling grows. Set to `0` or omit to allow the write speed limit to grow linearly forever without any ceiling cap. (default: `10000.0` - reaching 100K QPS in 10 minutes). Note: The throttler automatically disables itself (sets limit to Infinity) once the allowed rate reaches 100K QPS.
+  - **updateIntervalMs**: The interval in milliseconds at which the throttler background worker recalculates and applies the new rate limit (default: `1000` ms / 1 second).
+
 #### Parallel Reads Configuration
 - **parallelReadsEnabled**: Enable parallel reads for large collections (default: true).
 - **maxReadPartitions**: Maximum number of partitions for parallel reads (default: 8).

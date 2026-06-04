@@ -44,11 +44,22 @@ type Config struct {
 	SampleSize              int  `json:"sampleSize"`              // Number of documents to sample for partitioning
 	WorkersPerPartition     int  `json:"workersPerPartition"`     // Number of worker goroutines per partition
 
+	// Write ramp-up configuration for initial migration
+	BackfillRampUp BackfillRampUpConfig `json:"backfillRampUp"`
+
 	// Retry configuration
 	RetryConfig RetryConfig `json:"retryConfig"` // Configuration for retry mechanisms
 
 	// Enable field transformations (defaults to true)
 	EnableFieldTransformations *bool `json:"enableFieldTransformations"`
+}
+
+// BackfillRampUpConfig represents write ramp-up configuration for initial backfill
+type BackfillRampUpConfig struct {
+	Enabled          bool    `json:"enabled"`
+	StartQps         float64 `json:"startQps"`
+	RampRatePerMin   float64 `json:"rampRatePerMin"`
+	UpdateIntervalMs int     `json:"updateIntervalMs"`
 }
 
 // RetryConfig represents retry configuration
@@ -253,6 +264,15 @@ func LoadConfig(configPath string) (*Config, error) {
 	if config.EnableFieldTransformations == nil {
 		defaultVal := false
 		config.EnableFieldTransformations = &defaultVal
+	}
+
+	// Initialize default values for BackfillRampUpConfig
+	// targetQps == 0 or omitted signifies uncapped linear growth (no ceiling).
+	if config.BackfillRampUp.RampRatePerMin <= 0 {
+		config.BackfillRampUp.RampRatePerMin = 10000.0 // Balanced profile: 10K QPS increase per minute
+	}
+	if config.BackfillRampUp.UpdateIntervalMs <= 0 {
+		config.BackfillRampUp.UpdateIntervalMs = 1000 // Default to 1 second
 	}
 
 	// No backward compatibility needed anymore
