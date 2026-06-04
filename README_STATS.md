@@ -1,10 +1,10 @@
-# Change Stream Telemetry & Statistics Guide
+# Telemetry & Statistics Guide
 
-This document defines the telemetry metrics tracked, compiled, and logged by the `IncrementalStatsManager` inside the sharded replication pipeline.
+This document defines the telemetry metrics tracked, compiled, and logged by both the `BackfillStatsManager` (for the initial migration phase) and the `IncrementalStatsManager` (for the live incremental replication phase).
 
 ---
 
-## What Change Stream Stats
+## 1. Change Stream (Live Replication) Stats
 
 ### 1. Queue Fullness
 *   **What it measures**: The current buffer load (fill percentage) of the pipeline stage queues:
@@ -98,3 +98,37 @@ This document defines the telemetry metrics tracked, compiled, and logged by the
 *   **When it is measured**: Recorded upon database commit failures.
 *   **What it implies**: High sequential retries indicate persistent lock contention, deadlocks, or network drops.
 *   **How to solve**: Increase Spanner/Firestore transaction retry timeout limits, optimize write batches to decrease row locking overlap, or review the Dead Letter Queue (DLQ) to examine persistently unprocessable payloads.
+
+---
+
+## 2. Initial Backfill Stats
+
+### 1. Progress & Remaining Time
+*   **What it measures**: Overall percentage progress, total processed vs target document count, and the estimated remaining duration (Remaining) until backfill completion.
+*   **When it is measured**: Continuously updated during backfill writes and computed at statistics intervals using the overall throughput rate.
+*   **What it implies**: Real-time visibility into the backfill phase progress.
+
+### 2. Ingestion Stalls (Reader Backpressure)
+*   **What it measures**: The cumulative duration that reader threads (or cursor partition loops) spent blocked waiting to push read document batches into worker channel buffers.
+*   **When it is measured**: Stopwatch-timed when writing to the worker channel blocks.
+*   **What it implies**: Severe write-path bottlenecks. Downstream workers are saturated writing to the target database, causing the document read cursor to stall.
+*   **How to solve**: Increase target database write capacity, adjust worker parallelism, or inspect Spanner/Firestore commit queue locks.
+
+### 3. Read Performance
+*   **What it measures**: Performance of document retrieval from the source database:
+    *   **Fetch Latency**: MongoDB cursor next-call fetch latency percentiles (p50, p99, p100).
+    *   **Document Size**: The average document size in bytes, total bytes read, and overall read throughput rate (MB/sec).
+*   **What it implies**: Slow fetch latency indicates reading bottlenecks on the source database or network. High document sizes imply larger payload serialization/deserialization overhead.
+
+### 4. BulkWrite Latency & Worker QPS
+*   **What it measures**: Target database bulk write commit times (p50, p90, p99, p100) and active worker write QPS distributions.
+*   **What it implies**: Identifies write latency bottlenecks on Spanner/Firestore and worker load distribution/contention.
+
+### 5. Error & DLQ Tracking
+*   **What it measures**: Cumulative duplicate key errors and DLQ'ed document counts.
+*   **What it implies**: Tracks skip counts of duplicate documents (Case 1) and writes to Dead Letter Queue for unprocessable payloads (Case 2).
+
+### 6. Connection Pool Performance
+*   **What it measures**: Real-time socket utilization, checkout succeed/fail rates, and average checkout wait latency for both source and target connections during backfill.
+*   **What it implies**: Identifies connection pool starvation and socket leaks during heavy migration traffic.
+

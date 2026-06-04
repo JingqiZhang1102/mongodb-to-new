@@ -147,6 +147,14 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 	incrementalStatsManager := NewIncrementalStatsManager(m.log, statsInterval, m.config.GroupOpsByDistinctId)
 	incrementalStatsManager.DryRun = m.DryRun
 
+	backfillStatsManager := NewBackfillStatsManager(m.log, statsInterval, incrementalStatsManager)
+	backfillStatsManager.DryRun = m.DryRun
+
+	// Start backfill stats manager
+	backfillStatsCtx, cancelBackfillStats := context.WithCancel(ctx)
+	defer cancelBackfillStats()
+	backfillStatsManager.Start(backfillStatsCtx)
+
 	// Check if this is legacy mode - if so, handle it separately
 	if (mode == "live" || mode == "live-only") && pair.Source.ReplicationMethod == "oplog-legacy" {
 		// For legacy mode, don't connect here - let startOplogReplicationLegacy handle it
@@ -246,9 +254,10 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 				defer func() { <-semaphore }() // Release semaphore when done
 
 				opts := MigrateOptions{
-					DLQ:          nil, // fail-fast
-					StatsManager: nil,
-					UpsertMode:   collConfig.UpsertMode,
+					DLQ:                  nil, // fail-fast
+					StatsManager:         nil,
+					BackfillStatsManager: backfillStatsManager,
+					UpsertMode:           collConfig.UpsertMode,
 				}
 				if _, _, err := m.migrateCollection(ctx, sourceDB, targetDB, collConfig, opts); err != nil {
 					if err == context.Canceled {
@@ -264,9 +273,10 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 
 		// Wait for all migrations to complete
 		wg.Wait()
+		backfillStatsManager.ReportStats(true)
 	} else if mode == "live" || mode == "live-only" {
 		// Use client-level change stream for live replication
-		if err := m.startClientLevelReplication(ctx, sourceDB, targetDB, pair.Source.Database, pair.Target.Database, collections, pair, pairIndex, liveOnly, incrementalStatsManager); err != nil {
+		if err := m.startClientLevelReplication(ctx, sourceDB, targetDB, pair.Source.Database, pair.Target.Database, collections, pair, pairIndex, liveOnly, incrementalStatsManager, backfillStatsManager); err != nil {
 			// We don't need to check for context.Canceled here anymore as it's handled in the lower layers
 			return fmt.Errorf("error starting client-level replication: %w", err)
 		}
@@ -286,7 +296,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 }
 
 // startClientLevelReplication starts replication using either change streams or oplog
-func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool, incrementalStatsManager *IncrementalStatsManager) error {
+func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool, incrementalStatsManager *IncrementalStatsManager, backfillStatsManager *BackfillStatsManager) error {
 	// Determine replication method
 	replicationMethod := pair.Source.ReplicationMethod
 	if replicationMethod == "" {
@@ -300,17 +310,18 @@ func (m *Migrator) startClientLevelReplication(ctx context.Context, sourceDB, ta
 		return m.startOplogReplication(ctx, sourceDB, targetDB, sourceDBName, targetDBName, collections, pair, pairIndex, liveOnly)
 	} else {
 		// Use change stream-based replication (default)
-		return m.startChangeStreamReplication(ctx, sourceDB, targetDB, sourceDBName, targetDBName, collections, pair, pairIndex, liveOnly, incrementalStatsManager)
+		return m.startChangeStreamReplication(ctx, sourceDB, targetDB, sourceDBName, targetDBName, collections, pair, pairIndex, liveOnly, incrementalStatsManager, backfillStatsManager)
 	}
 }
 
 // startChangeStreamReplication starts replication using change streams
-func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool, incrementalStatsManager *IncrementalStatsManager) error {
+func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, targetDB *db.MongoDB, sourceDBName, targetDBName string, collections []config.CollectionConfig, pair config.DatabasePair, pairIndex int, liveOnly bool, incrementalStatsManager *IncrementalStatsManager, backfillStatsManager *BackfillStatsManager) error {
 	m.log.Info("Starting change stream-based replication for all collections")
 
 	// Create client-level replicator
 	replicator := NewClientLevelReplicator(sourceDB, targetDB, m.config, m.log)
 	replicator.SetIncrementalStatsManager(incrementalStatsManager)
+	replicator.SetBackfillStatsManager(backfillStatsManager)
 	replicator.DryRun = m.DryRun
 
 	// Add all collections to the replicator
@@ -512,9 +523,10 @@ func (m *Migrator) getCollectionsToProcess(ctx context.Context, sourceDB *db.Mon
 
 // MigrateOptions defines parameters to tune the backfill behavior dynamically
 type MigrateOptions struct {
-	DLQ          DLQ                      // If provided, failures are routed here and migration continues (resilient mode)
-	StatsManager *IncrementalStatsManager // If provided, statistics are updated thread-safely (live mode stats)
-	UpsertMode   bool                     // Use upsert instead of insert (from CollectionConfig)
+	DLQ                  DLQ                      // If provided, failures are routed here and migration continues (resilient mode)
+	StatsManager         *IncrementalStatsManager // If provided, statistics are updated thread-safely (live mode stats)
+	BackfillStatsManager *BackfillStatsManager    // If provided, backfill statistics are recorded thread-safely
+	UpsertMode           bool                     // Use upsert instead of insert (from CollectionConfig)
 }
 
 // migrateCollection performs a one-time migration of a collection with parallel batch processing
@@ -532,6 +544,10 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	}
 
 	m.log.Infof("Found %d documents to migrate", totalCount)
+
+	if opts.BackfillStatsManager != nil {
+		opts.BackfillStatsManager.AddTargetCount(totalCount)
+	}
 
 	// If no documents, we're done
 	if totalCount == 0 {
@@ -592,7 +608,10 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 			defer wg.Done()
 
 			for batch := range batchChan {
-				succeeded, failed, err := m.writeBatch(ctx, targetCollection, batch, sourceDB.GetDatabaseName(), collConfig.SourceCollection, opts, retryManager)
+				if opts.BackfillStatsManager != nil {
+					opts.BackfillStatsManager.RecordWorkerReceived(int64(len(batch)))
+				}
+				succeeded, failed, err := m.writeBatch(ctx, targetCollection, batch, sourceDB.GetDatabaseName(), collConfig.SourceCollection, opts, retryManager, workerID)
 				if err != nil {
 					select {
 					case errorChan <- fmt.Errorf("worker %d failed to process batch: %w", workerID, err):
@@ -658,7 +677,9 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		}
 
 		// Get next document
-		if !cursor.Next(ctx) {
+		readStart := time.Now()
+		hasNext := cursor.Next(ctx)
+		if !hasNext {
 			break
 		}
 
@@ -668,6 +689,11 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 			close(batchChan)
 			return successCount, failedCount, fmt.Errorf("failed to decode document: %w", err)
 		}
+		readDuration := time.Since(readStart)
+
+		if opts.BackfillStatsManager != nil {
+			opts.BackfillStatsManager.RecordRead(readDuration, len(cursor.Current))
+		}
 
 		// Add to batch
 		batch = append(batch, doc)
@@ -675,8 +701,12 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 
 		// Send batch if it reaches the write batch size
 		if batchCount >= writeBatchSize {
+			sendStart := time.Now()
 			select {
 			case batchChan <- batch:
+				if opts.BackfillStatsManager != nil {
+					opts.BackfillStatsManager.RecordIngestQueueStall(time.Since(sendStart))
+				}
 				// Batch sent to worker
 			case err := <-errorChan:
 				// Error from a worker
@@ -708,8 +738,12 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 
 	// Process any remaining documents
 	if len(batch) > 0 {
+		sendStart := time.Now()
 		select {
 		case batchChan <- batch:
+			if opts.BackfillStatsManager != nil {
+				opts.BackfillStatsManager.RecordIngestQueueStall(time.Since(sendStart))
+			}
 			// Final batch sent to worker
 		case err := <-errorChan:
 			// Error from a worker
@@ -998,7 +1032,11 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 					defer partitionWg.Done()
 
 					for batch := range partitionBatchChan {
-						succeeded, failed, err := m.writeBatch(ctx, targetCollection, batch, sourceDB.GetDatabaseName(), collConfig.SourceCollection, opts, retryManager)
+						if opts.BackfillStatsManager != nil {
+							opts.BackfillStatsManager.RecordWorkerReceived(int64(len(batch)))
+						}
+						globalWorkerID := partitionIndex*100 + workerID
+						succeeded, failed, err := m.writeBatch(ctx, targetCollection, batch, sourceDB.GetDatabaseName(), collConfig.SourceCollection, opts, retryManager, globalWorkerID)
 						if err != nil {
 							select {
 							case partitionErrorChan <- fmt.Errorf("worker %d in partition %d failed: %w", workerID, partitionIndex, err):
@@ -1045,7 +1083,9 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 				}
 
 				// Get next document
-				if !cursor.Next(ctx) {
+				readStart := time.Now()
+				hasNext := cursor.Next(ctx)
+				if !hasNext {
 					break
 				}
 
@@ -1056,15 +1096,23 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 					errorChan <- fmt.Errorf("failed to decode document in partition %d: %w", partitionIndex, err)
 					return
 				}
+				readDuration := time.Since(readStart)
+
+				if opts.BackfillStatsManager != nil {
+					opts.BackfillStatsManager.RecordRead(readDuration, len(cursor.Current))
+				}
 
 				// Add to batch
 				batch = append(batch, doc)
 				batchCount++
 
-				// Send batch if it reaches the write batch size
 				if batchCount >= m.config.InitialWriteBatchSize {
+					sendStart := time.Now()
 					select {
 					case partitionBatchChan <- batch:
+						if opts.BackfillStatsManager != nil {
+							opts.BackfillStatsManager.RecordIngestQueueStall(time.Since(sendStart))
+						}
 						// Batch sent to worker
 					case err := <-partitionErrorChan:
 						// Error from a worker
@@ -1095,8 +1143,12 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 
 			// Process any remaining documents
 			if len(batch) > 0 {
+				sendStart := time.Now()
 				select {
 				case partitionBatchChan <- batch:
+					if opts.BackfillStatsManager != nil {
+						opts.BackfillStatsManager.RecordIngestQueueStall(time.Since(sendStart))
+					}
 					// Final batch sent to worker
 				case err := <-partitionErrorChan:
 					// Error from a worker
@@ -1300,11 +1352,16 @@ func max(a, b int) int {
 // writeBatch processes and writes a batch of documents.
 // - If opts.DLQ is provided, it uses resilient writes (upsert fallback + DLQ routing) and returns counts.
 // - If opts.DLQ is nil, it uses fail-fast writes (standard InsertMany + RetryManager) and aborts on errors.
-func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, batch []interface{}, sourceDB, sourceCollection string, opts MigrateOptions, retryManager *RetryManager) (int64, int64, error) {
+func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, batch []interface{}, sourceDB, sourceCollection string, opts MigrateOptions, retryManager *RetryManager, workerID int) (int64, int64, error) {
 	enableTransform := m.config.EnableFieldTransformations != nil && *m.config.EnableFieldTransformations
 	transformer := NewFieldTransformer(enableTransform, m.log)
 
+	writeStart := time.Now()
+
 	if opts.DLQ != nil {
+		originalBatch := make([]interface{}, len(batch))
+		copy(originalBatch, batch)
+
 		// Resilient Mode: Use DLQ Fallback (exactly identical to client_stream.go)
 		transformedBatch, err := transformer.TransformBatch(batch, sourceDB, sourceCollection)
 		if err != nil {
@@ -1313,15 +1370,38 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 				docID := extractDocID(doc)
 				opts.DLQ.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
 			}
+			writeDuration := time.Since(writeStart)
+			if opts.BackfillStatsManager != nil {
+				opts.BackfillStatsManager.RecordBulkWrite(writeDuration)
+				opts.BackfillStatsManager.RecordWriteResult(0, int64(len(batch)), 0, int64(len(batch)), workerID)
+			}
 			return 0, int64(len(batch)), nil
 		}
 		batch = transformedBatch
 
 		var batchFailed int64
+		var duplicateKeys int64
+		var dlqCount int64
 
-		if _, err := targetCol.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false)); err != nil {
-			bulkWriteException, ok := err.(mongo.BulkWriteException)
-			if ok {
+		bulkStart := time.Now()
+		var insertErr error
+		_, insertErr = targetCol.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false))
+		bulkDuration := time.Since(bulkStart)
+
+		if insertErr == nil {
+			if opts.BackfillStatsManager != nil {
+				opts.BackfillStatsManager.RecordBulkWrite(bulkDuration)
+				opts.BackfillStatsManager.RecordWriteResult(int64(len(batch)), 0, 0, 0, workerID)
+			}
+			return int64(len(batch)), 0, nil
+		}
+
+		if opts.BackfillStatsManager != nil {
+			opts.BackfillStatsManager.RecordBulkWrite(bulkDuration)
+		}
+
+		bulkWriteException, ok := insertErr.(mongo.BulkWriteException)
+		if ok {
 				m.log.Debugf("Bulk insert partially failed for %s.%s: %d failed",
 					sourceDB, sourceCollection, len(bulkWriteException.WriteErrors))
 
@@ -1334,20 +1414,37 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 					m.log.Debugf("[%s.%s] Insert error at index %d, _id=%v: %v", sourceDB, sourceCollection, writeErr.Index, errDocID, writeErr.Message)
 
 					if writeErr.Code == 11000 && writeErr.Index < len(batch) {
+						// Case 1: The server responded successfully but flagged a duplicate key error (code 11000).
+						// Since we have 100% certainty that the document exists on the target and this is a backfill
+						// of identical data, we can safely skip overwriting it to optimize performance and disk writes.
 						m.log.Debugf("[%s.%s] Skipping duplicate document _id=%v at index %d", sourceDB, sourceCollection, errDocID, writeErr.Index)
+						duplicateKeys++
 					} else if writeErr.Index < len(batch) {
+						// Note: We do not classify the error here to decide whether to skip the fallback.
+						// Attempting fallback write first is safer: (1) if classification regexes are incomplete,
+						// we avoid dropping valid writes; (2) some errors are batch-specific and succeed individually.
 						doc := batch[writeErr.Index]
 						id := extractDocID(doc)
 
 						if id != nil {
 							filter := bson.M{"_id": id}
-							if _, err := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); err != nil {
+							if opts.BackfillStatsManager != nil {
+								opts.BackfillStatsManager.IncrementSequentialRetries("replace", 1)
+							}
+							err := m.executeWithRetry(ctx, retryManager, func() error {
+								_, replaceErr := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true))
+								return replaceErr
+							})
+							if err != nil {
 								m.log.Errorf("[%s.%s] Retry upsert failed for document _id=%v: %v", sourceDB, sourceCollection, id, err)
 								batchFailed++
-								opts.DLQ.WriteFailed(sourceDB, sourceCollection, id, err, "initial", "insert", doc)
+								dlqCount++
+								opts.DLQ.WriteFailed(sourceDB, sourceCollection, id, err, "initial", "insert", originalBatch[writeErr.Index])
 							}
 						} else {
 							batchFailed++
+							dlqCount++
+							opts.DLQ.WriteFailed(sourceDB, sourceCollection, nil, fmt.Errorf("missing _id"), "initial", "insert", originalBatch[writeErr.Index])
 						}
 					}
 				}
@@ -1373,41 +1470,88 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 
 				if !bulkRetrySucceeded {
 					// Fall back to individual operations with upsert for all documents
-					for _, doc := range batch {
-						if _, err := targetCol.InsertOne(ctx, doc); err != nil {
+					for idx, doc := range batch {
+						if opts.BackfillStatsManager != nil {
+							opts.BackfillStatsManager.IncrementSequentialRetries("insert", 1)
+						}
+						err := m.executeWithRetry(ctx, retryManager, func() error {
+							_, insertErr := targetCol.InsertOne(ctx, doc)
+							return insertErr
+						})
+						if err != nil {
 							docID := extractDocID(doc)
 							if docID != nil {
 								filter := bson.M{"_id": docID}
-								if _, err := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); err != nil {
-									if err == context.Canceled {
+								// Case 2: The bulk request failed entirely at the connection/socket layer. We cannot
+								// know which documents were written before the crash. If individual InsertOne fails
+								// with a duplicate key, we must upsert (overwrite) it rather than skipping to guarantee
+								// that the target document is fully synchronized with the correct, latest version.
+								if opts.BackfillStatsManager != nil {
+									opts.BackfillStatsManager.IncrementSequentialRetries("replace", 1)
+								}
+								replaceErr := m.executeWithRetry(ctx, retryManager, func() error {
+									_, repErr := targetCol.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true))
+									return repErr
+								})
+								if replaceErr != nil {
+									if replaceErr == context.Canceled {
 										m.log.Debugf("Upserting document %v in %s.%s canceled due to context cancellation", docID, sourceDB, sourceCollection)
 									} else {
-										m.log.Errorf("Error upserting document %v in %s.%s: %v", docID, sourceDB, sourceCollection, err)
+										m.log.Errorf("Error upserting document %v in %s.%s: %v", docID, sourceDB, sourceCollection, replaceErr)
 										batchFailed++
+										dlqCount++
 										if opts.DLQ != nil {
-											opts.DLQ.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
+											opts.DLQ.WriteFailed(sourceDB, sourceCollection, docID, replaceErr, "initial", "insert", originalBatch[idx])
 										}
 									}
 								}
 							} else {
 								batchFailed++
+								dlqCount++
+								if opts.DLQ != nil {
+									opts.DLQ.WriteFailed(sourceDB, sourceCollection, nil, err, "initial", "insert", originalBatch[idx])
+								}
 							}
 						}
 					}
 				}
 			}
-		}
 
 		successCount := int64(len(batch)) - batchFailed
+		if opts.BackfillStatsManager != nil {
+			opts.BackfillStatsManager.RecordWriteResult(successCount, batchFailed, duplicateKeys, dlqCount, workerID)
+		}
 		return successCount, batchFailed, nil
 	} else {
 		// Fail-Fast Mode (standard mode=migrate behavior)
 		err := retryManager.RetryWithSplit(ctx, batch, sourceCollection, func(b []interface{}) error {
 			return processBatch(ctx, targetCol, b, opts.UpsertMode, sourceDB, sourceCollection, transformer)
 		})
+		writeDuration := time.Since(writeStart)
 		if err != nil {
+			if opts.BackfillStatsManager != nil {
+				opts.BackfillStatsManager.RecordBulkWrite(writeDuration)
+				opts.BackfillStatsManager.RecordWriteResult(0, int64(len(batch)), 0, 0, workerID)
+			}
 			return 0, int64(len(batch)), err
+		}
+		if opts.BackfillStatsManager != nil {
+			opts.BackfillStatsManager.RecordBulkWrite(writeDuration)
+			opts.BackfillStatsManager.RecordWriteResult(int64(len(batch)), 0, 0, 0, workerID)
 		}
 		return int64(len(batch)), 0, nil
 	}
 }
+
+func (m *Migrator) executeWithRetry(ctx context.Context, retryManager *RetryManager, op func() error) error {
+	err := op()
+	if err != nil && retryManager != nil && err != context.Canceled && ctx.Err() != context.Canceled {
+		errType := retryManager.ClassifyError(err)
+		if errType == ErrorTypeConnection || errType == ErrorTypeContention {
+			m.log.Infof("Transient error during fallback execution. Retrying with backoff...")
+			err = retryManager.RetryWithBackoff(ctx, op)
+		}
+	}
+	return err
+}
+

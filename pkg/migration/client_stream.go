@@ -29,6 +29,7 @@ type ClientLevelReplicator struct {
 	mu                sync.Mutex                   // Mutex for thread-safe operations
 	dlq               DLQ                          // Dead Letter Queue for failed documents
 	incrementalStatsManager      *IncrementalStatsManager                // Statistics manager
+	backfillStatsManager         *BackfillStatsManager    // Backfill statistics manager
 	DryRun            bool                         // Dry run flag
 }
 
@@ -47,6 +48,11 @@ func NewClientLevelReplicator(sourceDB, targetDB *db.MongoDB, cfg *config.Config
 // SetIncrementalStatsManager sets the stats manager for this replicator
 func (r *ClientLevelReplicator) SetIncrementalStatsManager(sm *IncrementalStatsManager) {
 	r.incrementalStatsManager = sm
+}
+
+// SetBackfillStatsManager sets the backfill stats manager for this replicator
+func (r *ClientLevelReplicator) SetBackfillStatsManager(sm *BackfillStatsManager) {
+	r.backfillStatsManager = sm
 }
 
 // SetDLQ sets the Dead Letter Queue writer for this replicator
@@ -404,9 +410,10 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 					r.log.Infof("Starting initial migration for %s.%s to %s", sourceDB, sourceCollection, collConfig.TargetCollection)
 
 					opts := MigrateOptions{
-						DLQ:          r.dlq,
-						StatsManager: r.incrementalStatsManager,
-						UpsertMode:   true, // resilient mode always performs upserts on duplicates
+						DLQ:                  r.dlq,
+						StatsManager:         r.incrementalStatsManager,
+						BackfillStatsManager: r.backfillStatsManager,
+						UpsertMode:           true, // resilient mode always performs upserts on duplicates
 					}
 
 					succeeded, failed, err := migrator.migrateCollection(ctx, r.sourceDB, r.targetDB, collConfig, opts)
@@ -429,6 +436,9 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 
 		// Wait for all collection migrations to complete
 		wg.Wait()
+		if r.backfillStatsManager != nil {
+			r.backfillStatsManager.ReportStats(true)
+		}
 
 		if criticalErr != nil {
 			return criticalErr

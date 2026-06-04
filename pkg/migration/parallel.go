@@ -419,11 +419,12 @@ type QueueEvent struct {
 
 // WriteOperation represents a single write operation
 type WriteOperation struct {
-	DocumentID        interface{}
-	Document          interface{}
-	UpdateDescription interface{} // For modifier updates ($set, $inc, etc.)
-	Namespace         string
-	OpType            string
+	DocumentID          interface{}
+	Document            interface{}
+	TransformedDocument interface{} // Pre-calculated transformed document for Firestore/Spanner compatibility
+	UpdateDescription   interface{} // For modifier updates ($set, $inc, etc.)
+	Namespace           string
+	OpType              string
 	// Stats
 	EventTime         time.Time // Time when the change event occurred on the source database (clusterTime or wallTime)
 	ReadTime          time.Time // Time when the event was read from the change stream/oplog by the distributor
@@ -896,7 +897,7 @@ func (w *Worker) executeBatchWrite(group OperationGroup) {
 		var models []mongo.WriteModel
 		for idx := range group.Operations {
 			op := &group.Operations[idx]
-			model, err := w.buildWriteModel(*op, dbName, collName)
+			model, err := w.buildWriteModel(op, dbName, collName)
 			if err != nil {
 				w.handleTransformationFailure(op, dbName, collName, err)
 				continue
@@ -924,6 +925,7 @@ func (w *Worker) executeBatchWrite(group OperationGroup) {
 				w.handleTransformationFailure(op, dbName, collName, err)
 				continue
 			}
+			op.TransformedDocument = transformed
 			docs = append(docs, transformed)
 		}
 
@@ -1002,6 +1004,9 @@ func (w *Worker) handleBulkWriteResult(ctx context.Context, group *OperationGrou
 				w.log.Errorf("[%s.%s] Write error at index %d (opType=%s), _id=%v: %v", dbName, collName, writeErr.Index, op.OpType, failedDocID, writeErr.Message)
 			}
 
+			// Note: We do not classify the error here to decide whether to skip the fallback.
+			// Attempting fallback write first is safer: (1) if classification regexes are incomplete,
+			// we avoid dropping valid writes; (2) some errors are batch-specific and succeed individually.
 			if writeErr.Index < len(group.Operations) {
 				w.retryIndividualOperation(ctx, targetCollection, &group.Operations[writeErr.Index], dbName, collName, writeErr.Message)
 			}
@@ -1096,17 +1101,28 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 
 	switch op.OpType {
 	case "insert":
-		transformed, err := w.transformer.Transform(op.Document, dbName, collName, op.DocumentID)
-		if err != nil {
-			w.log.Errorf("[%s.%s] Field name transformation failed for fallback insert, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-			w.markDLQ(op, dbName, collName, err)
-			return
+		var transformed interface{}
+		if op.TransformedDocument != nil {
+			transformed = op.TransformedDocument
+		} else {
+			var err error
+			transformed, err = w.transformer.Transform(op.Document, dbName, collName, op.DocumentID)
+			if err != nil {
+				w.log.Errorf("[%s.%s] Field name transformation failed for fallback insert, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+				w.markDLQ(op, dbName, collName, err)
+				return
+			}
+			op.TransformedDocument = transformed
 		}
 
 		if isDup {
 			// If duplicate key, retry using ReplaceOne with upsert=true to overwrite
 			w.log.Debugf("[%s.%s] Fallback upserting duplicate insert document _id=%v", dbName, collName, op.DocumentID)
-			if _, err := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
+			err := w.executeWithRetry(ctx, func() error {
+				_, replaceErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true))
+				return replaceErr
+			})
+			if err != nil {
 				w.log.Debugf("[%s.%s] Fallback upsert failed for insert document _id=%v: %v", dbName, collName, op.DocumentID, err)
 				w.markDLQ(op, dbName, collName, err)
 			} else {
@@ -1116,14 +1132,22 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 			}
 		} else {
 			// For non-duplicate key errors, retry with standard InsertOne
-			if _, err := targetCollection.InsertOne(ctx, transformed); err != nil {
+			err := w.executeWithRetry(ctx, func() error {
+				_, insertErr := targetCollection.InsertOne(ctx, transformed)
+				return insertErr
+			})
+			if err != nil {
 				// If it actually already exists (e.g. concurrent write or socket retry pre-exist), fallback to ReplaceOne upsert
 				if isDuplicateKeyError(0, err.Error()) {
 					if w.incrementalStatsManager != nil {
 						w.incrementalStatsManager.IncrementDuplicateKeys(1)
 					}
 					w.log.Debugf("[%s.%s] Fallback InsertOne got duplicate key, retrying with upsert overwrite for _id=%v", dbName, collName, op.DocumentID)
-					if _, replaceErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true)); replaceErr != nil {
+					replaceErr := w.executeWithRetry(ctx, func() error {
+						_, repErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true))
+						return repErr
+					})
+					if replaceErr != nil {
 						w.log.Errorf("[%s.%s] Fallback upsert replace after duplicate insert failed for document _id=%v: %v", dbName, collName, op.DocumentID, replaceErr)
 						w.markDLQ(op, dbName, collName, replaceErr)
 					} else {
@@ -1142,13 +1166,24 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 
 	case "update":
 		if op.Document != nil {
-			transformed, err := w.transformer.Transform(op.Document, dbName, collName, op.DocumentID)
-			if err != nil {
-				w.log.Errorf("[%s.%s] Field name transformation failed for fallback replace update, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-				w.markDLQ(op, dbName, collName, err)
-				return
+			var transformed interface{}
+			if op.TransformedDocument != nil {
+				transformed = op.TransformedDocument
+			} else {
+				var err error
+				transformed, err = w.transformer.Transform(op.Document, dbName, collName, op.DocumentID)
+				if err != nil {
+					w.log.Errorf("[%s.%s] Field name transformation failed for fallback replace update, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+					w.markDLQ(op, dbName, collName, err)
+					return
+				}
+				op.TransformedDocument = transformed
 			}
-			if _, err := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
+			err := w.executeWithRetry(ctx, func() error {
+				_, replaceErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true))
+				return replaceErr
+			})
+			if err != nil {
 				if err == context.Canceled || ctx.Err() == context.Canceled {
 					w.log.Debugf("[%s.%s] Fallback replace update for document _id=%v canceled", dbName, collName, op.DocumentID)
 					return
@@ -1160,7 +1195,11 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 						w.incrementalStatsManager.IncrementDuplicateKeys(1)
 					}
 					w.log.Debugf("[%s.%s] Concurrent upsert collision detected for replace document _id=%v, retrying without upsert", dbName, collName, op.DocumentID)
-					if _, retryErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(false)); retryErr != nil {
+					retryErr := w.executeWithRetry(ctx, func() error {
+						_, repErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(false))
+						return repErr
+					})
+					if retryErr != nil {
 						w.log.Errorf("[%s.%s] Fallback replace update without upsert failed for document _id=%v: %v", dbName, collName, op.DocumentID, retryErr)
 						w.markDLQ(op, dbName, collName, retryErr)
 					} else {
@@ -1181,13 +1220,24 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 		}
 
 	case "replace":
-		transformed, err := w.transformer.Transform(op.Document, dbName, collName, op.DocumentID)
-		if err != nil {
-			w.log.Errorf("[%s.%s] Field name transformation failed for fallback replace, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-			w.markDLQ(op, dbName, collName, err)
-			return
+		var transformed interface{}
+		if op.TransformedDocument != nil {
+			transformed = op.TransformedDocument
+		} else {
+			var err error
+			transformed, err = w.transformer.Transform(op.Document, dbName, collName, op.DocumentID)
+			if err != nil {
+				w.log.Errorf("[%s.%s] Field name transformation failed for fallback replace, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+				w.markDLQ(op, dbName, collName, err)
+				return
+			}
+			op.TransformedDocument = transformed
 		}
-		if _, err := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
+		err := w.executeWithRetry(ctx, func() error {
+			_, replaceErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true))
+			return replaceErr
+		})
+		if err != nil {
 			if err == context.Canceled || ctx.Err() == context.Canceled {
 				w.log.Debugf("[%s.%s] Fallback replace for document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
 				return
@@ -1199,7 +1249,11 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 					w.incrementalStatsManager.IncrementDuplicateKeys(1)
 				}
 				w.log.Debugf("[%s.%s] Concurrent upsert collision detected for replace document _id=%v, retrying without upsert", dbName, collName, op.DocumentID)
-				if _, retryErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(false)); retryErr != nil {
+				retryErr := w.executeWithRetry(ctx, func() error {
+					_, repErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(false))
+					return repErr
+				})
+				if retryErr != nil {
 					w.log.Errorf("[%s.%s] Fallback replace without upsert failed for document _id=%v: %v", dbName, collName, op.DocumentID, retryErr)
 					w.markDLQ(op, dbName, collName, retryErr)
 				} else {
@@ -1217,7 +1271,11 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 		}
 
 	case "delete":
-		if _, err := targetCollection.DeleteOne(ctx, filter); err != nil {
+		err := w.executeWithRetry(ctx, func() error {
+			_, deleteErr := targetCollection.DeleteOne(ctx, filter)
+			return deleteErr
+		})
+		if err != nil {
 			w.log.Errorf("[%s.%s] Fallback delete failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
 			w.markDLQ(op, dbName, collName, err)
 		} else {
@@ -1248,7 +1306,7 @@ func isDuplicateKeyError(code int, msg string) bool {
 }
 
 // buildWriteModel builds a single mongo.WriteModel from a WriteOperation, transforming Firestore-incompatible keys.
-func (w *Worker) buildWriteModel(op WriteOperation, dbName, collName string) (mongo.WriteModel, error) {
+func (w *Worker) buildWriteModel(op *WriteOperation, dbName, collName string) (mongo.WriteModel, error) {
 	if op.OpType == "delete" {
 		return mongo.NewDeleteOneModel().SetFilter(bson.M{"_id": op.DocumentID}), nil
 	}
@@ -1262,6 +1320,7 @@ func (w *Worker) buildWriteModel(op WriteOperation, dbName, collName string) (mo
 		if err != nil {
 			return nil, err
 		}
+		op.TransformedDocument = transformed
 
 		collConfig, exists := w.collectionConfigs[dbName][collName]
 		useUpsert := op.OpType == "update" || op.OpType == "replace" || (exists && collConfig.UpsertMode)
@@ -1555,3 +1614,16 @@ func (t *PartitionTracker) savePartitionResumeToken(partitionIndex int, resumeTo
 		t.log.Debugf("[PartitionTracker %d] Saved resume token successfully to %s (seq: %d)", partitionIndex, path, t.lastCheckpointSeq[partitionIndex])
 	}
 }
+
+func (w *Worker) executeWithRetry(ctx context.Context, op func() error) error {
+	err := op()
+	if err != nil && w.retryManager != nil && err != context.Canceled && ctx.Err() != context.Canceled {
+		errType := w.retryManager.ClassifyError(err)
+		if errType == ErrorTypeConnection || errType == ErrorTypeContention {
+			w.log.Infof("Transient error during fallback execution. Retrying with backoff...")
+			err = w.retryManager.RetryWithBackoff(ctx, op)
+		}
+	}
+	return err
+}
+

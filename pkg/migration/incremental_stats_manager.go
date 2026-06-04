@@ -1181,7 +1181,7 @@ func (sm *IncrementalStatsManager) ReportStats() {
 		"      * Queue Stalls (Backpressure): [Batching Queue Stall (Distributor blocked): %s, Batch Write Queue Stall (Worker blocked): %s]\n"+
 		"  - ChangeStream Read Performance:\n"+
 		"      * Global Next Latency: avg %s (p50: %s, p99: %s, p100: %s)\n"+
-		"      * Event Size: avg %.1f bytes (total %s) (p50: %s, p90: %s, p100: %s)\n"+
+		"      * Event Size: avg %.1f bytes (total %s, rate %s/sec) (p50: %s, p90: %s, p100: %s)\n"+
 		"%s",
 		duration.Round(time.Second),
 		readCount, rateRead,
@@ -1212,6 +1212,7 @@ func (sm *IncrementalStatsManager) ReportStats() {
 		p50ReadNext, p99ReadNext, p100ReadNext,
 		avgReadSize,
 		formatBytes(totalReadSizeBytes),
+		formatBytes(int64(float64(totalReadSizeBytes)/duration.Seconds())),
 		p50ReadSize, p90ReadSize, p100ReadSize,
 		poolStatsStr)
 
@@ -1289,11 +1290,16 @@ func (sm *IncrementalStatsManager) ReportDryRunStats() {
 	sourcePoolStr := sm.formatPoolStats(&sm.sourcePool, "Source", duration)
 	targetPoolStr := sm.formatPoolStats(&sm.targetPool, "Target", duration)
 
+	var dryRunByteRate float64
+	if duration.Seconds() > 0 {
+		dryRunByteRate = float64(totalReadSizeBytes) / duration.Seconds()
+	}
+
 	msg := fmt.Sprintf("Change stream statistics in dry-run live-only mode (last %v):\n"+
 		"  - Read: %d (%.2f events/sec)\n"+
 		"  - ChangeStream Read Performance:\n"+
 		"      * Global Next Latency: avg %s (p50: %s, p99: %s, p100: %s)\n"+
-		"      * Event Size: avg %.1f bytes (total %s) (p50: %s, p90: %s, p100: %s)\n"+
+		"      * Event Size: avg %.1f bytes (total %s, rate %s/sec) (p50: %s, p90: %s, p100: %s)\n"+
 		"  - Lags:\n"+
 		"      * Event-to-Read: %s\n"+
 		"  - Connection Pool:\n"+
@@ -1305,6 +1311,7 @@ func (sm *IncrementalStatsManager) ReportDryRunStats() {
 		p50ReadNext, p99ReadNext, p100ReadNext,
 		avgSize,
 		formatBytes(totalReadSizeBytes),
+		formatBytes(int64(dryRunByteRate)),
 		p50ReadSize, p90ReadSize, p100ReadSize,
 		formatLag(lagRes.EventToReadLag),
 		sourcePoolStr,
@@ -1433,5 +1440,21 @@ func formatLag(d time.Duration) string {
 		return "N/A"
 	}
 	return d.Round(time.Millisecond).String()
+}
+
+// GetSourcePoolStatsString returns the formatted pool stats for source database
+func (sm *IncrementalStatsManager) GetSourcePoolStatsString(duration time.Duration) string {
+	if sm == nil {
+		return "Source: Pool stats unavailable"
+	}
+	return sm.formatPoolStats(&sm.sourcePool, "Source", duration)
+}
+
+// GetTargetPoolStatsString returns the formatted pool stats for target database
+func (sm *IncrementalStatsManager) GetTargetPoolStatsString(duration time.Duration) string {
+	if sm == nil {
+		return "Target: Pool stats unavailable"
+	}
+	return sm.formatPoolStats(&sm.targetPool, "Target", duration)
 }
 
