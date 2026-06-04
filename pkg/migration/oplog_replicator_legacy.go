@@ -30,12 +30,13 @@ type OplogReplicatorLegacy struct {
 	mu                sync.Mutex                   // Mutex for thread-safe operations
 	dlq               DLQ                          // Dead Letter Queue for failed documents
 	retryManager      *RetryManager                // Retry manager for transient errors
-	DontApply         bool                         // Don't apply flag
+	transformer       *FieldTransformer            // Field transformer
 	DryRun            bool                         // Dry run flag
 }
 
 // NewOplogReplicatorLegacy creates a new oplog-based replicator using GTM legacy
 func NewOplogReplicatorLegacy(sourceDB *db.MongoDBLegacy, targetDB *db.MongoDB, cfg *config.Config, log *logger.Logger) *OplogReplicatorLegacy {
+	enableTransform := cfg.EnableFieldTransformations != nil && *cfg.EnableFieldTransformations
 	return &OplogReplicatorLegacy{
 		sourceDB:          sourceDB,
 		targetDB:          targetDB,
@@ -43,6 +44,7 @@ func NewOplogReplicatorLegacy(sourceDB *db.MongoDBLegacy, targetDB *db.MongoDB, 
 		log:               log,
 		collectionMap:     make(map[string]map[string]string),
 		collectionConfigs: make(map[string]map[string]config.CollectionConfig),
+		transformer:       NewFieldTransformer(enableTransform, log),
 	}
 }
 
@@ -516,8 +518,7 @@ func (r *OplogReplicatorLegacy) migrateCollection(ctx context.Context, sourceCol
 // insertBatchWithRetry inserts a batch of documents with sophisticated error handling
 // Returns the count of successfully inserted documents
 func (r *OplogReplicatorLegacy) insertBatchWithRetry(ctx context.Context, targetCol *mongod.Collection, batch []interface{}, sourceDB, sourceCollection string) int64 {
-	// Transform __*__ field names to _*_ for Firestore compatibility
-	transformedBatch, err := TransformBatch(batch, r.log, sourceDB, sourceCollection)
+	transformedBatch, err := r.transformer.TransformBatch(batch, sourceDB, sourceCollection)
 	if err != nil {
 		r.log.Errorf("Field name transformation failed for batch in %s.%s: %v", sourceDB, sourceCollection, err)
 		for _, doc := range batch {
@@ -785,7 +786,7 @@ func (r *OplogReplicatorLegacy) tailOplog(ctx context.Context, afterTimestamp bs
 	r.log.Infof("Starting parallel oplog processing with %d workers", r.config.IncrementalWorkerCount)
 	workers := make([]*Worker, r.config.IncrementalWorkerCount)
 	for i := 0; i < r.config.IncrementalWorkerCount; i++ {
-		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionConfigs, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager, nil, r.config.GroupOpsByDistinctId, time.Duration(r.config.FlushIntervalMs)*time.Millisecond, r.config.IncrementalIncomingQueueSize, r.config.IncrementalProcessingQueueSize, r.DontApply)
+		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionConfigs, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager, nil, r.config.GroupOpsByDistinctId, time.Duration(r.config.FlushIntervalMs)*time.Millisecond, r.config.IncrementalIncomingQueueSize, r.config.IncrementalProcessingQueueSize, r.transformer)
 	}
 
 	// Set up context cancellation handling for workers

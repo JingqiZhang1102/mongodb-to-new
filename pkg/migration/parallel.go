@@ -49,7 +49,6 @@ type EventDistributor struct {
 	// Statistics tracking
 	incrementalStatsManager *IncrementalStatsManager // Manager for statistics and replication lag
 	cfg          *config.Config
-	DontApply    bool // Don't apply flag
 	DryRun       bool // Dry run flag
 
 	partitionTracker *PartitionTracker // Thread-safe ack-based progress checkpoint tracker
@@ -164,9 +163,12 @@ func (d *EventDistributor) Start() error {
 		d.incrementalStatsManager.Start(cancelCtx)
 	}
 
+	enableTransform := d.cfg.EnableFieldTransformations != nil && *d.cfg.EnableFieldTransformations
+	transformer := NewFieldTransformer(enableTransform, d.log)
+
 	// Initialize workers with retry manager and stats manager
 	for i := 0; i < d.incrementalWorkerCount; i++ {
-		d.workers[i] = NewWorker(i, cancelCtx, d.log, d.targetDB, d.collectionConfigs, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.incrementalStatsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval, d.cfg.IncrementalIncomingQueueSize, d.cfg.IncrementalProcessingQueueSize, d.DontApply)
+		d.workers[i] = NewWorker(i, cancelCtx, d.log, d.targetDB, d.collectionConfigs, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.incrementalStatsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval, d.cfg.IncrementalIncomingQueueSize, d.cfg.IncrementalProcessingQueueSize, transformer)
 		d.workers[i].SetPartitionTracker(d.partitionTracker)
 	}
 
@@ -240,6 +242,10 @@ func (d *EventDistributor) Start() error {
 				}
 
 				if d.DryRun {
+					if d.incrementalStatsManager != nil {
+						eventTime := ExtractEventTimeFromRaw(rawEvent)
+						d.incrementalStatsManager.RecordDryRunLag(eventTime, readTime)
+					}
 					continue
 				}
 
@@ -461,7 +467,6 @@ type Worker struct {
 
 	// Force ordered operations for all types
 	forceOrderedOperations bool
-	dontApply              bool
 
 	// Dead Letter Queue for failed documents
 	dlq DLQ
@@ -483,6 +488,7 @@ type Worker struct {
 	currentGroupIDs      map[int]bool
 	flushInterval        time.Duration
 	partitionTracker     *PartitionTracker
+	transformer          *FieldTransformer
 }
 
 // SetPartitionTracker sets the PartitionTracker for this worker
@@ -540,7 +546,7 @@ func (s *statsTrackingDLQ) Close() {
 func NewWorker(id int, ctx context.Context, log *logger.Logger,
 	targetDB *db.MongoDB, collectionConfigs map[string]map[string]config.CollectionConfig,
 	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager, incrementalStatsManager *IncrementalStatsManager, groupOpsByDistinctId bool, flushInterval time.Duration,
-	batchingQueueSize int, batchWriteQueueSize int, dontApply bool) *Worker {
+	batchingQueueSize int, batchWriteQueueSize int, transformer *FieldTransformer) *Worker {
 
 	var workerDLQ DLQ = dlq
 	if dlq != nil && incrementalStatsManager != nil {
@@ -560,13 +566,13 @@ func NewWorker(id int, ctx context.Context, log *logger.Logger,
 		batchWriteQueue:           make(chan *OperationGroup, batchWriteQueueSize),
 		incrementalWriteBatchSize: incrementalWriteBatchSize,
 		forceOrderedOperations:    forceOrderedOperations,
-		dontApply:                 dontApply,
 		dlq:                       workerDLQ,
 		retryManager:              retryManager,
 		incrementalStatsManager:              incrementalStatsManager,
 		groupOpsByDistinctId:      groupOpsByDistinctId,
 		currentGroupIDs:           make(map[int]bool),
 		flushInterval:             flushInterval,
+		transformer:               transformer,
 	}
 
 	// Increment WaitGroup count for both background goroutines on the parent constructor thread
@@ -852,12 +858,11 @@ func (w *Worker) executeBatchWrite(group OperationGroup) {
 	// Get mapped collection name
 	targetCollName := w.getTargetCollectionName(dbName, collName)
 
-	if w.dontApply {
+	if w.targetDB == nil {
 		now := time.Now()
 		for i := range group.Operations {
 			group.Operations[i].SuccessTime = now
 		}
-		w.log.Debugf("[%s.%s] Don't apply: dropped batch of %d %s operations", dbName, targetCollName, len(group.Operations), group.OpType)
 		if w.incrementalStatsManager != nil {
 			w.incrementalStatsManager.RecordLags(group.Operations)
 		}
@@ -914,8 +919,7 @@ func (w *Worker) executeBatchWrite(group OperationGroup) {
 		var docs []interface{}
 		for idx := range group.Operations {
 			op := &group.Operations[idx]
-			// Transform __*__ field names to _*_ for Firestore compatibility
-			transformed, err := TransformFieldNames(op.Document, w.log.logger, dbName, collName, op.DocumentID)
+			transformed, err := w.transformer.Transform(op.Document, dbName, collName, op.DocumentID)
 			if err != nil {
 				w.handleTransformationFailure(op, dbName, collName, err)
 				continue
@@ -1092,7 +1096,7 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 
 	switch op.OpType {
 	case "insert":
-		transformed, err := TransformFieldNames(op.Document, w.log.logger, dbName, collName, op.DocumentID)
+		transformed, err := w.transformer.Transform(op.Document, dbName, collName, op.DocumentID)
 		if err != nil {
 			w.log.Errorf("[%s.%s] Field name transformation failed for fallback insert, document _id=%v: %v", dbName, collName, op.DocumentID, err)
 			w.markDLQ(op, dbName, collName, err)
@@ -1138,7 +1142,7 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 
 	case "update":
 		if op.Document != nil {
-			transformed, err := TransformFieldNames(op.Document, w.log.logger, dbName, collName, op.DocumentID)
+			transformed, err := w.transformer.Transform(op.Document, dbName, collName, op.DocumentID)
 			if err != nil {
 				w.log.Errorf("[%s.%s] Field name transformation failed for fallback replace update, document _id=%v: %v", dbName, collName, op.DocumentID, err)
 				w.markDLQ(op, dbName, collName, err)
@@ -1177,7 +1181,7 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 		}
 
 	case "replace":
-		transformed, err := TransformFieldNames(op.Document, w.log.logger, dbName, collName, op.DocumentID)
+		transformed, err := w.transformer.Transform(op.Document, dbName, collName, op.DocumentID)
 		if err != nil {
 			w.log.Errorf("[%s.%s] Field name transformation failed for fallback replace, document _id=%v: %v", dbName, collName, op.DocumentID, err)
 			w.markDLQ(op, dbName, collName, err)
@@ -1254,7 +1258,7 @@ func (w *Worker) buildWriteModel(op WriteOperation, dbName, collName string) (mo
 			return nil, fmt.Errorf("document payload is nil for _id=%v", op.DocumentID)
 		}
 
-		transformed, err := TransformFieldNames(op.Document, w.log.logger, dbName, collName, op.DocumentID)
+		transformed, err := w.transformer.Transform(op.Document, dbName, collName, op.DocumentID)
 		if err != nil {
 			return nil, err
 		}

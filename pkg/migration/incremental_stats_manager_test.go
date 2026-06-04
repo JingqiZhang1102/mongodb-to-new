@@ -625,3 +625,44 @@ func TestIncrementalStatsManagerSkippedEvents(t *testing.T) {
 	}
 }
 
+func TestIncrementalStatsManagerDryRunLag(t *testing.T) {
+	log := logger.New()
+	sm := NewIncrementalStatsManager(log, 5*time.Minute)
+	sm.DryRun = true
+
+	now := time.Now()
+	// Simulate dry-run lag recording
+	sm.RecordDryRunLag(now.Add(-100*time.Millisecond), now)
+	sm.RecordDryRunLag(now.Add(-200*time.Millisecond), now)
+
+	// Simulate next latency recordings
+	sm.RecordReadMetric(0, 10*time.Millisecond, 1024)
+	sm.RecordReadMetric(0, 100*time.Millisecond, 2048)
+
+	// Call ReportDryRunStats to output the stats and flush
+	sm.ReportDryRunStats()
+
+	// Verify that lag tracker is flushed/reset
+	sm.mu.Lock()
+	res := sm.lagTracker.Flush()
+	sm.mu.Unlock()
+	if res.EventToReadLag != 0 {
+		t.Errorf("expected EventToReadLag to be reset to 0, got %v", res.EventToReadLag)
+	}
+
+	// Verify that readNextLatenciesHistogram is reset to 0
+	for i, count := range sm.readNextLatenciesHistogram {
+		if count != 0 {
+			t.Errorf("expected readNextLatenciesHistogram[%d] to be reset to 0, got %d", i, count)
+		}
+	}
+
+	// Verify that readSizesHistogram is reset to 0
+	for i, count := range sm.readSizesHistogram {
+		if count != 0 {
+			t.Errorf("expected readSizesHistogram[%d] to be reset to 0, got %d", i, count)
+		}
+	}
+}
+
+

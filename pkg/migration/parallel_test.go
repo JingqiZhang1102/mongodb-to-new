@@ -35,7 +35,7 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndDescription(t *testing.T
 		5*time.Minute,                       // flushInterval
 		8192,                                // batchingQueueSize
 		2,                                   // batchWriteQueueSize
-		false,                               // dontApply
+		NewFieldTransformer(false, log),     // transformer
 	)
 
 	// Create an update event where both fullDocument and updateDescription are nil/null
@@ -84,7 +84,7 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndIncrementalStatsManager(
 		5*time.Minute,                       // flushInterval
 		8192,                                // batchingQueueSize
 		2,                                   // batchWriteQueueSize
-		false,                               // dontApply
+		NewFieldTransformer(false, log),     // transformer
 	)
 
 	// Create an update event where fullDocument is nil
@@ -146,54 +146,7 @@ func BenchmarkNewHashing(b *testing.B) {
 	}
 }
 
-func TestWorkerDontApply(t *testing.T) {
-	log := logger.New()
-	ctx := context.Background()
-	statsMgr := NewIncrementalStatsManager(log, 0, false)
 
-	worker := NewWorker(
-		1,                                   // id
-		ctx,                                 // ctx
-		log,                                 // logger
-		nil,                                 // targetDB
-		nil,                                 // collectionMap
-		10,                                  // batch size
-		false,                               // forceOrdered
-		nil,                                 // dlq
-		nil,                                 // retryManager
-		statsMgr,                            // incrementalStatsManager
-		false,                               // groupOpsByDistinctID
-		5*time.Minute,                       // flushInterval
-		8192,                                // batchingQueueSize
-		2,                                   // batchWriteQueueSize
-		true,                                // dontApply
-	)
-
-	group := OperationGroup{
-		Namespace: "db.coll",
-		OpType:    "insert",
-		Operations: []WriteOperation{
-			{DocumentID: "123", OpType: "insert"},
-			{DocumentID: "456", OpType: "insert"},
-		},
-	}
-
-	// This should run successfully and return immediately without panicking on nil targetDB
-	worker.executeBatchWrite(group)
-
-	// Verify both operations are marked with a non-zero SuccessTime
-	for i, op := range group.Operations {
-		if op.SuccessTime.IsZero() {
-			t.Errorf("expected operation %d SuccessTime to be non-zero in dont-apply", i)
-		}
-	}
-
-	// Verify incrementalStatsManager has registered 2 processed inserts
-	processedCount := statsMgr.GetProcessedCount("insert")
-	if processedCount != 2 {
-		t.Errorf("expected processed count 2, got %d", processedCount)
-	}
-}
 
 func TestPartitionTrackerCorrectness(t *testing.T) {
 	log := logger.New()
@@ -329,7 +282,7 @@ func TestWorkerFlushCurrentGroupResetsIDs(t *testing.T) {
 		5*time.Minute,
 		8192,
 		2,
-		true,
+		NewFieldTransformer(false, log),
 	)
 
 	// Process an event to establish active group ID cache status
@@ -383,7 +336,7 @@ func TestWorkerConcurrencyStateSafety(t *testing.T) {
 		5*time.Minute,
 		8192,
 		2,
-		true,
+		NewFieldTransformer(false, log),
 	)
 
 	// Concurrently invoke ProcessEvent and manual flushes to verify Go race detector safety
@@ -440,7 +393,7 @@ func TestWorkerShutdownConcurrencyRaceSafety(t *testing.T) {
 		5*time.Minute,
 		8192,
 		2,
-		true,
+		NewFieldTransformer(false, log),
 	)
 
 	// Keep the consumer loop active by pushing a dummy event to batchingQueue
@@ -492,7 +445,7 @@ func TestWorkerTimeoutTickerFlush(t *testing.T) {
 		10*time.Millisecond, // very short timeout flush interval!
 		8192,
 		2,
-		true,
+		NewFieldTransformer(false, log),
 	)
 
 	// Process 1 operation to make w.currentGroup non-nil
@@ -551,7 +504,7 @@ func TestWorkerContextCancellationFlush(t *testing.T) {
 		5*time.Minute, // very large interval so it won't timeout flush
 		8192,
 		2,
-		true,
+		NewFieldTransformer(false, log),
 	)
 
 	// Process 1 operation to keep group active in memory
@@ -609,7 +562,7 @@ func TestWorkerSetPartitionTracker(t *testing.T) {
 		5*time.Minute,
 		8192,
 		2,
-		true,
+		NewFieldTransformer(false, log),
 	)
 
 	tracker := NewPartitionTracker(log, "/tmp/dummy-checkpoint.json", 5*time.Minute, 2, 2)

@@ -85,6 +85,15 @@ func (lt *LagTracker) RecordLags(ops []WriteOperation) {
 	}
 }
 
+// RecordEventToRead records only the event-to-read lag metric.
+// This is useful in dry-run mode where full WriteOperations are not constructed.
+func (lt *LagTracker) RecordEventToRead(eventTime, readTime time.Time) {
+	if !readTime.IsZero() && !eventTime.IsZero() {
+		lt.eventToRead.Add(readTime.Sub(eventTime))
+	}
+}
+
+
 // Flush returns the accumulated lag averages, then resets internal counters
 func (lt *LagTracker) Flush() LagFlushResult {
 	res := LagFlushResult{

@@ -46,6 +46,9 @@ type Config struct {
 
 	// Retry configuration
 	RetryConfig RetryConfig `json:"retryConfig"` // Configuration for retry mechanisms
+
+	// Enable field transformations (defaults to true)
+	EnableFieldTransformations *bool `json:"enableFieldTransformations"`
 }
 
 // RetryConfig represents retry configuration
@@ -244,6 +247,12 @@ func LoadConfig(configPath string) (*Config, error) {
 	// Default to true to automatically convert invalid _id types
 	if !config.RetryConfig.ConvertInvalidIds {
 		config.RetryConfig.ConvertInvalidIds = true
+	}
+
+	// Set default value for EnableFieldTransformations (default to false)
+	if config.EnableFieldTransformations == nil {
+		defaultVal := false
+		config.EnableFieldTransformations = &defaultVal
 	}
 
 	// No backward compatibility needed anymore

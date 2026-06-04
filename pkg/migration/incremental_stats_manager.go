@@ -76,7 +76,6 @@ type IncrementalStatsManager struct {
 	log                  *logger.Logger
 	statsInterval        time.Duration
 	groupOpsByDistinctId bool
-	DontApply            bool
 	DryRun               bool
 
 	bulkWriteLatenciesHistogram [30000]int64
@@ -111,6 +110,10 @@ type IncrementalStatsManager struct {
 	// Histograms (atomically tracked using fixed length arrays)
 	orderedSizesHistogram   [4096]int64
 	unorderedSizesHistogram [4096]int64
+	readNextLatenciesHistogram [30000]int64
+	readSizesHistogram         [16384]int64
+
+
 
 	// Worker processed tracking (lock-free fixed-size array)
 	workerProcessedSinceLastStats [4096]int64
@@ -546,6 +549,24 @@ func (sm *IncrementalStatsManager) RecordReadMetric(streamIndex int, latency tim
 	atomic.AddInt64(&sm.readCount, 1)
 	atomic.AddInt64(&sm.totalReadSizeBytes, int64(sizeBytes))
 
+	latencyMs := int64(latency / time.Millisecond)
+	if latencyMs < 0 {
+		latencyMs = 0
+	} else if latencyMs >= 30000 {
+		latencyMs = 29999
+	}
+	atomic.AddInt64(&sm.readNextLatenciesHistogram[latencyMs], 1)
+
+	sizeKb := int64(sizeBytes / 1024)
+	if sizeKb < 0 {
+		sizeKb = 0
+	} else if sizeKb >= 16384 {
+		sizeKb = 16383
+	}
+	atomic.AddInt64(&sm.readSizesHistogram[sizeKb], 1)
+
+
+
 	// Guard boundaries to protect the fixed-size partition array allocation limits
 	if streamIndex >= 0 && streamIndex < 128 {
 		stats := &sm.partitionReadStats[streamIndex]
@@ -554,6 +575,19 @@ func (sm *IncrementalStatsManager) RecordReadMetric(streamIndex int, latency tim
 		atomic.AddInt64(&stats.TotalReadSizeBytes, int64(sizeBytes))
 	}
 }
+
+// RecordDryRunLag records only the event-to-read lag in dry-run mode.
+func (sm *IncrementalStatsManager) RecordDryRunLag(eventTime, readTime time.Time) {
+	if sm == nil {
+		return
+	}
+	sm.mu.Lock()
+	if sm.lagTracker != nil {
+		sm.lagTracker.RecordEventToRead(eventTime, readTime)
+	}
+	sm.mu.Unlock()
+}
+
 
 // IncrementEventsProcessed increments the count of successfully processed events by operation type thread-safely and lock-freely
 func (sm *IncrementalStatsManager) IncrementEventsProcessed(opType string, count int64) {
@@ -791,8 +825,7 @@ func (sm *IncrementalStatsManager) ReportStats() {
 		totalWriteCount += val
 	}
 
-	// Atomically swap and snapshot partition-specific metrics lock-freely from flat array
-	partitionSnapshot, partitionIndices := sm.swapPartitionStats()
+
 
 	groupFlushesOpType := atomic.SwapInt64(&sm.groupFlushesOpType, 0)
 	groupFlushesBatchFull := atomic.SwapInt64(&sm.groupFlushesBatchFull, 0)
@@ -878,13 +911,52 @@ func (sm *IncrementalStatsManager) ReportStats() {
 	insertsProcessed = swapped[opInsert].processed
 	updatesProcessed = swapped[opUpdate].processed + swapped[opReplace].processed
 	deletesProcessed = swapped[opDelete].processed
-
 	avgReadLatency := time.Duration(0)
 	avgReadSize := 0.0
 	if readCount > 0 {
 		avgReadLatency = time.Duration(totalReadLatencyNs / readCount)
 		avgReadSize = float64(totalReadSizeBytes) / float64(readCount)
 	}
+
+	// Swap read next latencies histogram
+	readNextLatenciesSnapshot := make([]int64, 30000)
+	for i := 0; i < 30000; i++ {
+		readNextLatenciesSnapshot[i] = atomic.SwapInt64(&sm.readNextLatenciesHistogram[i], 0)
+	}
+
+	// Calculate next latency percentiles (p50, p99, p100)
+	readLatencyRes := calculatePercentilesFromHistogram(readNextLatenciesSnapshot, []float64{0.50, 0.99, 1.00})
+	p50ReadNext := formatLag(time.Duration(readLatencyRes[0]) * time.Millisecond)
+	p99ReadNext := formatLag(time.Duration(readLatencyRes[1]) * time.Millisecond)
+	p100ReadNext := formatLag(time.Duration(readLatencyRes[2]) * time.Millisecond)
+
+	// Swap read sizes histogram
+	readSizesSnapshot := make([]int64, 16384)
+	for i := 0; i < 16384; i++ {
+		readSizesSnapshot[i] = atomic.SwapInt64(&sm.readSizesHistogram[i], 0)
+	}
+
+	// Calculate read sizes percentiles (p50, p90, p100)
+	readSizesRes := calculatePercentilesFromHistogram(readSizesSnapshot, []float64{0.50, 0.90, 1.00})
+	formatSize := func(kb int) string {
+		if kb == -1 {
+			return "N/A"
+		}
+		return formatBytes(int64(kb) * 1024)
+	}
+	p50ReadSize := formatSize(readSizesRes[0])
+	p90ReadSize := formatSize(readSizesRes[1])
+	p100ReadSize := formatSize(readSizesRes[2])
+
+	// Reset partition-specific metrics to avoid memory accumulation
+	for i := 0; i < 128; i++ {
+		stats := &sm.partitionReadStats[i]
+		atomic.StoreInt64(&stats.TotalReadLatencyNs, 0)
+		atomic.StoreInt64(&stats.ReadCount, 0)
+		atomic.StoreInt64(&stats.TotalReadSizeBytes, 0)
+	}
+
+
 
 	var rateWorkerReceived, rateProcessed, rateApplied, rateFailed, rateUpdatedThenDeleted float64
 	var rateInsertsProcessed, rateUpdatesProcessed, rateDeletesProcessed float64
@@ -1006,12 +1078,6 @@ func (sm *IncrementalStatsManager) ReportStats() {
 			swapped[opInsert].sequentialRetries, swapped[opUpdate].sequentialRetries, swapped[opDelete].sequentialRetries, swapped[opReplace].sequentialRetries)
 	}
 
-	formatLag := func(d time.Duration) string {
-		if d == 0 {
-			return "N/A"
-		}
-		return d.Round(time.Millisecond).String()
-	}
 
 	// Format DLQ stats
 	dlqStatsStr := "      * DLQ'ed:"
@@ -1071,31 +1137,17 @@ func (sm *IncrementalStatsManager) ReportStats() {
 
 	_ = intervalSkipped
 
-	// Build a detailed partition-scoped read statistics telemetry log block
-	partitionReadStr := formatPartitionStats(partitionSnapshot, partitionIndices, duration, time.Millisecond)
+
 
 	headerStr := "Change stream statistics"
-	if sm.DontApply {
-		headerStr += " in dont-apply live-only mode"
-	}
 
-	var processedLine string
-	if sm.DontApply {
-		processedLine = fmt.Sprintf("  - Processed:      %d (%.2f events/sec) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]",
-			eventsProcessed, rateProcessed,
-			insertsProcessed, rateInsertsProcessed,
-			deletesProcessed, rateDeletesProcessed,
-			updatesProcessed, rateUpdatesProcessed,
-			updatedThenDeleted, rateUpdatedThenDeleted)
-	} else {
-		processedLine = fmt.Sprintf("  - Processed:      %d (%.2f events/sec) (applied: %d (%.2f/sec)) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]",
-			eventsProcessed, rateProcessed,
-			eventsApplied, rateApplied,
-			insertsProcessed, rateInsertsProcessed,
-			deletesProcessed, rateDeletesProcessed,
-			updatesProcessed, rateUpdatesProcessed,
-			updatedThenDeleted, rateUpdatedThenDeleted)
-	}
+	processedLine := fmt.Sprintf("  - Processed:      %d (%.2f events/sec) (applied: %d (%.2f/sec)) [Inserts: %d (%.2f/sec), Deletes: %d (%.2f/sec), Updates: %d (%.2f/sec), updatedThenDeleted: %d (%.2f/sec)]",
+		eventsProcessed, rateProcessed,
+		eventsApplied, rateApplied,
+		insertsProcessed, rateInsertsProcessed,
+		deletesProcessed, rateDeletesProcessed,
+		updatesProcessed, rateUpdatesProcessed,
+		updatedThenDeleted, rateUpdatedThenDeleted)
 
 	var rateRead float64
 	if duration.Seconds() > 0 {
@@ -1128,7 +1180,8 @@ func (sm *IncrementalStatsManager) ReportStats() {
 		"      * Queue Delays: [Ingest Queue: %s, Batching Queue: %s]\n"+
 		"      * Queue Stalls (Backpressure): [Batching Queue Stall (Distributor blocked): %s, Batch Write Queue Stall (Worker blocked): %s]\n"+
 		"  - ChangeStream Read Performance:\n"+
-		"      * Global Next Latency: %s | Event Size: avg %.1f bytes (total %s)%s\n"+
+		"      * Global Next Latency: avg %s (p50: %s, p99: %s, p100: %s)\n"+
+		"      * Event Size: avg %.1f bytes (total %s) (p50: %s, p90: %s, p100: %s)\n"+
 		"%s",
 		duration.Round(time.Second),
 		readCount, rateRead,
@@ -1156,9 +1209,10 @@ func (sm *IncrementalStatsManager) ReportStats() {
 		formatLag(batchingQueueStall),
 		formatLag(batchWriteQueueStall),
 		avgReadLatency.Round(time.Microsecond),
+		p50ReadNext, p99ReadNext, p100ReadNext,
 		avgReadSize,
 		formatBytes(totalReadSizeBytes),
-		partitionReadStr,
+		p50ReadSize, p90ReadSize, p100ReadSize,
 		poolStatsStr)
 
 	sm.log.Info(msg)
@@ -1171,13 +1225,52 @@ func (sm *IncrementalStatsManager) ReportDryRunStats() {
 	readCount := atomic.SwapInt64(&sm.readCount, 0)
 	totalReadSizeBytes := atomic.SwapInt64(&sm.totalReadSizeBytes, 0)
 
-	// Atomically swap and snapshot partition-specific metrics lock-freely from flat array
-	partitionSnapshot, partitionIndices := sm.swapPartitionStats()
+	// Swap read next latencies histogram
+	readNextLatenciesSnapshot := make([]int64, 30000)
+	for i := 0; i < 30000; i++ {
+		readNextLatenciesSnapshot[i] = atomic.SwapInt64(&sm.readNextLatenciesHistogram[i], 0)
+	}
+
+	// Calculate next latency percentiles (p50, p99, p100)
+	latencyRes := calculatePercentilesFromHistogram(readNextLatenciesSnapshot, []float64{0.50, 0.99, 1.00})
+	p50ReadNext := formatLag(time.Duration(latencyRes[0]) * time.Millisecond)
+	p99ReadNext := formatLag(time.Duration(latencyRes[1]) * time.Millisecond)
+	p100ReadNext := formatLag(time.Duration(latencyRes[2]) * time.Millisecond)
+
+	// Swap read sizes histogram
+	readSizesSnapshot := make([]int64, 16384)
+	for i := 0; i < 16384; i++ {
+		readSizesSnapshot[i] = atomic.SwapInt64(&sm.readSizesHistogram[i], 0)
+	}
+
+	// Calculate read sizes percentiles (p50, p90, p100)
+	readSizesRes := calculatePercentilesFromHistogram(readSizesSnapshot, []float64{0.50, 0.90, 1.00})
+	formatSize := func(kb int) string {
+		if kb == -1 {
+			return "N/A"
+		}
+		return formatBytes(int64(kb) * 1024)
+	}
+	p50ReadSize := formatSize(readSizesRes[0])
+	p90ReadSize := formatSize(readSizesRes[1])
+	p100ReadSize := formatSize(readSizesRes[2])
+
+	// Reset partition-specific metrics to avoid memory accumulation
+	for i := 0; i < 128; i++ {
+		stats := &sm.partitionReadStats[i]
+		atomic.StoreInt64(&stats.TotalReadLatencyNs, 0)
+		atomic.StoreInt64(&stats.ReadCount, 0)
+		atomic.StoreInt64(&stats.TotalReadSizeBytes, 0)
+	}
 
 	sm.mu.Lock()
 	now := time.Now()
 	duration := now.Sub(sm.lastStatsTime)
 	sm.lastStatsTime = now
+	var lagRes LagFlushResult
+	if sm.lagTracker != nil {
+		lagRes = sm.lagTracker.Flush()
+	}
 	sm.mu.Unlock()
 
 	var rateProcessed float64
@@ -1192,24 +1285,28 @@ func (sm *IncrementalStatsManager) ReportDryRunStats() {
 		avgSize = float64(totalReadSizeBytes) / float64(readCount)
 	}
 
-	// Build a detailed partition-scoped read statistics telemetry log block for dry-run mode
-	partitionReadStr := formatPartitionStats(partitionSnapshot, partitionIndices, duration, time.Microsecond)
-
 	// Format connection pool stats
 	sourcePoolStr := sm.formatPoolStats(&sm.sourcePool, "Source", duration)
 	targetPoolStr := sm.formatPoolStats(&sm.targetPool, "Target", duration)
 
 	msg := fmt.Sprintf("Change stream statistics in dry-run live-only mode (last %v):\n"+
-		"  - Read: %d (%.2f events/sec) | Global Next Latency: avg %s | Event Size: avg %.1f bytes (total %s)%s\n"+
+		"  - Read: %d (%.2f events/sec)\n"+
+		"  - ChangeStream Read Performance:\n"+
+		"      * Global Next Latency: avg %s (p50: %s, p99: %s, p100: %s)\n"+
+		"      * Event Size: avg %.1f bytes (total %s) (p50: %s, p90: %s, p100: %s)\n"+
+		"  - Lags:\n"+
+		"      * Event-to-Read: %s\n"+
 		"  - Connection Pool:\n"+
 		"      * %s\n"+
 		"      * %s",
 		duration.Round(time.Second),
 		readCount, rateProcessed,
 		avgLatency.Round(time.Microsecond),
+		p50ReadNext, p99ReadNext, p100ReadNext,
 		avgSize,
 		formatBytes(totalReadSizeBytes),
-		partitionReadStr,
+		p50ReadSize, p90ReadSize, p100ReadSize,
+		formatLag(lagRes.EventToReadLag),
 		sourcePoolStr,
 		targetPoolStr)
 
@@ -1330,3 +1427,11 @@ func formatPartitionStats(snapshot []PartitionReadStats, indices []int, duration
 	}
 	return partitionReadStr
 }
+
+func formatLag(d time.Duration) string {
+	if d == 0 {
+		return "N/A"
+	}
+	return d.Round(time.Millisecond).String()
+}
+

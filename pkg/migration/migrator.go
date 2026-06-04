@@ -24,7 +24,6 @@ type Migrator struct {
 	config       *config.Config
 	log          *logger.Logger
 	LiveStartTime *primitive.Timestamp
-	DontApply    bool
 	DryRun       bool
 }
 
@@ -43,19 +42,9 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 		return fmt.Errorf("invalid mode: %s, must be 'migrate', 'live', or 'live-only'", mode)
 	}
 
-	// Validate dont-apply constraint: dont-apply is only supported for 'live-only' mode
-	if m.DontApply && mode != "live-only" {
-		return fmt.Errorf("dont-apply mode is only supported for 'live-only' migrations")
-	}
-
 	// Validate dry run constraint: dry run is only supported for 'live-only' mode
 	if m.DryRun && mode != "live-only" {
 		return fmt.Errorf("dry-run mode is only supported for 'live-only' migrations")
-	}
-
-	// Validate mutual exclusivity of dont-apply and dry-run
-	if m.DontApply && m.DryRun {
-		return fmt.Errorf("dont-apply and dry-run modes are mutually exclusive")
 	}
 
 	m.log.Infof("Starting MongoDB to MongoDB %s process", mode)
@@ -156,7 +145,6 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 	// Initialize shared stats tracking for this database pair
 	statsInterval := time.Duration(m.config.StatsIntervalMinutes) * time.Minute
 	incrementalStatsManager := NewIncrementalStatsManager(m.log, statsInterval, m.config.GroupOpsByDistinctId)
-	incrementalStatsManager.DontApply = m.DontApply
 	incrementalStatsManager.DryRun = m.DryRun
 
 	// Check if this is legacy mode - if so, handle it separately
@@ -323,7 +311,6 @@ func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, t
 	// Create client-level replicator
 	replicator := NewClientLevelReplicator(sourceDB, targetDB, m.config, m.log)
 	replicator.SetIncrementalStatsManager(incrementalStatsManager)
-	replicator.DontApply = m.DontApply
 	replicator.DryRun = m.DryRun
 
 	// Add all collections to the replicator
@@ -373,7 +360,6 @@ func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB
 
 	// Use modern oplog replicator
 	replicator := NewOplogReplicator(sourceDB, targetDB, m.config, m.log)
-	replicator.DontApply = m.DontApply
 	replicator.DryRun = m.DryRun
 
 	// Add all collections to the replicator
@@ -447,7 +433,6 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 
 	// Create legacy oplog replicator
 	replicator := NewOplogReplicatorLegacy(sourceDBLegacy, targetDB, m.config, m.log)
-	replicator.DontApply = m.DontApply
 	replicator.DryRun = m.DryRun
 
 	// Add all collections to the replicator
@@ -765,13 +750,12 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 }
 
 // processBatch processes a batch of documents
-func processBatch(ctx context.Context, collection *mongo.Collection, batch []interface{}, useUpsert bool, log *logger.Logger, dbName, collName string) error {
+func processBatch(ctx context.Context, collection *mongo.Collection, batch []interface{}, useUpsert bool, dbName, collName string, transformer *FieldTransformer) error {
 	if len(batch) == 0 {
 		return nil
 	}
 
-	// Transform __*__ field names to _*_ for Firestore compatibility
-	transformedBatch, transErr := TransformBatch(batch, log, dbName, collName)
+	transformedBatch, transErr := transformer.TransformBatch(batch, dbName, collName)
 	if transErr != nil {
 		return fmt.Errorf("failed to transform field names: %w", transErr)
 	}
@@ -1317,9 +1301,12 @@ func max(a, b int) int {
 // - If opts.DLQ is provided, it uses resilient writes (upsert fallback + DLQ routing) and returns counts.
 // - If opts.DLQ is nil, it uses fail-fast writes (standard InsertMany + RetryManager) and aborts on errors.
 func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, batch []interface{}, sourceDB, sourceCollection string, opts MigrateOptions, retryManager *RetryManager) (int64, int64, error) {
+	enableTransform := m.config.EnableFieldTransformations != nil && *m.config.EnableFieldTransformations
+	transformer := NewFieldTransformer(enableTransform, m.log)
+
 	if opts.DLQ != nil {
 		// Resilient Mode: Use DLQ Fallback (exactly identical to client_stream.go)
-		transformedBatch, err := TransformBatch(batch, m.log, sourceDB, sourceCollection)
+		transformedBatch, err := transformer.TransformBatch(batch, sourceDB, sourceCollection)
 		if err != nil {
 			m.log.Errorf("Field name transformation failed for batch in %s.%s: %v", sourceDB, sourceCollection, err)
 			for _, doc := range batch {
@@ -1416,7 +1403,7 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 	} else {
 		// Fail-Fast Mode (standard mode=migrate behavior)
 		err := retryManager.RetryWithSplit(ctx, batch, sourceCollection, func(b []interface{}) error {
-			return processBatch(ctx, targetCol, b, opts.UpsertMode, m.log, sourceDB, sourceCollection)
+			return processBatch(ctx, targetCol, b, opts.UpsertMode, sourceDB, sourceCollection, transformer)
 		})
 		if err != nil {
 			return 0, int64(len(batch)), err

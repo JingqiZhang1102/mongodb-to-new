@@ -23,12 +23,13 @@ type InitialMigrator struct {
 	collectionConfigs map[string]map[string]config.CollectionConfig
 	dlq               DLQ
 	retryManager      *RetryManager
-	DontApply         bool
+	transformer       *FieldTransformer
 	DryRun            bool
 }
 
 // NewInitialMigrator creates a new shared initial migrator
 func NewInitialMigrator(sourceDB, targetDB *db.MongoDB, cfg *config.Config, log *logger.Logger, collectionConfigs map[string]map[string]config.CollectionConfig, dlq DLQ, retryManager *RetryManager) *InitialMigrator {
+	enableTransform := cfg.EnableFieldTransformations != nil && *cfg.EnableFieldTransformations
 	return &InitialMigrator{
 		sourceDB:          sourceDB,
 		targetDB:          targetDB,
@@ -37,6 +38,7 @@ func NewInitialMigrator(sourceDB, targetDB *db.MongoDB, cfg *config.Config, log 
 		collectionConfigs: collectionConfigs,
 		dlq:               dlq,
 		retryManager:      retryManager,
+		transformer:       NewFieldTransformer(enableTransform, log),
 	}
 }
 
@@ -268,7 +270,7 @@ func (r *InitialMigrator) migrateCollection(ctx context.Context, sourceCol, targ
 
 // insertBatchWithRetry handles batch insertion / upserting with retries and DLQ fallback
 func (r *InitialMigrator) insertBatchWithRetry(ctx context.Context, targetCol *mongo.Collection, batch []interface{}, sourceDB, sourceCollection string) int64 {
-	transformedBatch, err := TransformBatch(batch, r.log, sourceDB, sourceCollection)
+	transformedBatch, err := r.transformer.TransformBatch(batch, sourceDB, sourceCollection)
 	if err != nil {
 		r.log.Errorf("Field name transformation failed for batch in %s.%s: %v", sourceDB, sourceCollection, err)
 		for _, doc := range batch {

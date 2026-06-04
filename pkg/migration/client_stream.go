@@ -29,7 +29,6 @@ type ClientLevelReplicator struct {
 	mu                sync.Mutex                   // Mutex for thread-safe operations
 	dlq               DLQ                          // Dead Letter Queue for failed documents
 	incrementalStatsManager      *IncrementalStatsManager                // Statistics manager
-	DontApply         bool                         // Don't apply flag
 	DryRun            bool                         // Dry run flag
 }
 
@@ -620,7 +619,6 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		r.incrementalStatsManager,
 	)
 	distributor.DryRun = r.DryRun
-	distributor.DontApply = r.DontApply
 
 	// Start event distribution
 	err = distributor.Start()

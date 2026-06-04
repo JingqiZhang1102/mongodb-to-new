@@ -27,7 +27,6 @@ type OplogReplicator struct {
 	mu                sync.Mutex                   // Mutex for thread-safe operations
 	dlq               DLQ                          // Dead Letter Queue for failed documents
 	retryManager      *RetryManager                // Retry manager for transient errors
-	DontApply         bool                         // Don't apply flag
 	DryRun            bool                         // Dry run flag
 }
 
@@ -187,7 +186,6 @@ func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp 
 		}
 
 		initialMigrator := NewInitialMigrator(r.sourceDB, r.targetDB, r.config, r.log, r.collectionConfigs, r.dlq, r.retryManager)
-		initialMigrator.DontApply = r.DontApply
 		initialMigrator.DryRun = r.DryRun
 
 		_, totalFailedCount, err := initialMigrator.Run(ctx, pair, migrator)
@@ -321,9 +319,11 @@ func (r *OplogReplicator) tailOplog(ctx context.Context, afterTimestamp primitiv
 
 	// Initialize parallel workers
 	r.log.Infof("Starting parallel oplog processing with %d workers", r.config.IncrementalWorkerCount)
+	enableTransform := r.config.EnableFieldTransformations != nil && *r.config.EnableFieldTransformations
+	transformer := NewFieldTransformer(enableTransform, r.log)
 	workers := make([]*Worker, r.config.IncrementalWorkerCount)
 	for i := 0; i < r.config.IncrementalWorkerCount; i++ {
-		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionConfigs, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager, nil, r.config.GroupOpsByDistinctId, time.Duration(r.config.FlushIntervalMs)*time.Millisecond, r.config.IncrementalIncomingQueueSize, r.config.IncrementalProcessingQueueSize, r.DontApply)
+		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionConfigs, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager, nil, r.config.GroupOpsByDistinctId, time.Duration(r.config.FlushIntervalMs)*time.Millisecond, r.config.IncrementalIncomingQueueSize, r.config.IncrementalProcessingQueueSize, transformer)
 	}
 
 	// Set up context cancellation handling for workers

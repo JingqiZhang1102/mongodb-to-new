@@ -15,9 +15,10 @@ import (
 // helper function to assert success in non-collision tests
 func mustTransform(t *testing.T, doc interface{}, log *logger.Logger, dbName, collName string, docID interface{}) interface{} {
 	t.Helper()
-	res, err := TransformFieldNames(doc, log, dbName, collName, docID)
+	transformer := NewFieldTransformer(true, log)
+	res, err := transformer.Transform(doc, dbName, collName, docID)
 	if err != nil {
-		t.Fatalf("TransformFieldNames failed unexpectedly: %v", err)
+		t.Fatalf("Transform failed unexpectedly: %v", err)
 	}
 	return res
 }
@@ -25,7 +26,8 @@ func mustTransform(t *testing.T, doc interface{}, log *logger.Logger, dbName, co
 // helper function to assert batch success in non-collision tests
 func mustTransformBatch(t *testing.T, batch []interface{}, log *logger.Logger, dbName, collName string) []interface{} {
 	t.Helper()
-	res, err := TransformBatch(batch, log, dbName, collName)
+	transformer := NewFieldTransformer(true, log)
+	res, err := transformer.TransformBatch(batch, dbName, collName)
 	if err != nil {
 		t.Fatalf("TransformBatch failed unexpectedly: %v", err)
 	}
@@ -42,7 +44,7 @@ func TestTransformRenameFieldNames(t *testing.T) {
 		expected interface{}
 	}{
 		{
-			name: "bson.M mapping: __name__ to _name_ and collapse ___ to _",
+			name: "bson.M mapping: __name__ and ___ should not be renamed",
 			input: bson.M{
 				"__name__": "alice",
 				"___":      "triple-underscore",
@@ -50,19 +52,19 @@ func TestTransformRenameFieldNames(t *testing.T) {
 				"_____3_______": "3	underscores",
 			},
 			expected: bson.M{
-				"_name_": "alice",
-				"_":      "triple-underscore",
-				"normal": "value",
-				"_3_":    "3	underscores",
+				"__name__": "alice",
+				"___":      "triple-underscore",
+				"normal":   "value",
+				"_____3_______": "3	underscores",
 			},
 		},
 		{
-			name: "map[string]interface{} mapping: __height__ to _height_",
+			name: "map[string]interface{} mapping: __height__ should not be renamed",
 			input: map[string]interface{}{
 				"__height__": 180,
 			},
 			expected: map[string]interface{}{
-				"_height_": 180,
+				"__height__": 180,
 			},
 		},
 	}
@@ -87,8 +89,8 @@ func TestTransformBsonDOrderedRenaming(t *testing.T) {
 	}
 
 	expected := bson.D{
-		{Key: "_age_", Value: 30},
-		{Key: "_", Value: "four-underscores"},
+		{Key: "__age__", Value: 30},
+		{Key: "____", Value: "four-underscores"},
 	}
 
 	output := mustTransform(t, input, log, "db", "coll", "id").(bson.D)
@@ -192,7 +194,7 @@ func TestTransformArraysAndBatches(t *testing.T) {
 	}
 	arrayExpected := bson.M{
 		"arr": []interface{}{
-			bson.M{"_elem_": "val"},
+			bson.M{"__elem__": "val"},
 			"regular-string",
 		},
 	}
@@ -211,7 +213,7 @@ func TestTransformArraysAndBatches(t *testing.T) {
 	}
 	bsonAExpected := bson.M{
 		"arr": bson.A{
-			bson.M{"_elem_": "val"},
+			bson.M{"__elem__": "val"},
 			"regular-string",
 		},
 	}
@@ -296,16 +298,16 @@ func TestTransformCase1StandardDoubleUnderscoredKey(t *testing.T) {
 	log := logger.New()
 	doc := bson.M{
 		"name":        "Case 1: Standard double-underscored key",
-		"description": "A standard key matching the '__my_key__' format. Expected rename: '__my_key'",
+		"description": "A standard key matching the '__my_key__' format. Expected: Unchanged",
 		"data": bson.M{
 			"__my_key__": "value_1",
 		},
 	}
 	expected := bson.M{
 		"name":        "Case 1: Standard double-underscored key",
-		"description": "A standard key matching the '__my_key__' format. Expected rename: '__my_key'",
+		"description": "A standard key matching the '__my_key__' format. Expected: Unchanged",
 		"data": bson.M{
-			"_my_key_": "value_1",
+			"__my_key__": "value_1",
 		},
 	}
 	res := mustTransform(t, doc, log, "db", "coll", "id")
@@ -340,7 +342,7 @@ func TestTransformCase3NestedObjectWithMatchingKeys(t *testing.T) {
 	log := logger.New()
 	doc := bson.M{
 		"name":        "Case 3: Nested object with matching keys",
-		"description": "Recursively matches keys at multiple object levels. Expected: Both renamed to '__outer' and '__inner'",
+		"description": "Recursively matches keys at multiple object levels. Expected: Both unchanged",
 		"data": bson.M{
 			"__outer__": bson.M{
 				"__inner__": "nested_value",
@@ -349,10 +351,10 @@ func TestTransformCase3NestedObjectWithMatchingKeys(t *testing.T) {
 	}
 	expected := bson.M{
 		"name":        "Case 3: Nested object with matching keys",
-		"description": "Recursively matches keys at multiple object levels. Expected: Both renamed to '__outer' and '__inner'",
+		"description": "Recursively matches keys at multiple object levels. Expected: Both unchanged",
 		"data": bson.M{
-			"_outer_": bson.M{
-				"_inner_": "nested_value",
+			"__outer__": bson.M{
+				"__inner__": "nested_value",
 			},
 		},
 	}
@@ -366,7 +368,7 @@ func TestTransformCase4MixedRegularAndDoubleUnderscoredKeys(t *testing.T) {
 	log := logger.New()
 	doc := bson.M{
 		"name":        "Case 4: Mixed regular and double-underscored keys",
-		"description": "Ensures regular keys are left untouched while double-underscored keys in the same object are renamed.",
+		"description": "Ensures regular keys and double-underscored keys in the same object are left untouched.",
 		"data": bson.M{
 			"__my_key__":  "will_rename",
 			"regular_key": "will_not_change",
@@ -374,9 +376,9 @@ func TestTransformCase4MixedRegularAndDoubleUnderscoredKeys(t *testing.T) {
 	}
 	expected := bson.M{
 		"name":        "Case 4: Mixed regular and double-underscored keys",
-		"description": "Ensures regular keys are left untouched while double-underscored keys in the same object are renamed.",
+		"description": "Ensures regular keys and double-underscored keys in the same object are left untouched.",
 		"data": bson.M{
-			"_my_key_":    "will_rename",
+			"__my_key__":  "will_rename",
 			"regular_key": "will_not_change",
 		},
 	}
@@ -390,7 +392,7 @@ func TestTransformCase5ArrayContainingMatchingObjects(t *testing.T) {
 	log := logger.New()
 	doc := bson.M{
 		"name":        "Case 5: Array containing matching objects",
-		"description": "Recurses into array elements to transform keys. Expected: Both '__id__' keys renamed to '__id'",
+		"description": "Recurses into array elements without transforming keys. Expected: Both '__id__' keys unchanged",
 		"data": bson.M{
 			"items": []interface{}{
 				bson.M{"__id__": 1, "name": "item_a"},
@@ -400,11 +402,11 @@ func TestTransformCase5ArrayContainingMatchingObjects(t *testing.T) {
 	}
 	expected := bson.M{
 		"name":        "Case 5: Array containing matching objects",
-		"description": "Recurses into array elements to transform keys. Expected: Both '__id__' keys renamed to '__id'",
+		"description": "Recurses into array elements without transforming keys. Expected: Both '__id__' keys unchanged",
 		"data": bson.M{
 			"items": []interface{}{
-				bson.M{"_id_": 1, "name": "item_a"},
-				bson.M{"_id_": 2, "name": "item_b"},
+				bson.M{"__id__": 1, "name": "item_a"},
+				bson.M{"__id__": 2, "name": "item_b"},
 			},
 		},
 	}
@@ -418,7 +420,7 @@ func TestTransformCase6DeeplyNestedMapWithMixedKeyStyles(t *testing.T) {
 	log := logger.New()
 	doc := bson.M{
 		"name":        "Case 6: Deeply nested map with mixed key styles",
-		"description": "A deep object graph mixing regular and double-underscored structural keys.",
+		"description": "A deep object graph with double-underscored structural keys. Expected: Unchanged",
 		"data": bson.M{
 			"__root__": bson.M{
 				"regular_level": bson.M{
@@ -429,11 +431,11 @@ func TestTransformCase6DeeplyNestedMapWithMixedKeyStyles(t *testing.T) {
 	}
 	expected := bson.M{
 		"name":        "Case 6: Deeply nested map with mixed key styles",
-		"description": "A deep object graph mixing regular and double-underscored structural keys.",
+		"description": "A deep object graph with double-underscored structural keys. Expected: Unchanged",
 		"data": bson.M{
-			"_root_": bson.M{
+			"__root__": bson.M{
 				"regular_level": bson.M{
-					"_leaf_": "deep_value",
+					"__leaf__": "deep_value",
 				},
 			},
 		},
@@ -461,10 +463,10 @@ func TestTransformCase7MixedTypesInsideAnArray(t *testing.T) {
 		"name":        "Case 7: Mixed types inside an array",
 		"description": "Ensures non-object types inside arrays (strings, numbers) are bypassed safely.",
 		"data": bson.M{
-			"_list_": []interface{}{
+			"__list__": []interface{}{
 				"plain_string",
 				123,
-				bson.M{"_nested_key_": "value_7"},
+				bson.M{"__nested_key__": "value_7"},
 			},
 		},
 	}
@@ -532,8 +534,8 @@ func TestTransformCase10EmptyAndNullValuesWithMatchingKeys(t *testing.T) {
 		"name":        "Case 10: Empty and null values with matching keys",
 		"description": "Ensures the recursive step doesn't crash on null properties or empty objects.",
 		"data": bson.M{
-			"_null_key_":     nil,
-			"_empty_object_": bson.M{},
+			"__null_key__":     nil,
+			"__empty_object__": bson.M{},
 		},
 	}
 	res := mustTransform(t, doc, log, "db", "coll", "id")
@@ -630,49 +632,7 @@ func TestTransformExtractDocID(t *testing.T) {
 	}
 }
 
-func TestTransformCollisionOfRenamedFields(t *testing.T) {
-	log := logger.New()
 
-	// 1. bson.M collision: __name__ renames to _name_, which collides with existing _name_
-	docM := bson.M{
-		"__name__": "alice",
-		"_name_":   "bob",
-	}
-	_, err := TransformFieldNames(docM, log, "db", "coll", "id")
-	if err == nil {
-		t.Error("expected collision error for bson.M, got nil")
-	} else if !strings.Contains(err.Error(), "collision detected") {
-		t.Errorf("expected collision detected error message, got: %v", err)
-	}
-
-	// 2. bson.D collision: duplicate keys now explicitly trigger collision errors
-	docD := bson.D{
-		{Key: "__name__", Value: "alice"},
-		{Key: "_name_", Value: "bob"},
-	}
-	_, err = TransformFieldNames(docD, log, "db", "coll", "id")
-	if err == nil {
-		t.Error("expected collision error for bson.D, got nil")
-	} else if !strings.Contains(err.Error(), "collision detected") {
-		t.Errorf("expected collision detected error message, got: %v", err)
-	}
-}
-
-func TestTransformUnderscoreCollapseCollision(t *testing.T) {
-	log := logger.New()
-
-	// Collapsing '___' and '__' should both result in a single underscore '_'
-	docM := bson.M{
-		"___": "value_three",
-		"__":  "value_two",
-	}
-	_, err := TransformFieldNames(docM, log, "db", "coll", "id")
-	if err == nil {
-		t.Error("expected collapse collision error, got nil")
-	} else if !strings.Contains(err.Error(), "collision detected") {
-		t.Errorf("expected collision detected error message, got: %v", err)
-	}
-}
 
 func TestTransformStringifyUnsupportedJSONValue(t *testing.T) {
 	log := logger.New()
@@ -687,7 +647,8 @@ func TestTransformStringifyUnsupportedJSONValue(t *testing.T) {
 		},
 	}
 
-	_, err := TransformFieldNames(doc, log, "db", "coll", "id")
+	transformer := NewFieldTransformer(true, log)
+	_, err := transformer.Transform(doc, "db", "coll", "id")
 	if err == nil {
 		t.Error("expected error when stringifying unsupported JSON value in nested object with long keys, got nil")
 	} else if !strings.Contains(err.Error(), "failed to stringify") {
