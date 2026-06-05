@@ -36,6 +36,8 @@
   "minDocsForParallelReads": 50000,
   "sampleSize": 1000,
   "workersPerPartition": 3,
+  "dropEmptyFieldNames": false,
+  "convertLongFieldNamesInNestedDocs": false,
   
   "retryConfig": {
     "maxRetries": 5,

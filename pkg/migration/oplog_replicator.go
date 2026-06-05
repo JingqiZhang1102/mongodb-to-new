@@ -319,8 +319,7 @@ func (r *OplogReplicator) tailOplog(ctx context.Context, afterTimestamp primitiv
 
 	// Initialize parallel workers
 	r.log.Infof("Starting parallel oplog processing with %d workers", r.config.IncrementalWorkerCount)
-	enableTransform := r.config.EnableFieldTransformations != nil && *r.config.EnableFieldTransformations
-	transformer := NewFieldTransformer(enableTransform, r.log)
+	transformer := NewFieldTransformer(r.config.DropEmptyFieldNames, r.config.ConvertLongFieldNamesInNestedDocs, r.config.RetryConfig.ConvertInvalidIds, r.log)
 	workers := make([]*Worker, r.config.IncrementalWorkerCount)
 	for i := 0; i < r.config.IncrementalWorkerCount; i++ {
 		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionConfigs, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager, nil, r.config.GroupOpsByDistinctId, time.Duration(r.config.FlushIntervalMs)*time.Millisecond, r.config.IncrementalIncomingQueueSize, r.config.IncrementalProcessingQueueSize, transformer)

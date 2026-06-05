@@ -36,7 +36,6 @@ type OplogReplicatorLegacy struct {
 
 // NewOplogReplicatorLegacy creates a new oplog-based replicator using GTM legacy
 func NewOplogReplicatorLegacy(sourceDB *db.MongoDBLegacy, targetDB *db.MongoDB, cfg *config.Config, log *logger.Logger) *OplogReplicatorLegacy {
-	enableTransform := cfg.EnableFieldTransformations != nil && *cfg.EnableFieldTransformations
 	return &OplogReplicatorLegacy{
 		sourceDB:          sourceDB,
 		targetDB:          targetDB,
@@ -44,7 +43,7 @@ func NewOplogReplicatorLegacy(sourceDB *db.MongoDBLegacy, targetDB *db.MongoDB, 
 		log:               log,
 		collectionMap:     make(map[string]map[string]string),
 		collectionConfigs: make(map[string]map[string]config.CollectionConfig),
-		transformer:       NewFieldTransformer(enableTransform, log),
+		transformer:       NewFieldTransformer(cfg.DropEmptyFieldNames, cfg.ConvertLongFieldNamesInNestedDocs, cfg.RetryConfig.ConvertInvalidIds, log),
 	}
 }
 

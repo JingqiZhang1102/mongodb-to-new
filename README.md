@@ -220,7 +220,26 @@ If you want to migrate only specific collections or rename collections during mi
   - **maxDelayMs**: Maximum delay in milliseconds (default: 5000).
   - **enableBatchSplitting**: Enable batch splitting for contention errors (default: true).
   - **minBatchSize**: Minimum batch size for splitting (default: 10).
-  - **convertInvalidIds**: Automatically convert invalid _id types to string (default: true). When enabled, the system will detect errors like "_id must be an objectId, string, long; found int" and automatically convert the problematic _id fields to strings.
+  - **convertInvalidIds**: Automatically convert invalid `_id` types to string (default: `true`).
+    - **In Live Paths (Live Backfill & Live Incremental streaming):** Proactively detects unsupported `_id` datatypes before writing to the target, and serializes them into deterministic type-prefixed strings.
+      * *Example BSON ID conversion:*
+        - **Source ID:** `_id: [1, 2] (Array)`
+        - **Target ID:** `_id: "_converted:array:[1,2]" (String)`
+      * *Supported type mappings:* `bool` (`_converted:bool:`), `int` (`_converted:int:`), `int32` (`_converted:int32:`), `double` (`_converted:double:`), `float` (`_converted:float:`), `datetime` (`_converted:datetime:`), `binary` (`_converted:binary:`), `array` (`_converted:array:`), `document` (`_converted:document:`).
+    - **In Normal Backfill (`-mode=migrate`):** Reactively catches database write failures (due to invalid `_id` types), splits the batch, converts failing invalid `_id` values to string using simple formatting, and retries.
+      * *Example BSON ID conversion:*
+        - **Source ID:** `_id: [1, 2] (Array)`
+        - **Target ID:** `_id: "[1 2]" (String)`
+
+#### Field Transformation Configuration
+- **dropEmptyFieldNames**: Automatically remove empty field names (e.g., `""`) from document keys to satisfy target compatibility (default: `false`).
+  * *Example transformation:*
+    - **Source payload:** `{ "_id": "test", "": "empty-val", "name": "user" }`
+    - **Target payload:** `{ "_id": "test", "name": "user" }`
+- **convertLongFieldNamesInNestedDocs**: Automatically stringify nested subdocuments containing field names exceeding 1,000 characters to a JSON string to satisfy target key-length compatibility constraints (default: `false`).
+  * *Example transformation:*
+    - **Source payload:** `{ "nested": { "<long_key_1001_chars>": "value" } }`
+    - **Target payload:** `{ "nested": "{\"<long_key_1001_chars>\":\"value\"}" }`
 
 #### Index Synchronization Configuration
 - **syncAllIndexes**: (Optional) When set to `true`, automatically syncs all indexes (excluding `_id_`) from every source collection to the corresponding target collection. Default is `false`.
@@ -465,7 +484,15 @@ When no `collections` are specified (as above), the tool will automatically dete
 
    The application will continuously listen for changes in the specified MongoDB collections and replicate them to the target MongoDB.
 
-3. Additional Options:
+3. Target Compatibility Test Mode:
+
+   To test target database compatibility for different `_id` data types and long field names, and print a detailed compatibility report:
+
+   ```bash
+   ./migrate -test-compatibility
+   ```
+
+4. Additional Options:
 
    ```bash
    ./migrate -help
@@ -487,6 +514,8 @@ When no `collections` are specified (as above), the tool will automatically dete
             Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)
       -dry-run
             Dry run mode (live-only migrations only, drops all events in reader)
+      -test-compatibility
+            Run target database compatibility test for IDs and field names, print report, then exit
       -help
             Display this help information
     ```

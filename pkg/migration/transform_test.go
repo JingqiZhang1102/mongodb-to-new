@@ -15,7 +15,7 @@ import (
 // helper function to assert success in non-collision tests
 func mustTransform(t *testing.T, doc interface{}, log *logger.Logger, dbName, collName string, docID interface{}) interface{} {
 	t.Helper()
-	transformer := NewFieldTransformer(true, log)
+	transformer := NewFieldTransformer(true, true, false, log)
 	res, err := transformer.Transform(doc, dbName, collName, docID)
 	if err != nil {
 		t.Fatalf("Transform failed unexpectedly: %v", err)
@@ -26,7 +26,7 @@ func mustTransform(t *testing.T, doc interface{}, log *logger.Logger, dbName, co
 // helper function to assert batch success in non-collision tests
 func mustTransformBatch(t *testing.T, batch []interface{}, log *logger.Logger, dbName, collName string) []interface{} {
 	t.Helper()
-	transformer := NewFieldTransformer(true, log)
+	transformer := NewFieldTransformer(true, true, false, log)
 	res, err := transformer.TransformBatch(batch, dbName, collName)
 	if err != nil {
 		t.Fatalf("TransformBatch failed unexpectedly: %v", err)
@@ -647,7 +647,7 @@ func TestTransformStringifyUnsupportedJSONValue(t *testing.T) {
 		},
 	}
 
-	transformer := NewFieldTransformer(true, log)
+	transformer := NewFieldTransformer(true, true, false, log)
 	_, err := transformer.Transform(doc, "db", "coll", "id")
 	if err == nil {
 		t.Error("expected error when stringifying unsupported JSON value in nested object with long keys, got nil")
@@ -655,3 +655,171 @@ func TestTransformStringifyUnsupportedJSONValue(t *testing.T) {
 		t.Errorf("expected failed to stringify error, got: %v", err)
 	}
 }
+
+func TestTransformSeparateFlags(t *testing.T) {
+	log := logger.New()
+	longKey := strings.Repeat("a", 1001)
+
+	// Sample document containing both issues:
+	// - empty key field name ("")
+	// - long nested field name (longKey)
+	getInputDoc := func() bson.M {
+		return bson.M{
+			"":     "empty-key-val",
+			"keep": "keep-val",
+			"nested": bson.M{
+				longKey: "long-val",
+			},
+		}
+	}
+
+	// Case 1: Only DropEmptyFieldNames is true
+	t.Run("Only DropEmptyFieldNames", func(t *testing.T) {
+		transformer := NewFieldTransformer(true, false, false, log)
+		res, err := transformer.Transform(getInputDoc(), "db", "coll", "id")
+		if err != nil {
+			t.Fatalf("Transform failed: %v", err)
+		}
+		doc := res.(bson.M)
+
+		// Empty key should be removed
+		if _, exists := doc[""]; exists {
+			t.Error("expected empty key to be removed")
+		}
+
+		// Keep key should remain
+		if doc["keep"] != "keep-val" {
+			t.Errorf("expected keep-val, got %v", doc["keep"])
+		}
+
+		// Nested long key should NOT be stringified (remains bson.M)
+		nested, ok := doc["nested"].(bson.M)
+		if !ok {
+			t.Fatalf("expected nested to remain bson.M, got type: %T", doc["nested"])
+		}
+		if nested[longKey] != "long-val" {
+			t.Errorf("expected long-val, got %v", nested[longKey])
+		}
+	})
+
+	// Case 2: Only ConvertLongFieldNamesInNestedDocs is true
+	t.Run("Only ConvertLongFieldNamesInNestedDocs", func(t *testing.T) {
+		transformer := NewFieldTransformer(false, true, false, log)
+		res, err := transformer.Transform(getInputDoc(), "db", "coll", "id")
+		if err != nil {
+			t.Fatalf("Transform failed: %v", err)
+		}
+		doc := res.(bson.M)
+
+		// Empty key should NOT be removed
+		if doc[""] != "empty-key-val" {
+			t.Errorf("expected empty key to remain, got %v", doc[""])
+		}
+
+		// Keep key should remain
+		if doc["keep"] != "keep-val" {
+			t.Errorf("expected keep-val, got %v", doc["keep"])
+		}
+
+		// Nested long key should BE stringified (becomes JSON string)
+		nestedVal, ok := doc["nested"].(string)
+		if !ok {
+			t.Fatalf("expected nested to be stringified to JSON string, got type: %T", doc["nested"])
+		}
+		var decoded bson.M
+		if err := json.Unmarshal([]byte(nestedVal), &decoded); err != nil {
+			t.Fatalf("failed to decode nested stringified object: %v", err)
+		}
+		if decoded[longKey] != "long-val" {
+			t.Errorf("expected decoded long-val, got %v", decoded[longKey])
+		}
+	})
+
+	// Case 3: Both disabled
+	t.Run("Both disabled", func(t *testing.T) {
+		transformer := NewFieldTransformer(false, false, false, log)
+		res, err := transformer.Transform(getInputDoc(), "db", "coll", "id")
+		if err != nil {
+			t.Fatalf("Transform failed: %v", err)
+		}
+		doc := res.(bson.M)
+
+		// Empty key should NOT be removed
+		if doc[""] != "empty-key-val" {
+			t.Errorf("expected empty key to remain, got %v", doc[""])
+		}
+
+		// Nested long key should NOT be stringified
+		nested, ok := doc["nested"].(bson.M)
+		if !ok {
+			t.Fatalf("expected nested to remain bson.M, got type: %T", doc["nested"])
+		}
+		if nested[longKey] != "long-val" {
+			t.Errorf("expected long-val, got %v", nested[longKey])
+		}
+	})
+}
+
+func TestTransformProactiveIDConversion(t *testing.T) {
+	log := logger.New()
+	transformer := NewFieldTransformer(false, false, true, log)
+
+	t.Run("Valid types should remain unchanged", func(t *testing.T) {
+		objectID := primitive.NewObjectID()
+		docs := []bson.M{
+			{"_id": objectID, "name": "objectID"},
+			{"_id": "string-id", "name": "string"},
+			{"_id": int64(123456), "name": "int64"},
+		}
+
+		for _, original := range docs {
+			res, err := transformer.Transform(original, "db", "coll", "id")
+			if err != nil {
+				t.Fatalf("Transform failed: %v", err)
+			}
+			doc := res.(bson.M)
+			if doc["_id"] != original["_id"] {
+				t.Errorf("expected _id %v, got %v", original["_id"], doc["_id"])
+			}
+			if _, exists := doc["_migrationIdConverted"]; exists {
+				t.Errorf("expected no migration conversion flag for type %T", original["_id"])
+			}
+		}
+	})
+
+	t.Run("Invalid types should be proactively converted", func(t *testing.T) {
+		type testCase struct {
+			originalID   interface{}
+			expectedID   string
+			expectedType string
+		}
+		cases := []testCase{
+			{originalID: true, expectedID: "_converted:bool:true", expectedType: "bool"},
+			{originalID: int(987), expectedID: "_converted:int:987", expectedType: "int"},
+			{originalID: int32(456), expectedID: "_converted:int32:456", expectedType: "int32"},
+			{originalID: float64(12.34), expectedID: "_converted:double:12.34", expectedType: "float64"},
+			{originalID: bson.A{1, 2}, expectedID: "_converted:array:[1,2]", expectedType: "primitive.A"},
+			{originalID: bson.D{{"x", "y"}}, expectedID: "_converted:document:[{\"Key\":\"x\",\"Value\":\"y\"}]", expectedType: "primitive.D"},
+		}
+
+		for _, tc := range cases {
+			original := bson.M{"_id": tc.originalID}
+			res, err := transformer.Transform(original, "db", "coll", "id")
+			if err != nil {
+				t.Fatalf("Transform failed: %v", err)
+			}
+			doc := res.(bson.M)
+			if doc["_id"] != tc.expectedID {
+				t.Errorf("expected converted _id to be %s, got %v (original type: %s)", tc.expectedID, doc["_id"], tc.expectedType)
+			}
+			if _, exists := doc["_migrationIdConverted"]; exists {
+				t.Errorf("expected no _migrationIdConverted flag, but found it")
+			}
+			if _, exists := doc["_migrationOriginalIdType"]; exists {
+				t.Errorf("expected no _migrationOriginalIdType flag, but found it")
+			}
+		}
+	})
+}
+
+

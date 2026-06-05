@@ -26,6 +26,7 @@ type Migrator struct {
 	log          *logger.Logger
 	LiveStartTime *primitive.Timestamp
 	DryRun       bool
+	isLive       bool
 }
 
 // NewMigrator creates a new migrator
@@ -38,6 +39,8 @@ func NewMigrator(config *config.Config, log *logger.Logger) *Migrator {
 
 // Start starts the migration or replication process
 func (m *Migrator) Start(ctx context.Context, mode string) error {
+	m.isLive = (mode == "live" || mode == "live-only")
+
 	// Validate mode
 	if mode != "migrate" && mode != "live" && mode != "live-only" {
 		return fmt.Errorf("invalid mode: %s, must be 'migrate', 'live', or 'live-only'", mode)
@@ -1385,8 +1388,8 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 		}
 	}
 
-	enableTransform := m.config.EnableFieldTransformations != nil && *m.config.EnableFieldTransformations
-	transformer := NewFieldTransformer(enableTransform, m.log)
+	convertInvalidIds := m.config.RetryConfig.ConvertInvalidIds && m.isLive
+	transformer := NewFieldTransformer(m.config.DropEmptyFieldNames, m.config.ConvertLongFieldNamesInNestedDocs, convertInvalidIds, m.log)
 
 	writeStart := time.Now()
 

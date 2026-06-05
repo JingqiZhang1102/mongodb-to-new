@@ -29,7 +29,6 @@ type InitialMigrator struct {
 
 // NewInitialMigrator creates a new shared initial migrator
 func NewInitialMigrator(sourceDB, targetDB *db.MongoDB, cfg *config.Config, log *logger.Logger, collectionConfigs map[string]map[string]config.CollectionConfig, dlq DLQ, retryManager *RetryManager) *InitialMigrator {
-	enableTransform := cfg.EnableFieldTransformations != nil && *cfg.EnableFieldTransformations
 	return &InitialMigrator{
 		sourceDB:          sourceDB,
 		targetDB:          targetDB,
@@ -38,7 +37,7 @@ func NewInitialMigrator(sourceDB, targetDB *db.MongoDB, cfg *config.Config, log 
 		collectionConfigs: collectionConfigs,
 		dlq:               dlq,
 		retryManager:      retryManager,
-		transformer:       NewFieldTransformer(enableTransform, log),
+		transformer:       NewFieldTransformer(cfg.DropEmptyFieldNames, cfg.ConvertLongFieldNamesInNestedDocs, cfg.RetryConfig.ConvertInvalidIds, log),
 	}
 }
 

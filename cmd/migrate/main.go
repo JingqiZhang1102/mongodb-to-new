@@ -26,6 +26,7 @@ func main() {
 	logFile := flag.String("log-file", "", "Path to log file (logs to both stdout and file when specified)")
 	liveStartTimeStr := flag.String("live-start-timestamp", "", "Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)")
 	dryRun := flag.Bool("dry-run", false, "Dry run mode (live-only migrations only, drops all events in reader)")
+	testCompatibility := flag.Bool("test-compatibility", false, "Run target database compatibility test for IDs and field names, print report, then exit")
 	help := flag.Bool("help", false, "Display help information")
 	flag.Parse()
 
@@ -60,6 +61,15 @@ func main() {
 	}
 	// Display and log the loaded configuration with sensitive values masked
 	log.Infof("Active Configuration:\n%s", getSanitizedConfigJSON(cfg))
+
+	if *testCompatibility {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := migration.RunCompatibilityTest(ctx, cfg, log); err != nil {
+			log.Fatalf("Compatibility test failed: %v", err)
+		}
+		os.Exit(0)
+	}
 
 
 

@@ -163,8 +163,7 @@ func (d *EventDistributor) Start() error {
 		d.incrementalStatsManager.Start(cancelCtx)
 	}
 
-	enableTransform := d.cfg.EnableFieldTransformations != nil && *d.cfg.EnableFieldTransformations
-	transformer := NewFieldTransformer(enableTransform, d.log)
+	transformer := NewFieldTransformer(d.cfg.DropEmptyFieldNames, d.cfg.ConvertLongFieldNamesInNestedDocs, d.cfg.RetryConfig.ConvertInvalidIds, d.log)
 
 	// Initialize workers with retry manager and stats manager
 	for i := 0; i < d.incrementalWorkerCount; i++ {
@@ -701,6 +700,17 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 
 	documentKey, _ := event["documentKey"].(bson.M)
 	docID := documentKey["_id"]
+
+	if w.transformer != nil && w.transformer.convertInvalidIds && !w.transformer.isValidIDType(docID) {
+		originalType := fmt.Sprintf("%T", docID)
+		convertedID := serializeIDDeterministically(docID)
+		w.log.Infof("[%s] Proactively converting change stream documentKey _id %v (type: %s) to string: %s (Solution 1, 2 & 4)",
+			namespace, docID, originalType, convertedID)
+		docID = convertedID
+		if documentKey != nil {
+			documentKey["_id"] = docID
+		}
+	}
 
 	// Get fullDocument as interface{} to support both bson.M and map[string]interface{}
 	// This is needed because legacy oplog replicator returns map[string]interface{}

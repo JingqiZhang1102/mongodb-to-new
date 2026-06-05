@@ -6,6 +6,7 @@ import (
 
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 // maxFieldNameLength is the maximum allowed field name length.
@@ -15,15 +16,19 @@ const maxFieldNameLength = 1000
 
 // FieldTransformer handles Firestore compatibility transformations
 type FieldTransformer struct {
-	enableFieldTransformations bool
-	log                        *logger.Logger
+	dropEmptyFieldNames               bool
+	convertLongFieldNamesInNestedDocs bool
+	convertInvalidIds                 bool
+	log                               *logger.Logger
 }
 
 // NewFieldTransformer creates a new FieldTransformer
-func NewFieldTransformer(enable bool, log *logger.Logger) *FieldTransformer {
+func NewFieldTransformer(dropEmptyFieldNames, convertLongFieldNamesInNestedDocs, convertInvalidIds bool, log *logger.Logger) *FieldTransformer {
 	return &FieldTransformer{
-		enableFieldTransformations: enable,
-		log:                        log,
+		dropEmptyFieldNames:               dropEmptyFieldNames,
+		convertLongFieldNamesInNestedDocs: convertLongFieldNamesInNestedDocs,
+		convertInvalidIds:                 convertInvalidIds,
+		log:                               log,
 	}
 }
 
@@ -52,15 +57,107 @@ func extractDocID(doc interface{}) interface{} {
 // Supports bson.D, bson.M, map[string]interface{}, and arrays.
 // Logs transformations at Info/Warn level with db, collection, and document ID context.
 func (t *FieldTransformer) Transform(doc interface{}, dbName, collName string, docID interface{}) (interface{}, error) {
-	if !t.enableFieldTransformations {
+	if !t.dropEmptyFieldNames && !t.convertLongFieldNamesInNestedDocs && !t.convertInvalidIds {
 		return doc, nil
 	}
 	// Root-level documents cannot be stringified (must remain documents for MongoDB insert).
 	// Warn about long keys at root level but don't stringify.
-	if doc != nil {
+	if doc != nil && t.convertLongFieldNamesInNestedDocs {
 		t.warnRootLongKeys(doc, dbName, collName, docID)
 	}
+	if doc != nil && t.convertInvalidIds {
+		doc = t.proactivelyConvertID(doc, dbName, collName)
+	}
 	return t.transformFieldNamesRecursive(doc, dbName, collName, docID, true)
+}
+
+func (t *FieldTransformer) proactivelyConvertID(doc interface{}, dbName, collName string) interface{} {
+	switch d := doc.(type) {
+	case bson.D:
+		for i, elem := range d {
+			if elem.Key == "_id" {
+				if !t.isValidIDType(elem.Value) {
+					originalType := fmt.Sprintf("%T", elem.Value)
+					newID := serializeIDDeterministically(elem.Value)
+					if t.log != nil {
+						t.log.Infof("[%s.%s] Proactively converting invalid _id %v (type: %s) to string: %s (Solution 1, 2 & 4)",
+							dbName, collName, elem.Value, originalType, newID)
+					}
+					newDoc := make(bson.D, len(d))
+					copy(newDoc, d)
+					newDoc[i].Value = newID
+					return newDoc
+				}
+				break
+			}
+		}
+	case bson.M:
+		if id, ok := d["_id"]; ok {
+			if !t.isValidIDType(id) {
+				originalType := fmt.Sprintf("%T", id)
+				newID := serializeIDDeterministically(id)
+				if t.log != nil {
+					t.log.Infof("[%s.%s] Proactively converting invalid _id %v (type: %s) to string: %s (Solution 1, 2 & 4)",
+						dbName, collName, id, originalType, newID)
+				}
+				newDoc := make(bson.M, len(d))
+				for k, v := range d {
+					newDoc[k] = v
+				}
+				newDoc["_id"] = newID
+				return newDoc
+			}
+		}
+	}
+	return doc
+}
+
+func (t *FieldTransformer) isValidIDType(id interface{}) bool {
+	switch id.(type) {
+	case primitive.ObjectID, string, int64:
+		return true
+	default:
+		return false
+	}
+}
+
+func serializeIDDeterministically(id interface{}) string {
+	switch val := id.(type) {
+	case bool:
+		return fmt.Sprintf("_converted:bool:%t", val)
+	case int32:
+		return fmt.Sprintf("_converted:int32:%d", val)
+	case int:
+		return fmt.Sprintf("_converted:int:%d", val)
+	case float64:
+		return fmt.Sprintf("_converted:double:%g", val)
+	case float32:
+		return fmt.Sprintf("_converted:float:%g", val)
+	case primitive.DateTime:
+		return fmt.Sprintf("_converted:datetime:%d", val)
+	case primitive.Binary:
+		return fmt.Sprintf("_converted:binary:%x", val.Data)
+	case []interface{}:
+		data, err := json.Marshal(val)
+		if err == nil {
+			return fmt.Sprintf("_converted:array:%s", string(data))
+		}
+		return fmt.Sprintf("_converted:array:%v", val)
+	case bson.A:
+		data, err := json.Marshal(val)
+		if err == nil {
+			return fmt.Sprintf("_converted:array:%s", string(data))
+		}
+		return fmt.Sprintf("_converted:array:%v", val)
+	case bson.D, bson.M, map[string]interface{}:
+		data, err := json.Marshal(val)
+		if err == nil {
+			return fmt.Sprintf("_converted:document:%s", string(data))
+		}
+		return fmt.Sprintf("_converted:document:%v", val)
+	default:
+		return fmt.Sprintf("_converted:%T:%v", val, val)
+	}
 }
 
 // warnRootLongKeys logs warnings for any root-level field names exceeding maxFieldNameLength.
@@ -106,7 +203,7 @@ func (t *FieldTransformer) transformFieldNamesRecursive(doc interface{}, dbName,
 	case bson.D:
 		// For nested objects: if any immediate key exceeds maxFieldNameLength,
 		// stringify the entire object to avoid Firestore field name errors.
-		if !isRoot {
+		if !isRoot && t.convertLongFieldNamesInNestedDocs {
 			for _, elem := range d {
 				if len(elem.Key) > maxFieldNameLength {
 					if t.log != nil {
@@ -131,11 +228,13 @@ func (t *FieldTransformer) transformFieldNamesRecursive(doc interface{}, dbName,
 		for _, elem := range d {
 			// Remove empty field names (Firestore does not support them)
 			if elem.Key == "" {
-				if t.log != nil {
-					t.log.Warnf("Removed empty field name from document [db=%s, collection=%s, _id=%v]",
-						dbName, collName, docID)
+				if t.dropEmptyFieldNames {
+					if t.log != nil {
+						t.log.Warnf("Removed empty field name from document [db=%s, collection=%s, _id=%v]",
+							dbName, collName, docID)
+					}
+					continue
 				}
-				continue
 			}
 
 			transformedValue, err := t.transformFieldNamesRecursive(elem.Value, dbName, collName, docID, false)
@@ -153,7 +252,7 @@ func (t *FieldTransformer) transformFieldNamesRecursive(doc interface{}, dbName,
 	case bson.M:
 		// For nested objects: if any immediate key exceeds maxFieldNameLength,
 		// stringify the entire object.
-		if !isRoot {
+		if !isRoot && t.convertLongFieldNamesInNestedDocs {
 			for k := range d {
 				if len(k) > maxFieldNameLength {
 					if t.log != nil {
@@ -178,11 +277,13 @@ func (t *FieldTransformer) transformFieldNamesRecursive(doc interface{}, dbName,
 		for k, v := range d {
 			// Remove empty field names (Firestore does not support them)
 			if k == "" {
-				if t.log != nil {
-					t.log.Warnf("Removed empty field name from document [db=%s, collection=%s, _id=%v]",
-						dbName, collName, docID)
+				if t.dropEmptyFieldNames {
+					if t.log != nil {
+						t.log.Warnf("Removed empty field name from document [db=%s, collection=%s, _id=%v]",
+							dbName, collName, docID)
+					}
+					continue
 				}
-				continue
 			}
 
 			transformedValue, err := t.transformFieldNamesRecursive(v, dbName, collName, docID, false)
@@ -196,7 +297,7 @@ func (t *FieldTransformer) transformFieldNamesRecursive(doc interface{}, dbName,
 	case map[string]interface{}:
 		// For nested objects: if any immediate key exceeds maxFieldNameLength,
 		// stringify the entire object.
-		if !isRoot {
+		if !isRoot && t.convertLongFieldNamesInNestedDocs {
 			for k := range d {
 				if len(k) > maxFieldNameLength {
 					if t.log != nil {
@@ -221,11 +322,13 @@ func (t *FieldTransformer) transformFieldNamesRecursive(doc interface{}, dbName,
 		for k, v := range d {
 			// Remove empty field names (Firestore does not support them)
 			if k == "" {
-				if t.log != nil {
-					t.log.Warnf("Removed empty field name from document [db=%s, collection=%s, _id=%v]",
-						dbName, collName, docID)
+				if t.dropEmptyFieldNames {
+					if t.log != nil {
+						t.log.Warnf("Removed empty field name from document [db=%s, collection=%s, _id=%v]",
+							dbName, collName, docID)
+					}
+					continue
 				}
-				continue
 			}
 
 			transformedValue, err := t.transformFieldNamesRecursive(v, dbName, collName, docID, false)
@@ -305,7 +408,7 @@ func bsonValueToInterface(v interface{}) interface{} {
 // TransformBatch applies Transform to each document in a batch.
 // Extracts _id from each document for logging context.
 func (t *FieldTransformer) TransformBatch(batch []interface{}, dbName, collName string) ([]interface{}, error) {
-	if !t.enableFieldTransformations {
+	if !t.dropEmptyFieldNames && !t.convertLongFieldNamesInNestedDocs {
 		return batch, nil
 	}
 	result := make([]interface{}, len(batch))

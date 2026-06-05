@@ -35,7 +35,7 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndDescription(t *testing.T
 		5*time.Minute,                       // flushInterval
 		8192,                                // batchingQueueSize
 		2,                                   // batchWriteQueueSize
-		NewFieldTransformer(false, log),     // transformer
+		NewFieldTransformer(false, false, false, log),     // transformer
 	)
 
 	// Create an update event where both fullDocument and updateDescription are nil/null
@@ -84,7 +84,7 @@ func TestWorkerProcessEventUpdateWithNullFullDocumentAndIncrementalStatsManager(
 		5*time.Minute,                       // flushInterval
 		8192,                                // batchingQueueSize
 		2,                                   // batchWriteQueueSize
-		NewFieldTransformer(false, log),     // transformer
+		NewFieldTransformer(false, false, false, log),     // transformer
 	)
 
 	// Create an update event where fullDocument is nil
@@ -282,7 +282,7 @@ func TestWorkerFlushCurrentGroupResetsIDs(t *testing.T) {
 		5*time.Minute,
 		8192,
 		2,
-		NewFieldTransformer(false, log),
+		NewFieldTransformer(false, false, false, log),
 	)
 
 	// Process an event to establish active group ID cache status
@@ -336,7 +336,7 @@ func TestWorkerConcurrencyStateSafety(t *testing.T) {
 		5*time.Minute,
 		8192,
 		2,
-		NewFieldTransformer(false, log),
+		NewFieldTransformer(false, false, false, log),
 	)
 
 	// Concurrently invoke ProcessEvent and manual flushes to verify Go race detector safety
@@ -393,7 +393,7 @@ func TestWorkerShutdownConcurrencyRaceSafety(t *testing.T) {
 		5*time.Minute,
 		8192,
 		2,
-		NewFieldTransformer(false, log),
+		NewFieldTransformer(false, false, false, log),
 	)
 
 	// Keep the consumer loop active by pushing a dummy event to batchingQueue
@@ -445,7 +445,7 @@ func TestWorkerTimeoutTickerFlush(t *testing.T) {
 		10*time.Millisecond, // very short timeout flush interval!
 		8192,
 		2,
-		NewFieldTransformer(false, log),
+		NewFieldTransformer(false, false, false, log),
 	)
 
 	// Process 1 operation to make w.currentGroup non-nil
@@ -505,7 +505,7 @@ func TestWorkerContextCancellationFlush(t *testing.T) {
 		5*time.Minute, // very large interval so it won't timeout flush
 		8192,
 		2,
-		NewFieldTransformer(false, log),
+		NewFieldTransformer(false, false, false, log),
 	)
 
 	// Process 1 operation to keep group active in memory
@@ -559,7 +559,7 @@ func TestWorkerSetPartitionTracker(t *testing.T) {
 		5*time.Minute,
 		8192,
 		2,
-		NewFieldTransformer(false, log),
+		NewFieldTransformer(false, false, false, log),
 	)
 
 	tracker := NewPartitionTracker(log, "/tmp/dummy-checkpoint.json", 5*time.Minute, 2, 2)
