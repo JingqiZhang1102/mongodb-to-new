@@ -186,3 +186,89 @@ func TestLoadConfigIncrementalStreamPartitions(t *testing.T) {
 		t.Errorf("Expected IncrementalStreamPartitions to be 4, got %d", cfg2.IncrementalStreamPartitions)
 	}
 }
+
+// TestLoadConfigBackfillRampUp verifies that backfillRampUp parses correctly and initializes defaults.
+func TestLoadConfigBackfillRampUp(t *testing.T) {
+	writeTempFile := func(t *testing.T, content string) string {
+		tmpFile, err := os.CreateTemp("", "config_rampup_test_*.json")
+		if err != nil {
+			t.Fatalf("Failed to create temp file: %v", err)
+		}
+		defer tmpFile.Close()
+		if _, err := tmpFile.WriteString(content); err != nil {
+			t.Fatalf("Failed to write temp file: %v", err)
+		}
+		return tmpFile.Name()
+	}
+
+	// Case 1: missing backfillRampUp (should use default rampUp params when disabled/not configured)
+	json1 := `{
+		"databasePairs": [
+			{
+				"source": { "connectionString": "mongodb://localhost:27017", "database": "db" },
+				"target": { "connectionString": "mongodb://localhost:27018", "database": "db" }
+			}
+		]
+	}`
+	file1 := writeTempFile(t, json1)
+	defer os.Remove(file1)
+
+	cfg1, err := LoadConfig(file1)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+
+	if cfg1.BackfillRampUp.Enabled {
+		t.Errorf("Expected BackfillRampUp.Enabled to be false by default")
+	}
+	if cfg1.BackfillRampUp.RampRatePerMin != 10000.0 {
+		t.Errorf("Expected default RampRatePerMin to be 10000.0, got %f", cfg1.BackfillRampUp.RampRatePerMin)
+	}
+	if cfg1.BackfillRampUp.UpdateIntervalMs != 1000 {
+		t.Errorf("Expected default UpdateIntervalMs to be 1000, got %d", cfg1.BackfillRampUp.UpdateIntervalMs)
+	}
+
+	// Case 2: fully custom backfillRampUp configuration
+	json2 := `{
+		"databasePairs": [
+			{
+				"source": { "connectionString": "mongodb://localhost:27017", "database": "db" },
+				"target": { "connectionString": "mongodb://localhost:27018", "database": "db" }
+			}
+		],
+		"backfillRampUp": {
+			"enabled": true,
+			"startQps": 500.0,
+			"rampRatePerMin": 5000.0,
+			"updateIntervalMs": 500,
+			"useStaggeredWorkers": true,
+			"workerDelayMs": 200
+		}
+	}`
+	file2 := writeTempFile(t, json2)
+	defer os.Remove(file2)
+
+	cfg2, err := LoadConfig(file2)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+
+	if !cfg2.BackfillRampUp.Enabled {
+		t.Errorf("Expected BackfillRampUp.Enabled to be true")
+	}
+	if cfg2.BackfillRampUp.StartQps != 500.0 {
+		t.Errorf("Expected StartQps to be 500.0, got %f", cfg2.BackfillRampUp.StartQps)
+	}
+	if cfg2.BackfillRampUp.RampRatePerMin != 5000.0 {
+		t.Errorf("Expected RampRatePerMin to be 5000.0, got %f", cfg2.BackfillRampUp.RampRatePerMin)
+	}
+	if cfg2.BackfillRampUp.UpdateIntervalMs != 500 {
+		t.Errorf("Expected UpdateIntervalMs to be 500, got %d", cfg2.BackfillRampUp.UpdateIntervalMs)
+	}
+	if !cfg2.BackfillRampUp.UseStaggeredWorkers {
+		t.Errorf("Expected UseStaggeredWorkers to be true")
+	}
+	if cfg2.BackfillRampUp.WorkerDelayMs != 200 {
+		t.Errorf("Expected WorkerDelayMs to be 200, got %d", cfg2.BackfillRampUp.WorkerDelayMs)
+	}
+}

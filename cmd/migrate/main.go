@@ -178,6 +178,8 @@ func displayUsage() {
 	fmt.Println("          * RFC3339 format:                 date --rfc-3339=seconds   (or: date -Iseconds)")
 	fmt.Println("  -dry-run")
 	fmt.Println("        Dry run mode (live-only migrations only, drops all events in reader)")
+	fmt.Println("  -test-compatibility")
+	fmt.Println("        Run target database compatibility test for IDs and field names, print report, then exit")
 	fmt.Println("  -help")
 	fmt.Println("        Display this help information")
 	fmt.Println("Examples:")
@@ -189,6 +191,8 @@ func displayUsage() {
 	fmt.Println("  migrate -mode=live-only -live-start-timestamp=2026-05-20T21:00:00Z -dry-run")
 	fmt.Println("  migrate -config=custom_config.json -mode=migrate -log-level=debug")
 	fmt.Println("  migrate -mode=live -log-file=migration.log")
+	fmt.Println("  migrate -test-compatibility")
+	fmt.Println("  migrate -config=custom_config.json -test-compatibility")
 }
 
 // parseStartTimestamp parses a user-provided timestamp string as either a raw Unix epoch

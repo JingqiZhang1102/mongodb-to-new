@@ -38,6 +38,14 @@
   "workersPerPartition": 3,
   "dropEmptyFieldNames": false,
   "convertLongFieldNamesInNestedDocs": false,
+  "backfillRampUp": {
+    "enabled": true,
+    "startQps": 2000.0,
+    "rampRatePerMin": 10000.0,
+    "updateIntervalMs": 1000,
+    "useStaggeredWorkers": false,
+    "workerDelayMs": 0
+  },
   
   "retryConfig": {
     "maxRetries": 5,

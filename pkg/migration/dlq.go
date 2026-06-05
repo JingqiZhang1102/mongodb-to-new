@@ -1,9 +1,12 @@
 package migration
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,6 +55,10 @@ func NewDLQWriter(filePath string, log *logger.Logger) (*DLQWriter, error) {
 // WriteFailed appends a failed document record to the DLQ file.
 // This method is safe to call from multiple goroutines.
 func (w *DLQWriter) WriteFailed(sourceDB, sourceCollection string, documentID interface{}, err error, phase, opType string, document interface{}) {
+	if err != nil && (errors.Is(err, context.Canceled) || err.Error() == "context canceled" || strings.Contains(err.Error(), "context canceled")) {
+		return
+	}
+
 	record := DLQRecord{
 		SourceDB:         sourceDB,
 		SourceCollection: sourceCollection,

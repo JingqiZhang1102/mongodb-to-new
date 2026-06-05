@@ -486,11 +486,21 @@ When no `collections` are specified (as above), the tool will automatically dete
 
 3. Target Compatibility Test Mode:
 
-   To test target database compatibility for different `_id` data types and long field names, and print a detailed compatibility report:
+   To test target database compatibility for different `_id` data types and document key schemas (such as empty field names and nested long keys), and print a detailed compatibility report:
 
    ```bash
    ./migrate -test-compatibility
+   
+   # Or using a custom configuration file:
+   ./migrate -config=custom_config.json -test-compatibility
    ```
+
+   **How it works:**
+   - The tool connects to the target database specified in the configuration file.
+   - It creates a temporary collection (prefixed with `_compatibility_test_`) and attempts to write various types of test payloads representing different ID datatypes (e.g., ObjectID, custom objects, arrays) and structural limits (e.g., empty key names, nested keys > 1000 characters).
+   - It prints a formatted Markdown table detailing whether each feature is supported, along with any specific error messages returned by the target database.
+   - It provides recommended configuration settings (like `convertInvalidIds`, `convertLongFieldNamesInNestedDocs`, and `dropEmptyFieldNames`) depending on the results.
+   - It automatically drops the temporary test collection when finished.
 
 4. Additional Options:
 

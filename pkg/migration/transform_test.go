@@ -822,4 +822,55 @@ func TestTransformProactiveIDConversion(t *testing.T) {
 	})
 }
 
+func BenchmarkTransformStandardDoc(b *testing.B) {
+	log := logger.New()
+	log.SetLevel("error")
+	transformer := NewFieldTransformer(true, true, true, log)
+	doc := bson.M{
+		"_id":  "valid_string_id",
+		"name": "john doe",
+		"age":  30,
+		"tags": bson.A{"user", "admin"},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = transformer.Transform(doc, "db", "coll", "valid_string_id")
+	}
+}
+
+func BenchmarkTransformInvalidIDDoc(b *testing.B) {
+	log := logger.New()
+	log.SetLevel("error")
+	transformer := NewFieldTransformer(true, true, true, log)
+	doc := bson.M{
+		"_id":  bson.A{1, 2, 3},
+		"name": "john doe",
+		"age":  30,
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = transformer.Transform(doc, "db", "coll", bson.A{1, 2, 3})
+	}
+}
+
+func BenchmarkTransformLongNestedKeyDoc(b *testing.B) {
+	log := logger.New()
+	log.SetLevel("error")
+	transformer := NewFieldTransformer(true, true, true, log)
+	longKey := string(make([]byte, 1001))
+	doc := bson.M{
+		"_id": "valid_string_id",
+		"nested": bson.M{
+			longKey: "value",
+		},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = transformer.Transform(doc, "db", "coll", "valid_string_id")
+	}
+}
+
 

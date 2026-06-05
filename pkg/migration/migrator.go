@@ -631,6 +631,8 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 			m.log.Infof("Staggering worker startup: delaying worker %d startup by %dms...", i, m.config.BackfillRampUp.WorkerDelayMs)
 			select {
 			case <-ctx.Done():
+				close(batchChan)
+				wg.Wait()
 				return 0, 0, ctx.Err()
 			case <-time.After(time.Duration(m.config.BackfillRampUp.WorkerDelayMs) * time.Millisecond):
 			}

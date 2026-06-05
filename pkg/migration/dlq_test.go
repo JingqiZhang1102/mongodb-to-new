@@ -2,6 +2,7 @@ package migration
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -185,4 +186,31 @@ func TestDLQWriterWriteFailedAfterClose(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// TestDLQWriterFiltersContextCanceled verifies that DLQWriter.WriteFailed ignores context cancellation errors.
+func TestDLQWriterFiltersContextCanceled(t *testing.T) {
+	tmpDir := t.TempDir()
+	dlqFilePath := filepath.Join(tmpDir, "canceled_dlq.jsonl")
+	log := logger.New()
+
+	writer, err := NewDLQWriter(dlqFilePath, log)
+	if err != nil {
+		t.Fatalf("failed to create DLQWriter: %v", err)
+	}
+	defer writer.Close()
+
+	// 1. Write standard errors (should increment count)
+	writer.WriteFailed("db", "col", "id1", errors.New("some standard error"), "initial", "insert", nil)
+
+	// 2. Write context.Canceled error (should be ignored)
+	writer.WriteFailed("db", "col", "id2", context.Canceled, "initial", "insert", nil)
+
+	// 3. Write custom string error containing "context canceled" (should be ignored)
+	writer.WriteFailed("db", "col", "id3", errors.New("context canceled"), "initial", "insert", nil)
+	writer.WriteFailed("db", "col", "id4", errors.New("wrapped error: context canceled"), "initial", "insert", nil)
+
+	if writer.Count() != 1 {
+		t.Errorf("expected count to be 1, got %d", writer.Count())
+	}
 }
