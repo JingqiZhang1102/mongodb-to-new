@@ -59,10 +59,12 @@ type Config struct {
 
 // BackfillRampUpConfig represents write ramp-up configuration for initial backfill
 type BackfillRampUpConfig struct {
-	Enabled          bool    `json:"enabled"`
-	StartQps         float64 `json:"startQps"`
-	RampRatePerMin   float64 `json:"rampRatePerMin"`
-	UpdateIntervalMs int     `json:"updateIntervalMs"`
+	Enabled             bool    `json:"enabled"`
+	StartQps            float64 `json:"startQps"`
+	RampRatePerMin      float64 `json:"rampRatePerMin"`
+	UpdateIntervalMs    int     `json:"updateIntervalMs"`
+	UseStaggeredWorkers bool    `json:"useStaggeredWorkers"`
+	WorkerDelayMs       int     `json:"workerDelayMs"`
 }
 
 // RetryConfig represents retry configuration

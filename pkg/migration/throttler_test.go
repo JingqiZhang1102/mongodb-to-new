@@ -18,6 +18,15 @@ func TestNewWriteThrottler(t *testing.T) {
 		t.Errorf("Expected nil throttler when disabled")
 	}
 
+	// Enabled but with staggered workers enabled -> should return nil throttler
+	cfgStaggered := config.BackfillRampUpConfig{
+		Enabled:             true,
+		UseStaggeredWorkers: true,
+	}
+	if throttler := NewWriteThrottler(cfgStaggered, 2000); throttler != nil {
+		t.Errorf("Expected nil throttler when UseStaggeredWorkers is enabled")
+	}
+
 	// Enabled
 	cfgEnabled := config.BackfillRampUpConfig{
 		Enabled:          true,

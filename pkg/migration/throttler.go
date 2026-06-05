@@ -21,7 +21,7 @@ type WriteThrottler struct {
 // NewWriteThrottler constructs a WriteThrottler.
 // If the throttler is disabled (Enabled is false), it returns nil.
 func NewWriteThrottler(cfg config.BackfillRampUpConfig, burst int) *WriteThrottler {
-	if !cfg.Enabled {
+	if !cfg.Enabled || cfg.UseStaggeredWorkers {
 		return nil
 	}
 

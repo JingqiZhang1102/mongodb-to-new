@@ -627,6 +627,14 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	m.log.Infof("Starting %d workers for parallel document batch processing", workerCount)
 
 	for i := 0; i < workerCount; i++ {
+		if i > 0 && m.config.BackfillRampUp.Enabled && m.config.BackfillRampUp.UseStaggeredWorkers && m.config.BackfillRampUp.WorkerDelayMs > 0 {
+			m.log.Infof("Staggering worker startup: delaying worker %d startup by %dms...", i, m.config.BackfillRampUp.WorkerDelayMs)
+			select {
+			case <-ctx.Done():
+				return 0, 0, ctx.Err()
+			case <-time.After(time.Duration(m.config.BackfillRampUp.WorkerDelayMs) * time.Millisecond):
+			}
+		}
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
