@@ -3,6 +3,7 @@ package migration
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strconv"
 	"time"
 
@@ -20,17 +21,19 @@ type CollectionPartitioner struct {
 	maxPartitions       int
 	minDocsPerPartition int
 	sampleSize          int
+	idTypeForPartition  string
 }
 
 // NewCollectionPartitioner creates a new collection partitioner
 func NewCollectionPartitioner(sourceCollection *mongo.Collection,
-	log *logger.Logger, maxPartitions, minDocsPerPartition, sampleSize int) *CollectionPartitioner {
+	log *logger.Logger, maxPartitions, minDocsPerPartition, sampleSize int, idTypeForPartition string) *CollectionPartitioner {
 	return &CollectionPartitioner{
 		sourceCollection:    sourceCollection,
 		log:                 log,
 		maxPartitions:       maxPartitions,
 		minDocsPerPartition: minDocsPerPartition,
 		sampleSize:          sampleSize,
+		idTypeForPartition:  idTypeForPartition,
 	}
 }
 
@@ -68,33 +71,28 @@ func (p *CollectionPartitioner) Partition(ctx context.Context) ([]bson.D, error)
 		return []bson.D{{}}, nil
 	}
 
-	// Determine partition strategy based on _id type
-	// First, get a sample document to check _id type
-	var sampleDoc bson.M
-	err = p.sourceCollection.FindOne(ctx, bson.D{}).Decode(&sampleDoc)
-	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			// Empty collection, return single empty filter
-			return []bson.D{{}}, nil
+	strategy := p.idTypeForPartition
+	if strategy == "auto" || strategy == "" {
+		detected, err := p.RecommendIDPartitioning(ctx)
+		if err != nil {
+			p.log.Warnf("Failed to auto-detect partitioning ID type: %v. Falling back to 'mixed'", err)
+			strategy = "mixed"
+		} else {
+			p.log.Infof("Auto-detected partition ID strategy type: %s", detected)
+			strategy = detected
 		}
-		return nil, fmt.Errorf("failed to get sample document: %w", err)
 	}
 
-	// Check _id type
-	idValue, ok := sampleDoc["_id"]
-	if !ok {
-		return nil, fmt.Errorf("sample document has no _id field")
-	}
-
-	switch idValue.(type) {
-	case primitive.ObjectID:
-		// Use sampling-based partitioning for ObjectIDs
+	// Determine partition strategy based on strategy
+	switch strategy {
+	case "objectid":
 		return p.createObjectIDPartitionsWithSampling(ctx, partitionCount)
-	case int, int32, int64, float64:
-		// Use sampling-based partitioning for numeric IDs
+	case "numeric":
 		return p.createNumericPartitionsWithSampling(ctx, partitionCount)
+	case "mixed":
+		return p.createPartitionsWithSampling(ctx, partitionCount)
 	default:
-		// For other types (strings, nested documents, etc.), use generic sampling-based partitioning
+		p.log.Warnf("Unrecognized partitioning strategy '%s', falling back to mixed mode partitioning", strategy)
 		return p.createPartitionsWithSampling(ctx, partitionCount)
 	}
 }
@@ -111,20 +109,23 @@ func (p *CollectionPartitioner) createObjectIDPartitionsWithSampling(ctx context
 
 	// Sample documents to understand the _id distribution
 	pipeline := mongo.Pipeline{
-		{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
-		{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
-		{{Key: "$sort", Value: bson.D{{Key: "_id", Value: 1}}}},
+		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
+		bson.D{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
+		bson.D{{Key: "$sort", Value: bson.D{{Key: "_id", Value: 1}}}},
 	}
 
-	cursor, err := p.sourceCollection.Aggregate(ctx, pipeline)
+	sampleCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	cursor, err := p.sourceCollection.Aggregate(sampleCtx, pipeline)
 	if err != nil {
 		return nil, fmt.Errorf("failed to sample documents: %w", err)
 	}
-	defer cursor.Close(ctx)
+	defer cursor.Close(sampleCtx)
 
 	// Collect all sampled _ids
 	var sampledIDs []primitive.ObjectID
-	for cursor.Next(ctx) {
+	for cursor.Next(sampleCtx) {
 		var doc bson.M
 		if err := cursor.Decode(&doc); err != nil {
 			return nil, fmt.Errorf("failed to decode sampled document: %w", err)
@@ -137,6 +138,17 @@ func (p *CollectionPartitioner) createObjectIDPartitionsWithSampling(ctx context
 
 	if err := cursor.Err(); err != nil {
 		return nil, fmt.Errorf("cursor error during sampling: %w", err)
+	}
+
+	// Deduplicate sampled IDs
+	if len(sampledIDs) > 0 {
+		uniqueIDs := sampledIDs[:1]
+		for _, id := range sampledIDs[1:] {
+			if id != uniqueIDs[len(uniqueIDs)-1] {
+				uniqueIDs = append(uniqueIDs, id)
+			}
+		}
+		sampledIDs = uniqueIDs
 	}
 
 	// If not enough samples, fall back to min/max approach
@@ -259,20 +271,23 @@ func (p *CollectionPartitioner) createNumericPartitionsWithSampling(ctx context.
 
 	// Sample documents to understand the _id distribution
 	pipeline := mongo.Pipeline{
-		{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
-		{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
-		{{Key: "$sort", Value: bson.D{{Key: "_id", Value: 1}}}},
+		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
+		bson.D{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
+		bson.D{{Key: "$sort", Value: bson.D{{Key: "_id", Value: 1}}}},
 	}
 
-	cursor, err := p.sourceCollection.Aggregate(ctx, pipeline)
+	sampleCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	cursor, err := p.sourceCollection.Aggregate(sampleCtx, pipeline)
 	if err != nil {
 		return nil, fmt.Errorf("failed to sample documents: %w", err)
 	}
-	defer cursor.Close(ctx)
+	defer cursor.Close(sampleCtx)
 
 	// Collect all sampled _ids as float64 for consistent handling
 	var sampledIDs []float64
-	for cursor.Next(ctx) {
+	for cursor.Next(sampleCtx) {
 		var doc bson.M
 		if err := cursor.Decode(&doc); err != nil {
 			return nil, fmt.Errorf("failed to decode sampled document: %w", err)
@@ -298,6 +313,17 @@ func (p *CollectionPartitioner) createNumericPartitionsWithSampling(ctx context.
 
 	if err := cursor.Err(); err != nil {
 		return nil, fmt.Errorf("cursor error during sampling: %w", err)
+	}
+
+	// Deduplicate sampled IDs
+	if len(sampledIDs) > 0 {
+		uniqueIDs := sampledIDs[:1]
+		for _, id := range sampledIDs[1:] {
+			if id != uniqueIDs[len(uniqueIDs)-1] {
+				uniqueIDs = append(uniqueIDs, id)
+			}
+		}
+		sampledIDs = uniqueIDs
 	}
 
 	// If not enough samples, fall back to min/max approach
@@ -453,23 +479,26 @@ func (p *CollectionPartitioner) createPartitionsWithSampling(ctx context.Context
 	p.log.Infof("Sampling %d documents to create %d partitions", sampleSize, partitionCount)
 
 	pipeline := mongo.Pipeline{
-		{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
-		{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
-		{{Key: "$sort", Value: bson.D{{Key: "_id", Value: 1}}}},
+		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
+		bson.D{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
+		bson.D{{Key: "$sort", Value: bson.D{{Key: "_id", Value: 1}}}},
 	}
 
-	cursor, err := p.sourceCollection.Aggregate(ctx, pipeline)
+	sampleCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	cursor, err := p.sourceCollection.Aggregate(sampleCtx, pipeline)
 	if err != nil {
 		return nil, fmt.Errorf("failed to sample documents: %w", err)
 	}
-	defer cursor.Close(ctx)
+	defer cursor.Close(sampleCtx)
 
 	type idDoc struct {
 		ID interface{} `bson:"_id"`
 	}
 
 	var sampledIDs []interface{}
-	for cursor.Next(ctx) {
+	for cursor.Next(sampleCtx) {
 		var doc idDoc
 		if err := cursor.Decode(&doc); err != nil {
 			return nil, fmt.Errorf("failed to decode sampled document: %w", err)
@@ -481,6 +510,17 @@ func (p *CollectionPartitioner) createPartitionsWithSampling(ctx context.Context
 
 	if err := cursor.Err(); err != nil {
 		return nil, fmt.Errorf("cursor error during sampling: %w", err)
+	}
+
+	// Deduplicate sampled IDs using reflect.DeepEqual (supports slice/document IDs)
+	if len(sampledIDs) > 0 {
+		uniqueIDs := sampledIDs[:1]
+		for _, id := range sampledIDs[1:] {
+			if !reflect.DeepEqual(id, uniqueIDs[len(uniqueIDs)-1]) {
+				uniqueIDs = append(uniqueIDs, id)
+			}
+		}
+		sampledIDs = uniqueIDs
 	}
 
 	if len(sampledIDs) < partitionCount {
@@ -520,4 +560,68 @@ func buildPartitionFilters(sampledIDs []interface{}, partitionCount int) []bson.
 	}
 
 	return partitions
+}
+
+// RecommendIDPartitioning samples the collection and recommends the best ID partitioning strategy
+func (p *CollectionPartitioner) RecommendIDPartitioning(ctx context.Context) (string, error) {
+	// Sample documents
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: p.sampleSize}}}},
+		bson.D{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
+	}
+
+	sampleCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	cursor, err := p.sourceCollection.Aggregate(sampleCtx, pipeline)
+	if err != nil {
+		return "", fmt.Errorf("failed to sample for recommendation: %w", err)
+	}
+	defer cursor.Close(sampleCtx)
+
+	var objectIDCount int
+	var numericCount int
+	var otherCount int
+	var totalSampled int
+
+	for cursor.Next(sampleCtx) {
+		var doc bson.M
+		if err := cursor.Decode(&doc); err != nil {
+			return "", fmt.Errorf("failed to decode sample doc: %w", err)
+		}
+		totalSampled++
+		idVal, ok := doc["_id"]
+		if !ok {
+			otherCount++
+			continue
+		}
+
+		switch idVal.(type) {
+		case primitive.ObjectID:
+			objectIDCount++
+		case int, int32, int64, float64:
+			numericCount++
+		default:
+			otherCount++
+		}
+	}
+
+	if err := cursor.Err(); err != nil {
+		return "", fmt.Errorf("cursor error during sampling for recommendation: %w", err)
+	}
+
+	if totalSampled == 0 {
+		return "mixed", nil // Fallback/empty collection
+	}
+
+	p.log.Infof("ID partitioning analysis for %s: sampled %d docs. ObjectIDs: %d, Numerics: %d, Others: %d",
+		p.sourceCollection.Name(), totalSampled, objectIDCount, numericCount, otherCount)
+
+	if objectIDCount == totalSampled {
+		return "objectid", nil
+	} else if numericCount == totalSampled {
+		return "numeric", nil
+	} else {
+		return "mixed", nil
+	}
 }

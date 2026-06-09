@@ -43,6 +43,8 @@ type Config struct {
 	MinDocsForParallelReads int  `json:"minDocsForParallelReads"` // Minimum collection size for parallel reads
 	SampleSize              int  `json:"sampleSize"`              // Number of documents to sample for partitioning
 	WorkersPerPartition     int  `json:"workersPerPartition"`     // Number of worker goroutines per partition
+	IDTypeForPartition      string `json:"idTypeForPartition"`    // Partitioning ID type: "mixed", "objectid", or "numeric"
+
 
 	// Write ramp-up configuration for initial migration
 	BackfillRampUp BackfillRampUpConfig `json:"backfillRampUp"`
@@ -242,6 +244,10 @@ func LoadConfig(configPath string) (*Config, error) {
 		config.WorkersPerPartition = 3 // Default to 3 workers per partition
 	}
 
+	if config.IDTypeForPartition == "" {
+		config.IDTypeForPartition = "auto"
+	}
+
 	// Set default values for retry configuration
 	if config.RetryConfig.MaxRetries <= 0 {
 		config.RetryConfig.MaxRetries = 5 // Default to 5 retries
@@ -311,6 +317,10 @@ func validateConfig(config *Config) error {
 				return fmt.Errorf("target collection name is required for collection mapping at index %d in database pair %d", j, i)
 			}
 		}
+	}
+
+	if config.IDTypeForPartition != "" && config.IDTypeForPartition != "auto" && config.IDTypeForPartition != "mixed" && config.IDTypeForPartition != "objectid" && config.IDTypeForPartition != "numeric" {
+		return fmt.Errorf("invalid idTypeForPartition: %s. Must be 'auto', 'mixed', 'objectid', or 'numeric'", config.IDTypeForPartition)
 	}
 
 	return nil

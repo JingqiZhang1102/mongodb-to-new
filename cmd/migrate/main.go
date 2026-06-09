@@ -25,8 +25,7 @@ func main() {
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	logFile := flag.String("log-file", "", "Path to log file (logs to both stdout and file when specified)")
 	liveStartTimeStr := flag.String("live-start-timestamp", "", "Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)")
-	dryRun := flag.Bool("dry-run", false, "Dry run mode (live-only migrations only, drops all events in reader)")
-	testCompatibility := flag.Bool("test-compatibility", false, "Run target database compatibility test for IDs and field names, print report, then exit")
+	dryRun := flag.Bool("dry-run", false, "Dry run mode (skips writes, outputs partitioning recommendations on backfill)")
 	help := flag.Bool("help", false, "Display help information")
 	flag.Parse()
 
@@ -62,14 +61,6 @@ func main() {
 	// Display and log the loaded configuration with sensitive values masked
 	log.Infof("Active Configuration:\n%s", getSanitizedConfigJSON(cfg))
 
-	if *testCompatibility {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		if err := migration.RunCompatibilityTest(ctx, cfg, log); err != nil {
-			log.Fatalf("Compatibility test failed: %v", err)
-		}
-		os.Exit(0)
-	}
 
 
 
@@ -78,10 +69,6 @@ func main() {
 		log.Fatalf("Invalid mode: %s. Please choose either 'migrate', 'live', or 'live-only'", *mode)
 	}
 
-	// Validate dry-run and read-only options
-	if *dryRun && *mode != "live-only" {
-		log.Fatal("Error: -dry-run can only be specified when -mode is 'live-only'")
-	}
 
 	// Parse and validate -live-start-timestamp option.
 	// This flag specifies a custom historical starting point (Unix epoch seconds or RFC3339 date)
@@ -177,9 +164,14 @@ func displayUsage() {
 	fmt.Printf("          * Unix epoch seconds:             date +%%s\n")
 	fmt.Println("          * RFC3339 format:                 date --rfc-3339=seconds   (or: date -Iseconds)")
 	fmt.Println("  -dry-run")
-	fmt.Println("        Dry run mode (live-only migrations only, drops all events in reader)")
-	fmt.Println("  -test-compatibility")
-	fmt.Println("        Run target database compatibility test for IDs and field names, print report, then exit")
+	fmt.Println("        Dry run mode (skips writes).")
+	fmt.Println("        - In backfill modes ('migrate' or 'live' initial phase): connects to the source")
+	fmt.Println("          and target, runs target compatibility validations, samples source collections")
+	fmt.Println("          to output partition recommendations, and exits without reading full collections.")
+	fmt.Println("        - In incremental modes ('live-only' or 'live' incremental phase): connects to the")
+	fmt.Println("          source, starts the change stream/oplog readers to ingest live events, and prints")
+	fmt.Println("          real-time ingestion lag statistics while discarding writes. Useful to test read")
+	fmt.Println("          performance and change stream partitioning effectiveness.")
 	fmt.Println("  -help")
 	fmt.Println("        Display this help information")
 	fmt.Println("Examples:")
@@ -191,8 +183,6 @@ func displayUsage() {
 	fmt.Println("  migrate -mode=live-only -live-start-timestamp=2026-05-20T21:00:00Z -dry-run")
 	fmt.Println("  migrate -config=custom_config.json -mode=migrate -log-level=debug")
 	fmt.Println("  migrate -mode=live -log-file=migration.log")
-	fmt.Println("  migrate -test-compatibility")
-	fmt.Println("  migrate -config=custom_config.json -test-compatibility")
 }
 
 // parseStartTimestamp parses a user-provided timestamp string as either a raw Unix epoch

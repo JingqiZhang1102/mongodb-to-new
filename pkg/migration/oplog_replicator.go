@@ -181,8 +181,10 @@ func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp 
 	// Perform initial migration if needed (same logic as change stream replicator)
 	if needsInitialMigration {
 		// Mark initial migration state as incomplete before starting
-		if err := SaveInitialMigrationState(initialMigrationStatePath, StatusInProgress, 0); err != nil {
-			r.log.Errorf("Error saving initial migration state as incomplete: %v", err)
+		if !r.DryRun {
+			if err := SaveInitialMigrationState(initialMigrationStatePath, StatusInProgress, 0); err != nil {
+				r.log.Errorf("Error saving initial migration state as incomplete: %v", err)
+			}
 		}
 
 		initialMigrator := NewInitialMigrator(r.sourceDB, r.targetDB, r.config, r.log, r.collectionConfigs, r.dlq, r.retryManager)
@@ -211,8 +213,10 @@ func (r *OplogReplicator) StartReplication(ctx context.Context, globalTimestamp 
 		}
 
 		// Mark initial migration state as complete
-		if err := SaveInitialMigrationState(initialMigrationStatePath, status, totalFailedCount); err != nil {
-			r.log.Errorf("Error saving initial migration state as complete: %v", err)
+		if !r.DryRun {
+			if err := SaveInitialMigrationState(initialMigrationStatePath, status, totalFailedCount); err != nil {
+				r.log.Errorf("Error saving initial migration state as complete: %v", err)
+			}
 		}
 
 		if status == StatusCompletedWithFailures {

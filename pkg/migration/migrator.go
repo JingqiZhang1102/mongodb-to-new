@@ -46,12 +46,15 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 		return fmt.Errorf("invalid mode: %s, must be 'migrate', 'live', or 'live-only'", mode)
 	}
 
-	// Validate dry run constraint: dry run is only supported for 'live-only' mode
-	if m.DryRun && mode != "live-only" {
-		return fmt.Errorf("dry-run mode is only supported for 'live-only' migrations")
-	}
 
 	m.log.Infof("Starting MongoDB to MongoDB %s process", mode)
+
+	if m.DryRun {
+		m.log.Info("[Dry Run] Running target compatibility check reports before starting migration")
+		if err := RunCompatibilityTest(ctx, m.config, m.DryRun, m.log); err != nil {
+			m.log.Warnf("Target compatibility check connection check failed: %v", err)
+		}
+	}
 
 	if mode == "migrate" {
 		// Migrate mode: process each database pair sequentially
@@ -562,6 +565,26 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 
 	m.log.Infof("Found %d documents to migrate", totalCount)
 
+	if m.DryRun {
+		m.log.Infof("[Dry Run] Skipping actual data migration for collection %s", collConfig.SourceCollection)
+		// Perform sampling analysis to recommend ID partitioning strategy
+		partitioner := NewCollectionPartitioner(
+			sourceCollection,
+			m.log,
+			m.config.MaxReadPartitions,
+			m.config.MinDocsPerPartition,
+			m.config.SampleSize,
+			m.config.IDTypeForPartition,
+		)
+		recType, err := partitioner.RecommendIDPartitioning(ctx)
+		if err != nil {
+			m.log.Warnf("[Dry Run] Failed to recommend ID partitioning for collection %s: %v", collConfig.SourceCollection, err)
+		} else {
+			m.log.Infof("[Dry Run] Recommended ID partitioning strategy for collection %s: %s", collConfig.SourceCollection, recType)
+		}
+		return 0, 0, nil
+	}
+
 	if opts.BackfillStatsManager != nil {
 		opts.BackfillStatsManager.AddTargetCount(totalCount)
 	}
@@ -951,6 +974,7 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 		m.config.MaxReadPartitions,
 		m.config.MinDocsPerPartition,
 		m.config.SampleSize,
+		m.config.IDTypeForPartition,
 	)
 
 	// Create partitions
@@ -1258,6 +1282,11 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 // When pair.Target.SyncAllIndexes is true, it syncs ALL indexes (except _id_) for every
 // collection in the collections list. Otherwise it uses the explicit pair.Target.Indexes config.
 func (m *Migrator) syncIndexes(ctx context.Context, sourceDB, targetDB *db.MongoDB, pair config.DatabasePair, collections []config.CollectionConfig) error {
+	if m.DryRun {
+		m.log.Info("[Dry Run] Skipping index synchronization")
+		return nil
+	}
+
 	m.log.Info("Starting async index synchronization (fire-and-forget)...")
 
 	var indexCount int

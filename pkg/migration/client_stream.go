@@ -337,11 +337,10 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 
 	// Perform initial migration if needed
 	if needsInitialMigration {
-		// Critical File-System State Checkpoint:
-		// We flag the initial migration status as StatusInProgress on disk before running the hot migration loop.
-		// If this file write fails, we halt immediately to keep progress safe from untracked restart states.
-		if err := SaveInitialMigrationState(initialMigrationStatePath, StatusInProgress, 0); err != nil {
-			return fmt.Errorf("failed to save initial migration state as incomplete: %w", err)
+		if !r.DryRun {
+			if err := SaveInitialMigrationState(initialMigrationStatePath, StatusInProgress, 0); err != nil {
+				return fmt.Errorf("failed to save initial migration state as incomplete: %w", err)
+			}
 		}
 		initialMigrationStart := time.Now()
 		r.log.Info("Performing initial migration for all collections")
@@ -490,12 +489,10 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 			}
 		}
 
-		// Critical File-System State Checkpoint:
-		// We persist the completed backfill status (StatusCompleted or StatusCompletedWithFailures) to disk.
-		// If this file write fails, we abort replication immediately to avoid starting incremental operations
-		// without solid baseline checkpoints on disk.
-		if err := SaveInitialMigrationState(initialMigrationStatePath, status, totalFailedCount); err != nil {
-			return fmt.Errorf("failed to save initial migration state as complete: %w", err)
+		if !r.DryRun {
+			if err := SaveInitialMigrationState(initialMigrationStatePath, status, totalFailedCount); err != nil {
+				return fmt.Errorf("failed to save initial migration state as complete: %w", err)
+			}
 		}
 
 		if status == StatusCompletedWithFailures {

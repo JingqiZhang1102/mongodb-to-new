@@ -142,6 +142,26 @@ func (r *InitialMigrator) Run(ctx context.Context, pair config.DatabasePair, mig
 
 // migrateCollection migrates a single collection from modern source to target
 func (r *InitialMigrator) migrateCollection(ctx context.Context, sourceCol, targetCol *mongo.Collection, count int64, sourceDB, sourceCollection string) (int64, int64) {
+	if r.DryRun {
+		r.log.Infof("[Dry Run] Skipping actual data migration for collection %s.%s", sourceDB, sourceCollection)
+		// Perform sampling analysis to recommend ID partitioning strategy
+		partitioner := NewCollectionPartitioner(
+			sourceCol,
+			r.log,
+			r.config.MaxReadPartitions,
+			r.config.MinDocsPerPartition,
+			r.config.SampleSize,
+			r.config.IDTypeForPartition,
+		)
+		recType, err := partitioner.RecommendIDPartitioning(ctx)
+		if err != nil {
+			r.log.Warnf("[Dry Run] Failed to recommend ID partitioning for collection %s.%s: %v", sourceDB, sourceCollection, err)
+		} else {
+			r.log.Infof("[Dry Run] Recommended ID partitioning strategy for collection %s.%s: %s", sourceDB, sourceCollection, recType)
+		}
+		return 0, 0
+	}
+
 	readBatchSize := r.config.InitialReadBatchSize
 	writeBatchSize := r.config.InitialWriteBatchSize
 

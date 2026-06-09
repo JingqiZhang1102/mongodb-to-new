@@ -272,3 +272,77 @@ func TestLoadConfigBackfillRampUp(t *testing.T) {
 		t.Errorf("Expected WorkerDelayMs to be 200, got %d", cfg2.BackfillRampUp.WorkerDelayMs)
 	}
 }
+
+// TestLoadConfigIDTypeForPartition verifies that the idTypeForPartition configuration parses, defaults, and validates correctly.
+func TestLoadConfigIDTypeForPartition(t *testing.T) {
+	writeTempFile := func(t *testing.T, content string) string {
+		tmpFile, err := os.CreateTemp("", "config_idtype_test_*.json")
+		if err != nil {
+			t.Fatalf("Failed to create temp file: %v", err)
+		}
+		defer tmpFile.Close()
+		if _, err := tmpFile.WriteString(content); err != nil {
+			t.Fatalf("Failed to write temp file: %v", err)
+		}
+		return tmpFile.Name()
+	}
+
+	// Case 1: missing idTypeForPartition (should default to "auto")
+	json1 := `{
+		"databasePairs": [
+			{
+				"source": { "connectionString": "mongodb://localhost:27017", "database": "db" },
+				"target": { "connectionString": "mongodb://localhost:27018", "database": "db" }
+			}
+		]
+	}`
+	file1 := writeTempFile(t, json1)
+	defer os.Remove(file1)
+
+	cfg1, err := LoadConfig(file1)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+	if cfg1.IDTypeForPartition != "auto" {
+		t.Errorf("Expected default IDTypeForPartition to be 'auto', got %q", cfg1.IDTypeForPartition)
+	}
+
+	// Case 2: custom valid idTypeForPartition "objectid"
+	json2 := `{
+		"databasePairs": [
+			{
+				"source": { "connectionString": "mongodb://localhost:27017", "database": "db" },
+				"target": { "connectionString": "mongodb://localhost:27018", "database": "db" }
+			}
+		],
+		"idTypeForPartition": "objectid"
+	}`
+	file2 := writeTempFile(t, json2)
+	defer os.Remove(file2)
+
+	cfg2, err := LoadConfig(file2)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+	if cfg2.IDTypeForPartition != "objectid" {
+		t.Errorf("Expected IDTypeForPartition to be 'objectid', got %q", cfg2.IDTypeForPartition)
+	}
+
+	// Case 3: invalid idTypeForPartition (should fail validation)
+	json3 := `{
+		"databasePairs": [
+			{
+				"source": { "connectionString": "mongodb://localhost:27017", "database": "db" },
+				"target": { "connectionString": "mongodb://localhost:27018", "database": "db" }
+			}
+		],
+		"idTypeForPartition": "invalid_type"
+	}`
+	file3 := writeTempFile(t, json3)
+	defer os.Remove(file3)
+
+	_, err = LoadConfig(file3)
+	if err == nil {
+		t.Error("Expected LoadConfig to fail validation for invalid idTypeForPartition, but it succeeded")
+	}
+}

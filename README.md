@@ -207,6 +207,11 @@ If you want to migrate only specific collections or rename collections during mi
 
 #### Parallel Reads Configuration
 - **parallelReadsEnabled**: Enable parallel reads for large collections (default: true).
+- **idTypeForPartition**: BSON Partitioning ID strategy type for collection partitioning. Supported values:
+  - `"auto"` (default): Automatically detects strategy by sampling `sampleSize` documents and choosing `"objectid"`, `"numeric"`, or `"mixed"` accordingly.
+  - `"mixed"`: Generic range-sampling strategy suitable for collections with mixed ID types.
+  - `"objectid"`: Optimized strategy for collections where `_id` values are mainly BSON `ObjectID`s.
+  - `"numeric"`: Optimized strategy for collections where `_id` values are numbers (integers or doubles).
 - **maxReadPartitions**: Maximum number of partitions for parallel reads (default: 8).
 - **minDocsPerPartition**: Minimum number of documents per partition (default: 10000).
 - **minDocsForParallelReads**: Minimum collection size for parallel reads (default: 50000).
@@ -484,23 +489,19 @@ When no `collections` are specified (as above), the tool will automatically dete
 
    The application will continuously listen for changes in the specified MongoDB collections and replicate them to the target MongoDB.
 
-3. Target Compatibility Test Mode:
+3. Dry Run and Compatibility Reports:
 
-   To test target database compatibility for different `_id` data types and document key schemas (such as empty field names and nested long keys), and print a detailed compatibility report:
+   To dry run a migration (which runs connectivity and compatibility validation, checks target database support for various datatypes/key limits, and samples source collections to output partitioning recommendations):
 
    ```bash
-   ./migrate -test-compatibility
-   
-   # Or using a custom configuration file:
-   ./migrate -config=custom_config.json -test-compatibility
+   ./migrate -mode=migrate -dry-run
    ```
 
    **How it works:**
-   - The tool connects to the target database specified in the configuration file.
-   - It creates a temporary collection (prefixed with `_compatibility_test_`) and attempts to write various types of test payloads representing different ID datatypes (e.g., ObjectID, custom objects, arrays) and structural limits (e.g., empty key names, nested keys > 1000 characters).
-   - It prints a formatted Markdown table detailing whether each feature is supported, along with any specific error messages returned by the target database.
-   - It provides recommended configuration settings (like `convertInvalidIds`, `convertLongFieldNamesInNestedDocs`, and `dropEmptyFieldNames`) depending on the results.
-   - It automatically drops the temporary test collection when finished.
+   - **Target Connection & Validation:** The tool connects to the target database specified in the configuration file to verify connectivity and compatibility. It prints target support reports for `_id` types, long nested fields, and empty key names without writing actual records.
+   - **In Backfill Modes (`-mode=migrate` or `live` initial phase):** It runs target checks, samples a small subset of documents (e.g. 1000) from source collections to recommend partition boundaries and ID strategy configurations, and exits immediately. It skips scanning/reading full collection payloads.
+   - **In Incremental Modes (`-mode=live-only` or `live` streaming phase):** It starts change stream/oplog replication threads, pulls events from source database partitions, and outputs real-time ingestion lag stats. However, it discards events before formatting/sending writes to the target. This is useful for safely measuring network pre-fetching performance and verifying that the configured sharded change stream partitioning (`incrementalStreamPartitions`) functions correctly on active production setups.
+   - **Safety:** No write operations or state checkpoints are committed to either source or target systems.
 
 4. Additional Options:
 
@@ -523,9 +524,7 @@ When no `collections` are specified (as above), the tool will automatically dete
       -live-start-timestamp string
             Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)
       -dry-run
-            Dry run mode (live-only migrations only, drops all events in reader)
-      -test-compatibility
-            Run target database compatibility test for IDs and field names, print report, then exit
+            Dry run mode (skips writes, outputs partitioning recommendations on backfill)
       -help
             Display this help information
     ```
