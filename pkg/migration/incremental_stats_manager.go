@@ -132,6 +132,7 @@ type IncrementalStatsManager struct {
 	// Queue snapshot support (protected by mu lock)
 	workers     []*Worker
 	ingestQueue chan QueueEvent
+	dlq         DLQ
 
 	// Stall / Backpressure stats (atomically tracked)
 	batchingQueueStallNs   int64
@@ -142,6 +143,16 @@ type IncrementalStatsManager struct {
 	ingestQueueWaitCount   int64
 	batchingQueueWaitNs    int64
 	batchingQueueWaitCount int64
+}
+
+// SetDLQ sets the DLQ reference for monitoring.
+func (sm *IncrementalStatsManager) SetDLQ(dlq DLQ) {
+	if sm == nil {
+		return
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.dlq = dlq
 }
 
 // RegisterQueues registers the worker pool and ingest queue for monitoring in the IncrementalStatsManager
@@ -1217,6 +1228,17 @@ func (sm *IncrementalStatsManager) ReportStats() {
 		poolStatsStr)
 
 	sm.log.Info(msg)
+
+	sm.mu.Lock()
+	dlq := sm.dlq
+	sm.mu.Unlock()
+
+	if dlq != nil {
+		count := dlq.Count()
+		if count > 100 {
+			sm.log.Warnf("DLQ WARNING: The Dead Letter Queue contains %d failed documents! Please check the DLQ file.", count)
+		}
+	}
 }
 
 // ReportDryRunStats logs the dry-run statistics, resetting dry-run specific counters.

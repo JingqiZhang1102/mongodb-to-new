@@ -379,6 +379,12 @@ func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, t
 		defer dlq.Close()
 	}
 	replicator.SetDLQ(dlqInterface)
+	if incrementalStatsManager != nil {
+		incrementalStatsManager.SetDLQ(dlqInterface)
+	}
+	if backfillStatsManager != nil {
+		backfillStatsManager.SetDLQ(dlqInterface)
+	}
 
 	// Start client-level replication (which will handle index sync during initial migration)
 	return replicator.StartReplication(ctx, globalResumeToken, globalResumeTokenPath, initialMigrationState, initialMigrationStatePath, pair, liveOnly, m.LiveStartTime, m)

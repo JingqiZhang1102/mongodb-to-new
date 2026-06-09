@@ -1,7 +1,10 @@
 package migration
 
 import (
+	"bytes"
 	"context"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,3 +67,35 @@ func TestBackfillStatsManager(t *testing.T) {
 	// Final report
 	sm.ReportStats(true)
 }
+
+func TestBackfillStatsManagerDLQWarning(t *testing.T) {
+	log := logger.New()
+	var logBuf bytes.Buffer
+	log.Logger.SetOutput(&logBuf)
+
+	sm := NewBackfillStatsManager(log, 5*time.Minute, nil)
+
+	// 1. DLQ is nil -> no warning
+	sm.ReportStats(false)
+	if strings.Contains(logBuf.String(), "DLQ WARNING") {
+		t.Errorf("did not expect DLQ WARNING with nil DLQ, got log: %s", logBuf.String())
+	}
+	logBuf.Reset()
+
+	// 2. DLQ count <= 100 -> no warning
+	mock := &mockDLQ{count: 100}
+	sm.SetDLQ(mock)
+	sm.ReportStats(false)
+	if strings.Contains(logBuf.String(), "DLQ WARNING") {
+		t.Errorf("did not expect DLQ WARNING with count 100, got log: %s", logBuf.String())
+	}
+	logBuf.Reset()
+
+	// 3. DLQ count > 100 -> warning
+	atomic.StoreInt64(&mock.count, 101)
+	sm.ReportStats(false)
+	if !strings.Contains(logBuf.String(), "DLQ WARNING") {
+		t.Errorf("expected DLQ WARNING with count 101, got log: %s", logBuf.String())
+	}
+}
+

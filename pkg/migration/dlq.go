@@ -79,8 +79,7 @@ func (w *DLQWriter) WriteFailed(sourceDB, sourceCollection string, documentID in
 
 	data, marshalErr := bson.MarshalExtJSON(record, false, false)
 	if marshalErr != nil {
-		w.log.Errorf("DLQ: Failed to marshal record for %s.%s _id=%v: %v", sourceDB, sourceCollection, documentID, marshalErr)
-		return
+		w.log.Fatalf("DLQ: Failed to marshal record for %s.%s _id=%v: %v", sourceDB, sourceCollection, documentID, marshalErr)
 	}
 
 	// Append newline for JSONL format
@@ -91,15 +90,14 @@ func (w *DLQWriter) WriteFailed(sourceDB, sourceCollection string, documentID in
 	// w.file is nil. Writing to a nil file raises a nil pointer panic. We check this under the lock and abort safely.
 	if w.file == nil {
 		w.mu.Unlock()
-		w.log.Errorf("DLQ: Attempted to write to a closed DLQ writer [db=%s, collection=%s, _id=%v]", sourceDB, sourceCollection, documentID)
+		w.log.Warnf("DLQ: Attempted to write to a closed DLQ writer [db=%s, collection=%s, _id=%v]", sourceDB, sourceCollection, documentID)
 		return
 	}
 	_, writeErr := w.file.Write(data)
 	w.mu.Unlock()
 
 	if writeErr != nil {
-		w.log.Errorf("DLQ: Failed to write record for %s.%s _id=%v: %v", sourceDB, sourceCollection, documentID, writeErr)
-		return
+		w.log.Fatalf("DLQ: Failed to write record for %s.%s _id=%v: %v", sourceDB, sourceCollection, documentID, writeErr)
 	}
 
 	atomic.AddInt64(&w.count, 1)

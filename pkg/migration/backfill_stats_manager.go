@@ -59,6 +59,7 @@ type BackfillStatsManager struct {
 
 	// Write Throttler (optional reference for stats reporting)
 	throttler *WriteThrottler
+	dlq       DLQ
 }
 
 // NewBackfillStatsManager creates a new BackfillStatsManager
@@ -71,6 +72,16 @@ func NewBackfillStatsManager(log *logger.Logger, interval time.Duration, incStat
 		lastStatsTime: now,
 		incStats:      incStats,
 	}
+}
+
+// SetDLQ sets the DLQ reference for monitoring.
+func (sm *BackfillStatsManager) SetDLQ(dlq DLQ) {
+	if sm == nil {
+		return
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.dlq = dlq
 }
 
 // SetThrottler sets the write throttler reference for metrics reporting.
@@ -430,6 +441,17 @@ func (sm *BackfillStatsManager) ReportStats(isFinal bool) {
 	)
 
 	sm.log.Info(msg)
+
+	sm.mu.Lock()
+	dlq := sm.dlq
+	sm.mu.Unlock()
+
+	if dlq != nil {
+		count := dlq.Count()
+		if count > 100 {
+			sm.log.Warnf("DLQ WARNING: The Dead Letter Queue contains %d failed documents! Please check the DLQ file.", count)
+		}
+	}
 }
 
 func formatMs(ms int) string {

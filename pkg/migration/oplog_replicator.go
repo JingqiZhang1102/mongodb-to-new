@@ -377,6 +377,13 @@ func (r *OplogReplicator) tailOplog(ctx context.Context, afterTimestamp primitiv
 				} else {
 					r.log.Info("Oplog replication statistics: No events processed since last report")
 				}
+
+				if r.dlq != nil {
+					count := r.dlq.Count()
+					if count > 100 {
+						r.log.Warnf("DLQ WARNING: The Dead Letter Queue contains %d failed documents! Please check the DLQ file.", count)
+					}
+				}
 			case <-ctx.Done():
 				return
 			}

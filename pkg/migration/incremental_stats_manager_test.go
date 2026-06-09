@@ -1,8 +1,10 @@
 package migration
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -664,5 +666,45 @@ func TestIncrementalStatsManagerDryRunLag(t *testing.T) {
 		}
 	}
 }
+
+type mockDLQ struct {
+	count int64
+}
+
+func (m *mockDLQ) WriteFailed(sourceDB, sourceCollection string, documentID interface{}, err error, phase, opType string, document interface{}, eventTime time.Time) {}
+func (m *mockDLQ) Count() int64 { return atomic.LoadInt64(&m.count) }
+func (m *mockDLQ) Close() {}
+
+func TestIncrementalStatsManagerDLQWarning(t *testing.T) {
+	log := logger.New()
+	var logBuf bytes.Buffer
+	log.Logger.SetOutput(&logBuf)
+
+	sm := NewIncrementalStatsManager(log, 5*time.Minute)
+
+	// 1. DLQ is nil -> no warning
+	sm.ReportStats()
+	if strings.Contains(logBuf.String(), "DLQ WARNING") {
+		t.Errorf("did not expect DLQ WARNING with nil DLQ, got log: %s", logBuf.String())
+	}
+	logBuf.Reset()
+
+	// 2. DLQ count <= 100 -> no warning
+	mock := &mockDLQ{count: 100}
+	sm.SetDLQ(mock)
+	sm.ReportStats()
+	if strings.Contains(logBuf.String(), "DLQ WARNING") {
+		t.Errorf("did not expect DLQ WARNING with count 100, got log: %s", logBuf.String())
+	}
+	logBuf.Reset()
+
+	// 3. DLQ count > 100 -> warning
+	atomic.StoreInt64(&mock.count, 101)
+	sm.ReportStats()
+	if !strings.Contains(logBuf.String(), "DLQ WARNING") {
+		t.Errorf("expected DLQ WARNING with count 101, got log: %s", logBuf.String())
+	}
+}
+
 
 
