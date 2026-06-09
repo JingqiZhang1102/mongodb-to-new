@@ -15,7 +15,6 @@
     }
   ],
   "saveThreshold": 1000,
-  "checkpointInterval": 5,
   "forceOrderedOperations": false,
   "flushIntervalMs": 500,
   

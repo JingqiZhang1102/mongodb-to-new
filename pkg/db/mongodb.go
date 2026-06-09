@@ -162,8 +162,12 @@ func (m *MongoDB) CreateChangeStream(ctx context.Context, collectionName string,
 	return changeStream, nil
 }
 
-// CreateClientLevelChangeStream creates a change stream at the client level
-// This watches for changes across all collections in all databases.
+// CreateClientLevelChangeStream creates a change stream at the database level.
+// This watches for changes across all collections in the configured database.
+// Note: Previously this used client.Watch() which targets the admin database internally,
+// but Firestore's MongoDB-compatible API does not support the admin database. Using
+// database.Watch() avoids this issue while providing identical change event structure
+// (each event still includes the full ns.db and ns.coll fields).
 // It accepts both a resumeToken and a cdcStartTime:
 // - If resumeToken is provided, it takes precedence and instructs the driver to resume from a specific checkpoint.
 // - If resumeToken is nil but cdcStartTime is specified, it configures SetStartAtOperationTime to begin reading changes from that exact historical moment.
@@ -189,13 +193,13 @@ func (m *MongoDB) CreateClientLevelChangeStream(ctx context.Context, resumeToken
 		m.log.Infof("Setting change stream batch size to %d", batchSize)
 	}
 
-	// Create client-level change stream
-	changeStream, err := m.client.Watch(ctx, pipeline, opts)
+	// Create database-level change stream (watches all collections in the configured database)
+	changeStream, err := m.database.Watch(ctx, pipeline, opts)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create client-level change stream: %w", err)
+		return nil, fmt.Errorf("failed to create change stream for database '%s': %w", m.database.Name(), err)
 	}
 
-	m.log.Info("Created client-level change stream watching all databases and collections")
+	m.log.Infof("Created database-level change stream watching all collections in database '%s'", m.database.Name())
 	return changeStream, nil
 }
 
