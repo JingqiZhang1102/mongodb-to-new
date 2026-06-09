@@ -529,8 +529,8 @@ type statsTrackingDLQ struct {
 	incrementalStatsManager  *IncrementalStatsManager
 }
 
-func (s *statsTrackingDLQ) WriteFailed(sourceDB, sourceCollection string, documentID interface{}, err error, phase, opType string, document interface{}) {
-	s.underlyingDlq.WriteFailed(sourceDB, sourceCollection, documentID, err, phase, opType, document)
+func (s *statsTrackingDLQ) WriteFailed(sourceDB, sourceCollection string, documentID interface{}, err error, phase, opType string, document interface{}, eventTime time.Time) {
+	s.underlyingDlq.WriteFailed(sourceDB, sourceCollection, documentID, err, phase, opType, document, eventTime)
 	// Incremented in incrementalStatsManager.RecordLags to prevent double counting and maintain context
 }
 
@@ -1294,7 +1294,7 @@ func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection 
 
 func (w *Worker) markDLQ(op *WriteOperation, dbName, collName string, err error) {
 	if w.dlq != nil {
-		w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", op.OpType, op.Document)
+		w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", op.OpType, op.Document, op.EventTime)
 	}
 	op.DLQed = true
 	op.Error = err

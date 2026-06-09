@@ -1442,7 +1442,7 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 			m.log.Errorf("Field name transformation failed for batch in %s.%s: %v", sourceDB, sourceCollection, err)
 			for _, doc := range batch {
 				docID := extractDocID(doc)
-				opts.DLQ.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
+				opts.DLQ.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc, time.Time{})
 			}
 			writeDuration := time.Since(writeStart)
 			if opts.BackfillStatsManager != nil {
@@ -1519,12 +1519,12 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 							m.log.Errorf("[%s.%s] Retry upsert failed for document _id=%v: %v", sourceDB, sourceCollection, id, err)
 							batchFailed++
 							dlqCount++
-							opts.DLQ.WriteFailed(sourceDB, sourceCollection, id, err, "initial", "insert", originalBatch[writeErr.Index])
+							opts.DLQ.WriteFailed(sourceDB, sourceCollection, id, err, "initial", "insert", originalBatch[writeErr.Index], time.Time{})
 						}
 					} else {
 						batchFailed++
 						dlqCount++
-						opts.DLQ.WriteFailed(sourceDB, sourceCollection, nil, fmt.Errorf("missing _id"), "initial", "insert", originalBatch[writeErr.Index])
+						opts.DLQ.WriteFailed(sourceDB, sourceCollection, nil, fmt.Errorf("missing _id"), "initial", "insert", originalBatch[writeErr.Index], time.Time{})
 					}
 				}
 			}
@@ -1588,7 +1588,7 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 							batchFailed++
 							dlqCount++
 							if opts.DLQ != nil {
-								opts.DLQ.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", originalBatch[idx])
+								opts.DLQ.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", originalBatch[idx], time.Time{})
 							}
 						}
 					}

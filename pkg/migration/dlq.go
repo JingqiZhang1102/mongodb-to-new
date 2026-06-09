@@ -23,6 +23,7 @@ type DLQRecord struct {
 	Phase            string      `bson:"phase" json:"phase"`   // "initial" or "incremental"
 	OpType           string      `bson:"opType" json:"opType"` // "insert", "update", "replace", "delete"
 	Timestamp        string      `bson:"timestamp" json:"timestamp"`
+	EventTime        string      `bson:"eventTime,omitempty" json:"eventTime,omitempty"` // Time when the change event occurred (incremental phase only)
 	Document         interface{} `bson:"document,omitempty" json:"document,omitempty"`
 }
 
@@ -54,9 +55,14 @@ func NewDLQWriter(filePath string, log *logger.Logger) (*DLQWriter, error) {
 
 // WriteFailed appends a failed document record to the DLQ file.
 // This method is safe to call from multiple goroutines.
-func (w *DLQWriter) WriteFailed(sourceDB, sourceCollection string, documentID interface{}, err error, phase, opType string, document interface{}) {
+func (w *DLQWriter) WriteFailed(sourceDB, sourceCollection string, documentID interface{}, err error, phase, opType string, document interface{}, eventTime time.Time) {
 	if err != nil && (errors.Is(err, context.Canceled) || err.Error() == "context canceled" || strings.Contains(err.Error(), "context canceled")) {
 		return
+	}
+
+	var eventTimeStr string
+	if !eventTime.IsZero() {
+		eventTimeStr = eventTime.Format(time.RFC3339)
 	}
 
 	record := DLQRecord{
@@ -67,6 +73,7 @@ func (w *DLQWriter) WriteFailed(sourceDB, sourceCollection string, documentID in
 		Phase:            phase,
 		OpType:           opType,
 		Timestamp:        time.Now().Format(time.RFC3339),
+		EventTime:        eventTimeStr,
 		Document:         document,
 	}
 
@@ -137,7 +144,7 @@ func (w *DLQWriter) Close() {
 type NopDLQWriter struct{}
 
 // WriteFailed is a no-op for NopDLQWriter.
-func (w *NopDLQWriter) WriteFailed(sourceDB, sourceCollection string, documentID interface{}, err error, phase, opType string, document interface{}) {
+func (w *NopDLQWriter) WriteFailed(sourceDB, sourceCollection string, documentID interface{}, err error, phase, opType string, document interface{}, eventTime time.Time) {
 }
 
 // Count always returns 0 for NopDLQWriter.
@@ -148,7 +155,7 @@ func (w *NopDLQWriter) Close() {}
 
 // DLQ is the interface that both DLQWriter and NopDLQWriter implement.
 type DLQ interface {
-	WriteFailed(sourceDB, sourceCollection string, documentID interface{}, err error, phase, opType string, document interface{})
+	WriteFailed(sourceDB, sourceCollection string, documentID interface{}, err error, phase, opType string, document interface{}, eventTime time.Time)
 	Count() int64
 	Close()
 }

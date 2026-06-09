@@ -295,7 +295,7 @@ func (r *InitialMigrator) insertBatchWithRetry(ctx context.Context, targetCol *m
 		for _, doc := range batch {
 			docID := extractDocID(doc)
 			if r.dlq != nil {
-				r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
+				r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc, time.Time{})
 			}
 		}
 		return 0
@@ -325,7 +325,7 @@ func (r *InitialMigrator) insertBatchWithRetry(ctx context.Context, targetCol *m
 						}
 						r.log.Errorf("[%s.%s] Upsert error at index %d, _id=%v: %v", sourceDB, sourceCollection, writeErr.Index, errDocID, writeErr.Message)
 						if r.dlq != nil && writeErr.Index < len(batch) {
-							r.dlq.WriteFailed(sourceDB, sourceCollection, errDocID, fmt.Errorf("upsert failed: %s", writeErr.Message), "initial", "insert", batch[writeErr.Index])
+							r.dlq.WriteFailed(sourceDB, sourceCollection, errDocID, fmt.Errorf("upsert failed: %s", writeErr.Message), "initial", "insert", batch[writeErr.Index], time.Time{})
 						}
 					}
 				} else {
@@ -342,7 +342,7 @@ func (r *InitialMigrator) insertBatchWithRetry(ctx context.Context, targetCol *m
 								if err != context.Canceled {
 									r.log.Errorf("Error fallback upserting document %v in %s.%s: %v", docID, sourceDB, sourceCollection, err)
 									if r.dlq != nil {
-										r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
+										r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc, time.Time{})
 									}
 								}
 							} else {
@@ -379,7 +379,7 @@ func (r *InitialMigrator) insertBatchWithRetry(ctx context.Context, targetCol *m
 								r.log.Debugf("Upsert fallback failed for document %v in %s.%s: %v",
 									docID, sourceDB, sourceCollection, err)
 								if r.dlq != nil {
-									r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
+									r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc, time.Time{})
 								}
 							} else {
 								r.log.Debugf("Successfully upserted document %v in %s.%s after duplicate key error",
@@ -398,7 +398,7 @@ func (r *InitialMigrator) insertBatchWithRetry(ctx context.Context, targetCol *m
 							r.log.Errorf("[%s.%s] Retry insert failed for document _id=%v: %v",
 								sourceDB, sourceCollection, retryDocID, err)
 							if r.dlq != nil {
-								r.dlq.WriteFailed(sourceDB, sourceCollection, retryDocID, err, "initial", "insert", batch[writeErr.Index])
+								r.dlq.WriteFailed(sourceDB, sourceCollection, retryDocID, err, "initial", "insert", batch[writeErr.Index], time.Time{})
 							}
 						} else {
 							successCount++
@@ -446,7 +446,7 @@ func (r *InitialMigrator) insertBatchWithRetry(ctx context.Context, targetCol *m
 									r.log.Errorf("Error upserting document %v in %s.%s: %v",
 										docID, sourceDB, sourceCollection, err)
 									if r.dlq != nil {
-										r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
+										r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc, time.Time{})
 									}
 								}
 							} else {

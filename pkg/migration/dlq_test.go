@@ -44,8 +44,8 @@ func TestDLQWriterIncrementsCountOnWrite(t *testing.T) {
 	}
 	defer writer.Close()
 
-	writer.WriteFailed("source_db", "col_1", "doc_id_123", errors.New("timeout"), "initial", "insert", nil)
-	writer.WriteFailed("source_db", "col_1", "doc_id_456", errors.New("dup key"), "incremental", "replace", nil)
+	writer.WriteFailed("source_db", "col_1", "doc_id_123", errors.New("timeout"), "initial", "insert", nil, time.Time{})
+	writer.WriteFailed("source_db", "col_1", "doc_id_456", errors.New("dup key"), "incremental", "replace", nil, time.Now())
 
 	if writer.Count() != 2 {
 		t.Errorf("expected count to be 2, got %d", writer.Count())
@@ -62,11 +62,12 @@ func TestDLQWriterWritesJSONLRecordsToDisk(t *testing.T) {
 		t.Fatalf("failed to create DLQWriter: %v", err)
 	}
 
+	testTime := time.Date(2026, 5, 20, 21, 0, 0, 0, time.UTC)
 	err1 := errors.New("connection timed out")
-	writer.WriteFailed("source_db", "col_1", "doc_id_123", err1, "initial", "insert", map[string]interface{}{"name": "value"})
+	writer.WriteFailed("source_db", "col_1", "doc_id_123", err1, "initial", "insert", map[string]interface{}{"name": "value"}, time.Time{})
 
 	err2 := errors.New("duplicate key error")
-	writer.WriteFailed("source_db", "col_1", "doc_id_456", err2, "incremental", "replace", map[string]interface{}{"name": "value2"})
+	writer.WriteFailed("source_db", "col_1", "doc_id_456", err2, "incremental", "replace", map[string]interface{}{"name": "value2"}, testTime)
 
 	writer.Close()
 
@@ -108,6 +109,9 @@ func TestDLQWriterWritesJSONLRecordsToDisk(t *testing.T) {
 	if r2.Error != "duplicate key error" || r2.Phase != "incremental" || r2.OpType != "replace" {
 		t.Errorf("invalid record 2 error/phase: %+v", r2)
 	}
+	if r2.EventTime != testTime.Format(time.RFC3339) {
+		t.Errorf("expected EventTime %s, got %s", testTime.Format(time.RFC3339), r2.EventTime)
+	}
 }
 
 func TestDLQWriterConcurrency(t *testing.T) {
@@ -138,6 +142,7 @@ func TestDLQWriterConcurrency(t *testing.T) {
 					"initial",
 					"insert",
 					nil,
+					time.Time{},
 				)
 			}
 		}(i)
@@ -153,7 +158,7 @@ func TestDLQWriterConcurrency(t *testing.T) {
 
 func TestNopDLQWriter(t *testing.T) {
 	nop := &NopDLQWriter{}
-	nop.WriteFailed("db", "col", "id", errors.New("test"), "initial", "insert", nil)
+	nop.WriteFailed("db", "col", "id", errors.New("test"), "initial", "insert", nil, time.Time{})
 
 	if nop.Count() != 0 {
 		t.Errorf("expected NopDLQWriter count to always be 0")
@@ -186,7 +191,7 @@ func TestDLQWriterWriteFailedAfterClose(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			// Should log error but NOT panic!
-			writer.WriteFailed("db", "col", id, errors.New("write after close"), "incremental", "insert", nil)
+			writer.WriteFailed("db", "col", id, errors.New("write after close"), "incremental", "insert", nil, time.Time{})
 		}(i)
 	}
 	wg.Wait()
@@ -205,14 +210,14 @@ func TestDLQWriterFiltersContextCanceled(t *testing.T) {
 	defer writer.Close()
 
 	// 1. Write standard errors (should increment count)
-	writer.WriteFailed("db", "col", "id1", errors.New("some standard error"), "initial", "insert", nil)
+	writer.WriteFailed("db", "col", "id1", errors.New("some standard error"), "initial", "insert", nil, time.Time{})
 
 	// 2. Write context.Canceled error (should be ignored)
-	writer.WriteFailed("db", "col", "id2", context.Canceled, "initial", "insert", nil)
+	writer.WriteFailed("db", "col", "id2", context.Canceled, "initial", "insert", nil, time.Time{})
 
 	// 3. Write custom string error containing "context canceled" (should be ignored)
-	writer.WriteFailed("db", "col", "id3", errors.New("context canceled"), "initial", "insert", nil)
-	writer.WriteFailed("db", "col", "id4", errors.New("wrapped error: context canceled"), "initial", "insert", nil)
+	writer.WriteFailed("db", "col", "id3", errors.New("context canceled"), "initial", "insert", nil, time.Time{})
+	writer.WriteFailed("db", "col", "id4", errors.New("wrapped error: context canceled"), "initial", "insert", nil, time.Time{})
 
 	if writer.Count() != 1 {
 		t.Errorf("expected count to be 1, got %d", writer.Count())
@@ -268,7 +273,7 @@ func TestDLQWriterBSONTypesExtendedJSON(t *testing.T) {
 	}
 
 	// This should NOT fail to marshal, and should successfully write to disk
-	writer.WriteFailed("test_db", "test_coll", docID, errors.New("bson validation error"), "initial", "insert", doc)
+	writer.WriteFailed("test_db", "test_coll", docID, errors.New("bson validation error"), "initial", "insert", doc, testTime)
 	writer.Close()
 
 	// Read and verify EJSON contents
@@ -297,6 +302,10 @@ func TestDLQWriterBSONTypesExtendedJSON(t *testing.T) {
 	parsedDocID, ok := record["documentID"].(primitive.ObjectID)
 	if !ok || parsedDocID != docID {
 		t.Errorf("expected documentID to be ObjectID %v, got %v (type: %T)", docID, record["documentID"], record["documentID"])
+	}
+	parsedEventTime, ok := record["eventTime"].(string)
+	if !ok || parsedEventTime != testTime.Format(time.RFC3339) {
+		t.Errorf("expected eventTime %s, got %v (type: %T)", testTime.Format(time.RFC3339), record["eventTime"], record["eventTime"])
 	}
 
 	// Verify parsed bson document types
