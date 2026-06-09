@@ -2,7 +2,6 @@ package migration
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,18 +11,19 @@ import (
 	"time"
 
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
+	"go.mongodb.org/mongo-driver/bson"
 )
 
 // DLQRecord represents a single failed document record in the Dead Letter Queue
 type DLQRecord struct {
-	SourceDB         string      `json:"sourceDB"`
-	SourceCollection string      `json:"sourceCollection"`
-	DocumentID       interface{} `json:"documentID"`
-	Error            string      `json:"error"`
-	Phase            string      `json:"phase"`  // "initial" or "incremental"
-	OpType           string      `json:"opType"` // "insert", "update", "replace", "delete"
-	Timestamp        string      `json:"timestamp"`
-	Document         interface{} `json:"document,omitempty"`
+	SourceDB         string      `bson:"sourceDB" json:"sourceDB"`
+	SourceCollection string      `bson:"sourceCollection" json:"sourceCollection"`
+	DocumentID       interface{} `bson:"documentID" json:"documentID"`
+	Error            string      `bson:"error" json:"error"`
+	Phase            string      `bson:"phase" json:"phase"`   // "initial" or "incremental"
+	OpType           string      `bson:"opType" json:"opType"` // "insert", "update", "replace", "delete"
+	Timestamp        string      `bson:"timestamp" json:"timestamp"`
+	Document         interface{} `bson:"document,omitempty" json:"document,omitempty"`
 }
 
 // DLQWriter provides thread-safe writing of failed documents to a JSONL file
@@ -70,7 +70,7 @@ func (w *DLQWriter) WriteFailed(sourceDB, sourceCollection string, documentID in
 		Document:         document,
 	}
 
-	data, marshalErr := json.Marshal(record)
+	data, marshalErr := bson.MarshalExtJSON(record, false, false)
 	if marshalErr != nil {
 		w.log.Errorf("DLQ: Failed to marshal record for %s.%s _id=%v: %v", sourceDB, sourceCollection, documentID, marshalErr)
 		return
