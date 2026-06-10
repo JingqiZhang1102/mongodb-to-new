@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -42,8 +43,8 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 	m.isLive = (mode == "live" || mode == "live-only")
 
 	// Validate mode
-	if mode != "migrate" && mode != "live" && mode != "live-only" {
-		return fmt.Errorf("invalid mode: %s, must be 'migrate', 'live', or 'live-only'", mode)
+	if mode != "migrate" && mode != "live" && mode != "live-only" && mode != "retry-dlq" {
+		return fmt.Errorf("invalid mode: %s, must be 'migrate', 'live', 'live-only', or 'retry-dlq'", mode)
 	}
 
 
@@ -56,7 +57,7 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 		}
 	}
 
-	if mode == "migrate" {
+	if mode == "migrate" || mode == "retry-dlq" {
 		// Migrate mode: process each database pair sequentially
 		for i, pair := range m.config.DatabasePairs {
 			m.log.Infof("Processing database pair %d/%d", i+1, len(m.config.DatabasePairs))
@@ -68,7 +69,11 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 				m.log.Errorf("Error processing database pair %d: %v", i+1, err)
 			}
 		}
-		m.log.Info("Migration completed successfully")
+		if mode == "retry-dlq" {
+			m.log.Info("DLQ reprocessing completed successfully")
+		} else {
+			m.log.Info("Migration completed successfully")
+		}
 		return nil
 	}
 
@@ -147,6 +152,10 @@ func (m *Migrator) getInitialMigrationStatePath(pairIndex int) string {
 
 // processDatabasePair processes a single database pair
 func (m *Migrator) processDatabasePair(ctx context.Context, pair config.DatabasePair, pairIndex int, mode string) error {
+	if mode == "retry-dlq" {
+		return m.reprocessDLQ(ctx, pair, pairIndex)
+	}
+
 	liveOnly := mode == "live-only"
 
 	// Initialize shared stats tracking for this database pair
@@ -366,8 +375,23 @@ func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, t
 		return fmt.Errorf("failed to load initial migration state: %w", err)
 	}
 
-	// Create DLQ writer for this database pair
+	// Strict DLQ safety checks based on initial migration state
 	dlqPath := m.getDLQPath(pairIndex)
+	if initialMigrationState == nil || !initialMigrationState.IsCompleted() {
+		hasFailed, err := HasActiveFailedRecords(dlqPath)
+		if err != nil {
+			return fmt.Errorf("failed to check DLQ status: %w", err)
+		}
+		if hasFailed {
+			return fmt.Errorf("DLQ safety violation: active failures found in dead letter queue %s. Please reprocess these failures (using DLQ retry) or clear the queue before running the initial migration.", dlqPath)
+		}
+	} else {
+		if initialMigrationState.Status == StatusCompletedWithFailures {
+			return fmt.Errorf("cannot start incremental replication: initial migration completed with failures in a previous run. Please reprocess the failures using DLQ retry first")
+		}
+	}
+
+	// Create DLQ writer for this database pair
 	dlq, err := NewDLQWriter(dlqPath, m.log)
 	if err != nil {
 		m.log.Warnf("Failed to create DLQ writer at %s: %v (continuing without DLQ)", dlqPath, err)
@@ -426,8 +450,23 @@ func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB
 		globalTimestamp = oplogTimestamp
 	}
 
-	// Create DLQ writer for this database pair
+	// Strict DLQ safety checks based on initial migration state
 	dlqPath := m.getDLQPath(pairIndex)
+	if initialMigrationState == nil || !initialMigrationState.IsCompleted() {
+		hasFailed, err := HasActiveFailedRecords(dlqPath)
+		if err != nil {
+			return fmt.Errorf("failed to check DLQ status: %w", err)
+		}
+		if hasFailed {
+			return fmt.Errorf("DLQ safety violation: active failures found in dead letter queue %s. Please reprocess these failures (using DLQ retry) or clear the queue before running the initial migration.", dlqPath)
+		}
+	} else {
+		if initialMigrationState.Status == StatusCompletedWithFailures {
+			return fmt.Errorf("cannot start incremental replication: initial migration completed with failures in a previous run. Please reprocess the failures using DLQ retry first")
+		}
+	}
+
+	// Create DLQ writer for this database pair
 	dlq, err := NewDLQWriter(dlqPath, m.log)
 	if err != nil {
 		m.log.Warnf("Failed to create DLQ writer at %s: %v (continuing without DLQ)", dlqPath, err)
@@ -499,8 +538,23 @@ func (m *Migrator) startOplogReplicationLegacy(ctx context.Context, sourceDBName
 		globalTimestamp = oplogTimestamp
 	}
 
-	// Create DLQ writer for this database pair
+	// Strict DLQ safety checks based on initial migration state
 	dlqPath := m.getDLQPath(pairIndex)
+	if initialMigrationState == nil || !initialMigrationState.IsCompleted() {
+		hasFailed, err := HasActiveFailedRecords(dlqPath)
+		if err != nil {
+			return fmt.Errorf("failed to check DLQ status: %w", err)
+		}
+		if hasFailed {
+			return fmt.Errorf("DLQ safety violation: active failures found in dead letter queue %s. Please reprocess these failures (using DLQ retry) or clear the queue before running the initial migration.", dlqPath)
+		}
+	} else {
+		if initialMigrationState.Status == StatusCompletedWithFailures {
+			return fmt.Errorf("cannot start incremental replication: initial migration completed with failures in a previous run. Please reprocess the failures using DLQ retry first")
+		}
+	}
+
+	// Create DLQ writer for this database pair
 	dlq, err := NewDLQWriter(dlqPath, m.log)
 	if err != nil {
 		m.log.Warnf("Failed to create DLQ writer at %s: %v (continuing without DLQ)", dlqPath, err)
@@ -1642,3 +1696,257 @@ func (m *Migrator) executeWithRetry(ctx context.Context, retryManager *RetryMana
 	return err
 }
 
+// TargetCollection defines the minimal DB operations interface required for DLQ reprocessing,
+// allowing it to be mocked in unit tests.
+type TargetCollection interface {
+	ReplaceOne(ctx context.Context, filter interface{}, replacement interface{}, opts ...*options.ReplaceOptions) (*mongo.UpdateResult, error)
+	DeleteOne(ctx context.Context, filter interface{}, opts ...*options.DeleteOptions) (*mongo.DeleteResult, error)
+}
+
+// reprocessDLQ reads the DLQ file for a database pair, re-applies failures, and writes new failures to a new DLQ.
+func (m *Migrator) reprocessDLQ(ctx context.Context, pair config.DatabasePair, pairIndex int) (runErr error) {
+	dlqPath := m.getDLQPath(pairIndex)
+	tempPath := dlqPath + ".retry-temp"
+
+	// Recover leftover temporary file from a crashed previous run if it exists.
+	// Discards any active partial file and restores the original temp file.
+	if err := m.restoreLeftoverTempDLQ(dlqPath, tempPath); err != nil {
+		return fmt.Errorf("failed to restore leftover temp DLQ file: %w", err)
+	}
+
+	m.log.Infof("Starting DLQ reprocessing for pair %d using file: %s", pairIndex, dlqPath)
+
+	// Check if the DLQ file exists
+	if _, err := os.Stat(dlqPath); os.IsNotExist(err) {
+		m.log.Infof("No DLQ file found at %s. Skipping retry.", dlqPath)
+		return nil
+	}
+
+	// Rename the DLQ file so we can read it while opening a new clean DLQ file for new failures
+	if err := os.Rename(dlqPath, tempPath); err != nil {
+		return fmt.Errorf("failed to rename DLQ file for reprocessing: %w", err)
+	}
+	defer func() {
+		if runErr == nil {
+			_ = os.Remove(tempPath)
+		} else {
+			m.log.Warnf("DLQ retry failed: %v. Restoring original DLQ file to preserve integrity.", runErr)
+			_ = os.Remove(dlqPath) // Discard incomplete active retry file
+			if restoreErr := os.Rename(tempPath, dlqPath); restoreErr != nil {
+				m.log.Errorf("DLQ recovery: Failed to restore leftover temp DLQ file: %v", restoreErr)
+			}
+		}
+	}()
+
+	targetDB, err := db.NewMongoDB(pair.Target.ConnectionString, pair.Target.Database, 1, 10, 0, nil, m.log)
+	if err != nil {
+		return fmt.Errorf("failed to connect to target MongoDB: %w", err)
+	}
+	defer func() {
+		if err := targetDB.Close(ctx); err != nil {
+			m.log.Errorf("Error closing target DB: %v", err)
+		}
+	}()
+
+	// Open new DLQ writer for any failures that occur during retry
+	newDLQ, err := NewDLQWriter(dlqPath, m.log)
+	if err != nil {
+		return fmt.Errorf("failed to create new DLQ writer: %w", err)
+	}
+	defer newDLQ.Close()
+
+	getCollection := func(collectionName string) TargetCollection {
+		return targetDB.GetCollection(collectionName)
+	}
+
+	phase, failedCount, err := m.reprocessDLQLoop(ctx, tempPath, newDLQ, getCollection)
+	if err != nil {
+		runErr = err
+		return runErr
+	}
+
+	// Sync initial migration state if we successfully completed reprocessing for the initial phase
+	if phase == "initial" {
+		statePath := m.getInitialMigrationStatePath(pairIndex)
+		if failedCount == 0 {
+			m.log.Infof("DLQ retry: Initial migration completed successfully. Updating state file to StatusCompleted.")
+			if stateErr := SaveInitialMigrationState(statePath, StatusCompleted, 0); stateErr != nil {
+				m.log.Errorf("Failed to update initial migration state: %v", stateErr)
+			}
+		} else {
+			m.log.Warnf("DLQ retry: Initial migration completed with %d remaining failures. Updating state file.", failedCount)
+			if stateErr := SaveInitialMigrationState(statePath, StatusCompletedWithFailures, failedCount); stateErr != nil {
+				m.log.Errorf("Failed to update initial migration state: %v", stateErr)
+			}
+		}
+	}
+
+	return nil
+}
+
+// reprocessDLQLoop processes records inside the DLQ temp file, writing them back to target using the getCollection helper.
+// It performs a chronological scan to de-duplicate updates and ignore resolved records, ensuring zero stale write overwrites.
+func (m *Migrator) reprocessDLQLoop(ctx context.Context, tempPath string, newDLQ *DLQWriter, getCollection func(string) TargetCollection) (phase string, failedCount int64, runErr error) {
+	file, err := os.Open(tempPath)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to open temp DLQ file: %w", err)
+	}
+	defer file.Close()
+
+	// Read all lines into memory first to facilitate chronological scan and EOF analysis
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", 0, fmt.Errorf("error reading temp DLQ file: %w", err)
+	}
+
+	convertInvalidIds := true
+	if m.config != nil {
+		convertInvalidIds = m.config.RetryConfig.ConvertInvalidIds
+	}
+	transformer := NewFieldTransformer(
+		m.config.DropEmptyFieldNames,
+		m.config.ConvertLongFieldNamesInNestedDocs,
+		convertInvalidIds,
+		m.log,
+	)
+
+	type activeFailure struct {
+		record  DLQRecord
+		rawLine string
+	}
+	failuresMap := make(map[string]*activeFailure)
+	var expectedPhase string
+
+	// Pass 1: Chronological Scan & De-duplication
+	for i, line := range lines {
+		if i == 0 {
+			var header struct {
+				DLQVersion string `bson:"dlqVersion"`
+			}
+			if err := bson.UnmarshalExtJSON([]byte(line), false, &header); err == nil && header.DLQVersion != "" {
+				if header.DLQVersion != DLQVersion {
+					runErr = fmt.Errorf("DLQ retry: Safety violation: encountered unsupported DLQ version %q (expected %q). Please use the correct migration tool version to reprocess this file.", header.DLQVersion, DLQVersion)
+					return "", 0, runErr
+				}
+				continue // skip version header line
+			}
+		}
+
+		var record DLQRecord
+		if err := bson.UnmarshalExtJSON([]byte(line), false, &record); err != nil {
+			// Gracefully skip corrupted lines at the very end of the file (survive partial write crashes)
+			if i == len(lines)-1 {
+				m.log.Warnf("DLQ retry: Skipping corrupted line at EOF (probable mid-write crash fragment): %v. Line: %s", err, line)
+				continue
+			}
+			// Middle-file corruption represents a safety violation; abort replay immediately
+			runErr = fmt.Errorf("DLQ retry: Failed to unmarshal record: %w. Line: %s", err, line)
+			return "", 0, runErr
+		}
+
+		// Enforce single-phase validation
+		if expectedPhase == "" {
+			expectedPhase = record.Phase
+			m.log.Infof("DLQ retry: Set expected phase to %q based on first record", expectedPhase)
+		} else if record.Phase != expectedPhase {
+			runErr = fmt.Errorf("DLQ retry: Safety violation: encountered mixed phases in DLQ file (expected %q, got %q). Reprocessing aborted.", expectedPhase, record.Phase)
+			return "", 0, runErr
+		}
+
+		// Unique key per document identity
+		if record.ResolvedID != nil {
+			uniqueKey := MakeDLQKey(record.SourceDB, record.SourceCollection, record.ResolvedID)
+			delete(failuresMap, uniqueKey)
+		} else {
+			uniqueKey := MakeDLQKey(record.SourceDB, record.SourceCollection, record.DocumentID)
+			failuresMap[uniqueKey] = &activeFailure{
+				record:  record,
+				rawLine: line,
+			}
+		}
+	}
+
+	var processed, succeeded, failed int64
+
+	// Pass 2: Execute Replays
+	for _, f := range failuresMap {
+		if ctx.Err() != nil {
+			runErr = ctx.Err()
+			return "", 0, runErr
+		}
+
+		processed++
+		record := f.record
+
+		m.log.Debugf("Retrying document [db=%s, collection=%s, id=%v, op=%s]",
+			record.SourceDB, record.SourceCollection, record.DocumentID, record.OpType)
+
+		targetColl := getCollection(record.SourceCollection)
+		var writeErr error
+
+		if record.OpType == "delete" {
+			_, writeErr = targetColl.DeleteOne(ctx, bson.M{"_id": record.DocumentID})
+		} else { // insert, update, replace, mixed
+			var docToReplace interface{} = record.Document
+			if record.Document != nil {
+				transformed, err := transformer.Transform(record.Document, record.SourceDB, record.SourceCollection, record.DocumentID)
+				if err != nil {
+					m.log.Errorf("DLQ retry: Failed to transform document %v: %v", record.DocumentID, err)
+					failed++
+					newDLQ.WriteFailed(record.SourceDB, record.SourceCollection, record.DocumentID, err, record.Phase, record.OpType, record.Document, time.Time{})
+					continue
+				}
+				docToReplace = transformed
+			}
+			opts := options.Replace().SetUpsert(true)
+			_, writeErr = targetColl.ReplaceOne(ctx, bson.M{"_id": record.DocumentID}, docToReplace, opts)
+		}
+
+		if writeErr != nil {
+			m.log.Errorf("DLQ retry: Failed to write document %v to target: %v", record.DocumentID, writeErr)
+			failed++
+			var eventTime time.Time
+			if record.EventTime != "" {
+				if t, err := time.Parse(time.RFC3339, record.EventTime); err == nil {
+					eventTime = t
+				}
+			}
+			newDLQ.WriteFailed(record.SourceDB, record.SourceCollection, record.DocumentID, writeErr, record.Phase, record.OpType, record.Document, eventTime)
+		} else {
+			m.log.Infof("DLQ retry: Successfully recovered document %v", record.DocumentID)
+			succeeded++
+		}
+	}
+
+	m.log.Infof("DLQ reprocessing complete: processed %d, succeeded %d, failed %d", processed, succeeded, failed)
+	return expectedPhase, failed, nil
+}
+
+// restoreLeftoverTempDLQ checks if a temporary DLQ retry file exists from a crashed run.
+// If both active and temp files exist, it renames the temp file back to the active file.
+// If only the temp file exists, it renames it to the active file.
+func (m *Migrator) restoreLeftoverTempDLQ(dlqPath, tempPath string) error {
+	// If temp file does not exist, nothing to restore
+	if _, err := os.Stat(tempPath); os.IsNotExist(err) {
+		return nil
+	}
+
+	// If active file does not exist, we can safely rename the temp file to active file
+	if _, err := os.Stat(dlqPath); os.IsNotExist(err) {
+		m.log.Warnf("DLQ recovery: Leftover retry-temp file found from previous crashed run. Restoring to %s.", dlqPath)
+		return os.Rename(tempPath, dlqPath)
+	}
+
+	// Both files exist! Since we are doing "discard and restore" crash safety:
+	// We discard the incomplete active file (from the crashed run) and restore the temp file as active.
+	m.log.Warnf("DLQ recovery: Leftover retry-temp file and incomplete active file found. Discarding active file and restoring %s to %s.", tempPath, dlqPath)
+	_ = os.Remove(dlqPath)
+	return os.Rename(tempPath, dlqPath)
+}

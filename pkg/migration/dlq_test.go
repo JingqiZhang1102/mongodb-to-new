@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -81,6 +82,9 @@ func TestDLQWriterWritesJSONLRecordsToDisk(t *testing.T) {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
+		if strings.Contains(line, "dlqVersion") {
+			continue
+		}
 		var record DLQRecord
 		if err := json.Unmarshal([]byte(line), &record); err != nil {
 			t.Fatalf("failed to parse DLQ line: %v", err)
@@ -284,10 +288,18 @@ func TestDLQWriterBSONTypesExtendedJSON(t *testing.T) {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
-	if !scanner.Scan() {
+	var line []byte
+	for scanner.Scan() {
+		l := scanner.Bytes()
+		if strings.Contains(string(l), "dlqVersion") {
+			continue
+		}
+		line = l
+		break
+	}
+	if len(line) == 0 {
 		t.Fatal("expected at least 1 record in DLQ, got 0")
 	}
-	line := scanner.Bytes()
 
 	// Unmarshal line back using BSON Extended JSON parser to verify zero loss
 	var record bson.M
@@ -437,5 +449,71 @@ func TestDLQWriterBSONTypesExtendedJSON(t *testing.T) {
 	parsedInf, ok := rawDoc["inf_field"].(float64)
 	if !ok || !math.IsInf(parsedInf, 1) {
 		t.Errorf("expected +Inf float, got %v (type: %T)", rawDoc["inf_field"], rawDoc["inf_field"])
+	}
+}
+
+func TestHasActiveFailedRecords(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "test_dlq.jsonl")
+
+	// 1. File does not exist
+	hasRecords, err := HasActiveFailedRecords(filePath)
+	if err != nil {
+		t.Fatalf("unexpected error checking non-existent file: %v", err)
+	}
+	if hasRecords {
+		t.Errorf("expected false for non-existent file")
+	}
+
+	// 2. File exists but is empty
+	err = os.WriteFile(filePath, []byte(""), 0644)
+	if err != nil {
+		t.Fatalf("failed to create empty file: %v", err)
+	}
+	hasRecords, err = HasActiveFailedRecords(filePath)
+	if err != nil {
+		t.Fatalf("unexpected error checking empty file: %v", err)
+	}
+	if hasRecords {
+		t.Errorf("expected false for empty file")
+	}
+
+	// 3. File contains only version header
+	err = os.WriteFile(filePath, []byte("{\"dlqVersion\":\"v1\"}\n"), 0644)
+	if err != nil {
+		t.Fatalf("failed to write version header: %v", err)
+	}
+	hasRecords, err = HasActiveFailedRecords(filePath)
+	if err != nil {
+		t.Fatalf("unexpected error checking header-only file: %v", err)
+	}
+	if hasRecords {
+		t.Errorf("expected false for header-only file")
+	}
+
+	// 4. File contains version header and empty lines
+	err = os.WriteFile(filePath, []byte("{\"dlqVersion\":\"v1\"}\n\n  \n"), 0644)
+	if err != nil {
+		t.Fatalf("failed to write header and empty lines: %v", err)
+	}
+	hasRecords, err = HasActiveFailedRecords(filePath)
+	if err != nil {
+		t.Fatalf("unexpected error checking header and empty lines: %v", err)
+	}
+	if hasRecords {
+		t.Errorf("expected false for header and empty lines")
+	}
+
+	// 5. File contains version header and an actual record
+	err = os.WriteFile(filePath, []byte("{\"dlqVersion\":\"v1\"}\n{\"sourceDB\":\"db\",\"sourceCollection\":\"coll\",\"documentID\":\"id1\"}\n"), 0644)
+	if err != nil {
+		t.Fatalf("failed to write record: %v", err)
+	}
+	hasRecords, err = HasActiveFailedRecords(filePath)
+	if err != nil {
+		t.Fatalf("unexpected error checking non-empty file: %v", err)
+	}
+	if !hasRecords {
+		t.Errorf("expected true for file with record")
 	}
 }

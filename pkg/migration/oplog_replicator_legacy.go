@@ -783,9 +783,27 @@ func (r *OplogReplicatorLegacy) tailOplog(ctx context.Context, afterTimestamp bs
 
 	// Initialize parallel workers
 	r.log.Infof("Starting parallel oplog processing with %d workers", r.config.IncrementalWorkerCount)
+
+	// Pre-populate active failed document IDs from the DLQ file on startup
+	var activeFailedIDs map[string]string
+	var activeFailedMu sync.RWMutex
+	if r.dlq != nil && r.dlq.FilePath() != "" {
+		r.log.Info("DLQ resolution ledger: performing pre-scan startup check...")
+		var scanErr error
+		activeFailedIDs, scanErr = PopulateActiveFailedIDs(r.dlq.FilePath(), r.log)
+		if scanErr != nil {
+			r.log.Warnf("DLQ resolution ledger: failed to pre-scan DLQ file: %v (continuing without resolution logging)", scanErr)
+		} else {
+			r.log.Infof("DLQ resolution ledger: loaded %d active failed IDs on startup", len(activeFailedIDs))
+		}
+	}
+
 	workers := make([]*Worker, r.config.IncrementalWorkerCount)
 	for i := 0; i < r.config.IncrementalWorkerCount; i++ {
 		workers[i] = NewWorker(i, ctx, r.log, r.targetDB, r.collectionConfigs, r.config.IncrementalWriteBatchSize, r.config.ForceOrderedOperations, r.dlq, r.retryManager, nil, r.config.GroupOpsByDistinctId, time.Duration(r.config.FlushIntervalMs)*time.Millisecond, r.config.IncrementalIncomingQueueSize, r.config.IncrementalProcessingQueueSize, r.transformer)
+		if activeFailedIDs != nil {
+			workers[i].SetActiveFailedIDs(activeFailedIDs, &activeFailedMu)
+		}
 	}
 
 	// Set up context cancellation handling for workers

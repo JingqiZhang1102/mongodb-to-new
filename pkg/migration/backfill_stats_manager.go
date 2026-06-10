@@ -34,6 +34,7 @@ type BackfillStatsManager struct {
 	failedCount           int64
 	duplicateKeys         int64
 	dlqCount              int64
+	resolvedCount         int64
 
 	// Bulk write latency
 	totalBulkWriteLatencyNs   int64
@@ -162,6 +163,14 @@ func (sm *BackfillStatsManager) RecordWriteResult(succeeded, failed, duplicates,
 	}
 }
 
+// RecordDLQResolution records document DLQ resolution counts.
+func (sm *BackfillStatsManager) RecordDLQResolution(count int64) {
+	if sm == nil {
+		return
+	}
+	atomic.AddInt64(&sm.resolvedCount, count)
+}
+
 // RecordBulkWrite records bulk write latency.
 func (sm *BackfillStatsManager) RecordBulkWrite(latency time.Duration) {
 	if sm == nil {
@@ -227,6 +236,7 @@ func (sm *BackfillStatsManager) ReportStats(isFinal bool) {
 	failedCount := atomic.SwapInt64(&sm.failedCount, 0)
 	duplicateKeys := atomic.SwapInt64(&sm.duplicateKeys, 0)
 	dlqCount := atomic.SwapInt64(&sm.dlqCount, 0)
+	resolvedCount := atomic.SwapInt64(&sm.resolvedCount, 0)
 	ingestQueueStall := time.Duration(atomic.SwapInt64(&sm.ingestQueueStallNs, 0))
 
 	// Swap bulk write latency and sequential retries metrics
@@ -417,7 +427,7 @@ func (sm *BackfillStatsManager) ReportStats(isFinal bool) {
 		"  - Worker QPS: [Active: %d] [p50: %.2f, p90: %.2f, p99: %.2f, p100: %.2f]\n"+
 		"  - Errors\n"+
 		"      * Duplicate Key Errors: %d (%.2f/sec)\n"+
-		"      * DLQ'ed: %d\n"+
+		"      * DLQ'ed: %d (Resolved: %d)\n"+
 		"  - Read Performance:\n"+
 		"      * Fetch Latency: avg %s (p50: %s, p99: %s, p100: %s)\n"+
 		"      * Document Size: avg %.1f bytes (total %s, rate %s/sec) (p50: %s, p90: %s, p100: %s)\n"+
@@ -433,7 +443,7 @@ func (sm *BackfillStatsManager) ReportStats(isFinal bool) {
 		sequentialRetries, rateSequentialRetries, sequentialRetriesBreakdown,
 		activeWorkers, wQpsP50, wQpsP90, wQpsP99, wQpsP100,
 		duplicateKeys, rateDuplicates,
-		dlqCount,
+		dlqCount, resolvedCount,
 		avgReadLatency.Round(time.Microsecond), p50Read, p99Read, p100Read,
 		avgReadSize, formatBytes(totalReadSizeBytes), formatBytes(int64(rateBytesRead)), p50Size, p90Size, p100Size,
 		backpressureStr,

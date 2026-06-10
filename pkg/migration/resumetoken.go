@@ -221,7 +221,7 @@ func SaveResumeToken(filePath string, token interface{}, timestamp ...time.Time)
 		if err != nil {
 			return fmt.Errorf("failed to marshal resume token: %w", err)
 		}
-		return os.WriteFile(filePath, data, 0644)
+		return writeAtomic(filePath, data, 0644)
 	}
 
 	// Print the token type and value for debugging
@@ -342,8 +342,8 @@ func SaveResumeToken(filePath string, token interface{}, timestamp ...time.Time)
 		return fmt.Errorf("failed to marshal resume token: %w", err)
 	}
 
-	// Write to file
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
+	// Write to file atomically
+	if err := writeAtomic(filePath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write resume token file: %w", err)
 	}
 

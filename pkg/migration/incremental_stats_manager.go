@@ -78,6 +78,9 @@ type IncrementalStatsManager struct {
 	groupOpsByDistinctId bool
 	DryRun               bool
 
+	activeFailedIDs      map[string]string
+	activeFailedMu       *sync.RWMutex
+
 	bulkWriteLatenciesHistogram [30000]int64
 
 	// Partition-level read performance statistics (flat array of size 128 for lock-free max speeds!)
@@ -95,6 +98,8 @@ type IncrementalStatsManager struct {
 	unorderedBulkWritesSizeSinceLastStats int64
 	timeoutFlushesSinceLastStats          int64
 	duplicateKeysSinceLastStats           int64
+	resolvedCount                         int64
+	resolvedCountSinceLastStats           int64
 
 	// Read latency and size tracking (atomically updated)
 	totalReadLatencyNs int64
@@ -625,6 +630,26 @@ func (sm *IncrementalStatsManager) RecordSkippedEvent(opType string) {
 	sm.skippedEvents[opType]++
 }
 
+// RecordDLQResolution records document DLQ resolution counts.
+func (sm *IncrementalStatsManager) RecordDLQResolution(count int64) {
+	if sm == nil {
+		return
+	}
+	atomic.AddInt64(&sm.resolvedCount, count)
+	atomic.AddInt64(&sm.resolvedCountSinceLastStats, count)
+}
+
+// SetActiveFailedIDs sets the reference to the shared active failed document IDs map and its lock
+func (sm *IncrementalStatsManager) SetActiveFailedIDs(m map[string]string, mu *sync.RWMutex) {
+	if sm == nil {
+		return
+	}
+	sm.mu.Lock()
+	sm.activeFailedIDs = m
+	sm.activeFailedMu = mu
+	sm.mu.Unlock()
+}
+
 // GetSkippedEventsCount returns the count of skipped events of the given type thread-safely
 func (sm *IncrementalStatsManager) GetSkippedEventsCount(opType string) int64 {
 	if sm == nil {
@@ -815,6 +840,16 @@ func (sm *IncrementalStatsManager) ReportStats() {
 	unorderedWritesSize := atomic.SwapInt64(&sm.unorderedBulkWritesSizeSinceLastStats, 0)
 	timeoutFlushes := atomic.SwapInt64(&sm.timeoutFlushesSinceLastStats, 0)
 	duplicateKeys := atomic.SwapInt64(&sm.duplicateKeysSinceLastStats, 0)
+	resolvedCount := atomic.SwapInt64(&sm.resolvedCountSinceLastStats, 0)
+
+	netFailedCount := 0
+	sm.mu.Lock()
+	if sm.activeFailedIDs != nil && sm.activeFailedMu != nil {
+		sm.activeFailedMu.RLock()
+		netFailedCount = len(sm.activeFailedIDs)
+		sm.activeFailedMu.RUnlock()
+	}
+	sm.mu.Unlock()
 
 	totalReadLatencyNs := atomic.SwapInt64(&sm.totalReadLatencyNs, 0)
 	readCount := atomic.SwapInt64(&sm.readCount, 0)
@@ -1091,7 +1126,7 @@ func (sm *IncrementalStatsManager) ReportStats() {
 
 
 	// Format DLQ stats
-	dlqStatsStr := "      * DLQ'ed:"
+	dlqOpsStr := "0"
 	var dlqOps []string
 	opNames := []string{"insert", "update", "delete", "replace", "mixed"}
 	for _, op := range opNames {
@@ -1101,10 +1136,9 @@ func (sm *IncrementalStatsManager) ReportStats() {
 		}
 	}
 	if len(dlqOps) > 0 {
-		dlqStatsStr += " [" + strings.Join(dlqOps, ", ") + "]"
-	} else {
-		dlqStatsStr += " 0"
+		dlqOpsStr = "[" + strings.Join(dlqOps, ", ") + "]"
 	}
+	dlqStatsStr := fmt.Sprintf("      * DLQ'ed: %s (Resolved: %d) [Active Failed: %d]", dlqOpsStr, resolvedCount, netFailedCount)
 
 	// Extract and format connection pool stats for source and target
 	sourcePoolStr := sm.formatPoolStats(&sm.sourcePool, "Source", duration)

@@ -672,7 +672,9 @@ type mockDLQ struct {
 }
 
 func (m *mockDLQ) WriteFailed(sourceDB, sourceCollection string, documentID interface{}, err error, phase, opType string, document interface{}, eventTime time.Time) {}
+func (m *mockDLQ) WriteResolved(sourceDB, sourceCollection string, documentID interface{}, phase string, eventTime time.Time) {}
 func (m *mockDLQ) Count() int64 { return atomic.LoadInt64(&m.count) }
+func (m *mockDLQ) FilePath() string { return "" }
 func (m *mockDLQ) Close() {}
 
 func TestIncrementalStatsManagerDLQWarning(t *testing.T) {

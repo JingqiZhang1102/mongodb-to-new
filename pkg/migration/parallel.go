@@ -165,10 +165,30 @@ func (d *EventDistributor) Start() error {
 
 	transformer := NewFieldTransformer(d.cfg.DropEmptyFieldNames, d.cfg.ConvertLongFieldNamesInNestedDocs, d.cfg.RetryConfig.ConvertInvalidIds, d.log)
 
+	// Pre-populate the active failed document IDs from the DLQ file on startup
+	var activeFailedIDs map[string]string
+	var activeFailedMu sync.RWMutex
+	if d.dlq != nil && d.dlq.FilePath() != "" {
+		d.log.Info("DLQ resolution ledger: performing pre-scan startup check...")
+		var scanErr error
+		activeFailedIDs, scanErr = PopulateActiveFailedIDs(d.dlq.FilePath(), d.log)
+		if scanErr != nil {
+			d.log.Warnf("DLQ resolution ledger: failed to pre-scan DLQ file: %v (continuing without resolution logging)", scanErr)
+		} else {
+			d.log.Infof("DLQ resolution ledger: loaded %d active failed IDs on startup", len(activeFailedIDs))
+			if d.incrementalStatsManager != nil {
+				d.incrementalStatsManager.SetActiveFailedIDs(activeFailedIDs, &activeFailedMu)
+			}
+		}
+	}
+
 	// Initialize workers with retry manager and stats manager
 	for i := 0; i < d.incrementalWorkerCount; i++ {
 		d.workers[i] = NewWorker(i, cancelCtx, d.log, d.targetDB, d.collectionConfigs, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.incrementalStatsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval, d.cfg.IncrementalIncomingQueueSize, d.cfg.IncrementalProcessingQueueSize, transformer)
 		d.workers[i].SetPartitionTracker(d.partitionTracker)
+		if activeFailedIDs != nil {
+			d.workers[i].SetActiveFailedIDs(activeFailedIDs, &activeFailedMu)
+		}
 	}
 
 	// Ensure all workers are shut down sequentially and safely upon exit
@@ -489,6 +509,10 @@ type Worker struct {
 	flushInterval        time.Duration
 	partitionTracker     *PartitionTracker
 	transformer          *FieldTransformer
+
+	// Map to track active failed document IDs for Resolution Tombstoning
+	activeFailedIDs map[string]string
+	activeFailedMu  *sync.RWMutex
 }
 
 // SetPartitionTracker sets the PartitionTracker for this worker
@@ -496,6 +520,14 @@ func (w *Worker) SetPartitionTracker(tracker *PartitionTracker) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.partitionTracker = tracker
+}
+
+// SetActiveFailedIDs sets the shared map and lock for tracking active failed document IDs
+func (w *Worker) SetActiveFailedIDs(m map[string]string, mu *sync.RWMutex) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.activeFailedIDs = m
+	w.activeFailedMu = mu
 }
 
 // pushToBatchWriteQueue sends a completed group to the batch write queue while tracking any block/stall durations
@@ -534,8 +566,17 @@ func (s *statsTrackingDLQ) WriteFailed(sourceDB, sourceCollection string, docume
 	// Incremented in incrementalStatsManager.RecordLags to prevent double counting and maintain context
 }
 
+func (s *statsTrackingDLQ) WriteResolved(sourceDB, sourceCollection string, documentID interface{}, phase string, eventTime time.Time) {
+	s.underlyingDlq.WriteResolved(sourceDB, sourceCollection, documentID, phase, eventTime)
+	s.incrementalStatsManager.RecordDLQResolution(1)
+}
+
 func (s *statsTrackingDLQ) Count() int64 {
 	return s.underlyingDlq.Count()
+}
+
+func (s *statsTrackingDLQ) FilePath() string {
+	return s.underlyingDlq.FilePath()
 }
 
 func (s *statsTrackingDLQ) Close() {
@@ -953,6 +994,25 @@ func (w *Worker) executeBatchWrite(group OperationGroup) {
 	if w.incrementalStatsManager != nil {
 		w.incrementalStatsManager.RecordLags(group.Operations)
 	}
+
+	// Scan group operations for successful updates resolving previously failed documents
+	if w.activeFailedMu != nil {
+		w.activeFailedMu.Lock()
+		if w.activeFailedIDs != nil {
+			for _, op := range group.Operations {
+				if !op.SuccessTime.IsZero() && !op.DLQed {
+					key := MakeDLQKey(dbName, collName, op.DocumentID)
+					if originalPhase, exists := w.activeFailedIDs[key]; exists {
+						if w.dlq != nil {
+							w.dlq.WriteResolved(dbName, collName, op.DocumentID, originalPhase, op.EventTime)
+						}
+						delete(w.activeFailedIDs, key)
+					}
+				}
+			}
+		}
+		w.activeFailedMu.Unlock()
+	}
 }
 
 // handleBulkWriteResult processes the outcome of a bulk write operation, setting SuccessTime for succeeded operations and executing fallbacks for failed ones.
@@ -1298,6 +1358,16 @@ func (w *Worker) markDLQ(op *WriteOperation, dbName, collName string, err error)
 	}
 	op.DLQed = true
 	op.Error = err
+
+	// Track the failed document ID for Resolution Tombstoning
+	if w.activeFailedMu != nil {
+		w.activeFailedMu.Lock()
+		if w.activeFailedIDs != nil {
+			key := MakeDLQKey(dbName, collName, op.DocumentID)
+			w.activeFailedIDs[key] = "incremental"
+		}
+		w.activeFailedMu.Unlock()
+	}
 }
 
 func (w *Worker) handleTransformationFailure(op *WriteOperation, dbName, collName string, err error) {

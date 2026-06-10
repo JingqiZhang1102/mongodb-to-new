@@ -65,8 +65,8 @@ func main() {
 
 
 	// Validate mode
-	if *mode != "migrate" && *mode != "live" && *mode != "live-only" {
-		log.Fatalf("Invalid mode: %s. Please choose either 'migrate', 'live', or 'live-only'", *mode)
+	if *mode != "migrate" && *mode != "live" && *mode != "live-only" && *mode != "retry-dlq" {
+		log.Fatalf("Invalid mode: %s. Please choose either 'migrate', 'live', 'live-only', or 'retry-dlq'", *mode)
 	}
 
 
@@ -123,11 +123,11 @@ func main() {
 		}
 	}
 
-	// Log completion for migrate mode (live mode keeps running)
-	if *mode == "migrate" {
+	// Log completion for migrate and retry-dlq mode (live mode keeps running)
+	if *mode == "migrate" || *mode == "retry-dlq" {
 		duration := time.Since(startTime)
-		log.Infof("Migration completed in %.2f seconds", duration.Seconds())
-		os.Exit(0) // Explicitly exit after migration is complete
+		log.Infof("Process completed in %.2f seconds", duration.Seconds())
+		os.Exit(0) // Explicitly exit after completion
 	}
 }
 
@@ -140,7 +140,7 @@ func displayUsage() {
 	fmt.Println("  -config string")
 	fmt.Println("        Path to configuration file (default \"mongodb_replication_config.json\")")
 	fmt.Println("  -mode string")
-	fmt.Println("        Operation mode: 'migrate', 'live', or 'live-only' (default \"migrate\")")
+	fmt.Println("        Operation mode: 'migrate', 'live', 'live-only', or 'retry-dlq' (default \"migrate\")")
 	fmt.Println("        Modes:")
 	fmt.Println("          migrate:")
 	fmt.Println("            Perform a one-time full migration. Copies all data and indexes from")
@@ -154,6 +154,10 @@ func displayUsage() {
 	fmt.Println("            copy phase. Starts streaming real-time changes from the last saved resume token")
 	fmt.Println("            (or current moment if none exists), or from a custom position when")
 	fmt.Println("            -live-start-timestamp is specified.")
+	fmt.Println("          retry-dlq:")
+	fmt.Println("            Reprocess the Dead Letter Queue (DLQ). Reads previous failed records from")
+	fmt.Println("            the DLQ files, retries writing them to the target, and writes any subsequent")
+	fmt.Println("            failures to new DLQ files.")
 	fmt.Println("  -log-level string")
 	fmt.Println("        Log level: debug, info, warn, error (default \"info\")")
 	fmt.Println("  -log-file string")
