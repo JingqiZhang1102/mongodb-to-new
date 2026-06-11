@@ -8,6 +8,7 @@
       "target": {
         "connectionString": "mongodb://instance-1:27018/?replicaSet=rs1",
         "database": "test",
+        "upsertMode": true,
         "collections": [
           {
             "sourceCollection": "customers",

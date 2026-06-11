@@ -278,6 +278,7 @@ func PopulateActiveFailedIDs(dlqPath string, log *logger.Logger) (map[string]str
 				if header.DLQVersion != DLQVersion {
 					return nil, fmt.Errorf("DLQ pre-scan: Safety violation: encountered unsupported DLQ version %q (expected %q). Please use the correct migration tool version.", header.DLQVersion, DLQVersion)
 				}
+				log.Infof("DLQ pre-scan: DLQ file version %q matches tool DLQ version %q", header.DLQVersion, DLQVersion)
 				continue // skip header line
 			}
 			// If it's not a version header, process it as a regular legacy record

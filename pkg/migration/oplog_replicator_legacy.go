@@ -2,6 +2,7 @@ package migration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -551,7 +552,10 @@ func (r *OplogReplicatorLegacy) insertBatchWithRetry(ctx context.Context, target
 
 		if len(models) > 0 {
 			if _, err := targetCol.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false)); err != nil {
-				bulkWriteException, ok := err.(mongod.BulkWriteException)
+				// Use errors.As instead of direct type assertion (err.(mongod.BulkWriteException))
+				// because the driver or retry wrapper may wrap the underlying BulkWriteException.
+				var bulkWriteException mongod.BulkWriteException
+				ok := errors.As(err, &bulkWriteException)
 				if ok {
 					successCount = int64(len(batch) - len(bulkWriteException.WriteErrors))
 					r.log.Errorf("Bulk upsert partially failed for %s.%s: %d succeeded, %d failed",
@@ -601,7 +605,10 @@ func (r *OplogReplicatorLegacy) insertBatchWithRetry(ctx context.Context, target
 	}
 
 	if _, err := targetCol.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false)); err != nil {
-		bulkWriteException, ok := err.(mongod.BulkWriteException)
+		// Use errors.As to unwrap any nested BulkWriteException. This ensures that
+		// individual write errors (like duplicate keys) are handled gracefully.
+		var bulkWriteException mongod.BulkWriteException
+		ok := errors.As(err, &bulkWriteException)
 		if ok {
 			// Calculate successful inserts
 			successCount = int64(len(batch) - len(bulkWriteException.WriteErrors))

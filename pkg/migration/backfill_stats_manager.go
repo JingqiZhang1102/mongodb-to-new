@@ -21,6 +21,7 @@ type BackfillStatsManager struct {
 	interval      time.Duration
 	DryRun        bool
 	incStats      *IncrementalStatsManager // Reference to connection pool monitor
+	stopped       atomic.Bool
 
 	// Read metrics (atomically tracked)
 	readCount                  int64
@@ -106,12 +107,23 @@ func (sm *BackfillStatsManager) Start(ctx context.Context) {
 		for {
 			select {
 			case <-ticker.C:
+				if sm.stopped.Load() {
+					return
+				}
 				sm.ReportStats(false)
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
+}
+
+// Stop stops the background reporting loop and prevents further prints.
+func (sm *BackfillStatsManager) Stop() {
+	if sm == nil {
+		return
+	}
+	sm.stopped.Store(true)
 }
 
 // RecordRead records metrics for a document fetched from the source database cursor.
@@ -156,10 +168,10 @@ func (sm *BackfillStatsManager) RecordWriteResult(succeeded, failed, duplicates,
 	atomic.AddInt64(&sm.failedCount, failed)
 	atomic.AddInt64(&sm.duplicateKeys, duplicates)
 	atomic.AddInt64(&sm.dlqCount, dlq)
-	atomic.AddInt64(&sm.cumulativeProcessed, succeeded+failed)
+	atomic.AddInt64(&sm.cumulativeProcessed, succeeded+failed+duplicates)
 
 	if workerID >= 0 && workerID < 4096 {
-		atomic.AddInt64(&sm.workerProcessedSinceLastStats[workerID], succeeded+failed)
+		atomic.AddInt64(&sm.workerProcessedSinceLastStats[workerID], succeeded+failed+duplicates)
 	}
 }
 
@@ -293,6 +305,7 @@ func (sm *BackfillStatsManager) ReportStats(isFinal bool) {
 	rateSuccess := float64(successCount) / duration.Seconds()
 	rateFailed := float64(failedCount) / duration.Seconds()
 	rateDuplicates := float64(duplicateKeys) / duration.Seconds()
+	rateProcessed := float64(successCount+failedCount+duplicateKeys) / duration.Seconds()
 
 	var rateSequentialRetries float64
 	if duration.Seconds() > 0 {
@@ -419,9 +432,9 @@ func (sm *BackfillStatsManager) ReportStats(isFinal bool) {
 		"%s"+
 		"%s"+
 		"  - Read:           %d (%.2f docs/sec)\n"+
-		"  - WorkerReceived: %d (%.2f docs/sec) [Inserts: %d (%.2f/sec)]\n"+
-		"  - Processed:      %d (%.2f docs/sec) (applied: %d (%.2f/sec))\n"+
-		"  - Failed:         %d (%.2f docs/sec) [Inserts: %d (%.2f/sec)]\n"+
+		"  - WorkerReceived: %d (%.2f docs/sec)\n"+
+		"  - Processed (Total): %d (%.2f docs/sec) [Applied: %d (%.2f/sec), Skipped Duplicates: %d (%.2f/sec)]\n"+
+		"  - Failed:         %d (%.2f docs/sec)\n"+
 		"  - BulkWrite Latency:    [p50: %s, p90: %s, p99: %s, p100: %s] (avg: %s)\n"+
 		"  - Sequential Retries:   %d (%.2f/sec)%s\n"+
 		"  - Worker QPS: [Active: %d] [p50: %.2f, p90: %.2f, p99: %.2f, p100: %.2f]\n"+
@@ -436,9 +449,9 @@ func (sm *BackfillStatsManager) ReportStats(isFinal bool) {
 		progressStr,
 		throttlerStr,
 		readCount, rateRead,
-		workerReceived, rateReceived, workerReceived, rateReceived,
-		successCount+failedCount, (rateSuccess + rateFailed), successCount, rateSuccess,
-		failedCount, rateFailed, failedCount, rateFailed,
+		workerReceived, rateReceived,
+		successCount+failedCount+duplicateKeys, rateProcessed, successCount, rateSuccess, duplicateKeys, rateDuplicates,
+		failedCount, rateFailed,
 		p50BulkWrite, p90BulkWrite, p99BulkWrite, p100BulkWrite, avgBulkWriteLatency.Round(time.Millisecond),
 		sequentialRetries, rateSequentialRetries, sequentialRetriesBreakdown,
 		activeWorkers, wQpsP50, wQpsP90, wQpsP99, wQpsP100,

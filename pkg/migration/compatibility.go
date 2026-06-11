@@ -3,7 +3,9 @@ package migration
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/gsbingo17/mongodb-migration/pkg/config"
@@ -67,12 +69,14 @@ func RunCompatibilityTest(ctx context.Context, cfg *config.Config, dryRun bool, 
 
 		if dryRun {
 			log.Infof("[Dry Run] [Pair %d] Connection to target database succeeded. Skipping writes.", pairIdx+1)
-			fmt.Printf("\n### TARGET DATABASE COMPATIBILITY REPORT - DRY RUN (Pair %d: %s)\n\n", pairIdx+1, pair.Target.Database)
-			fmt.Printf("| Category | Feature to Test | Value Description |\n")
-			fmt.Printf("| :--- | :--- | :--- |\n")
+			fmt.Printf("\n--- TARGET DATABASE COMPATIBILITY REPORT - DRY RUN (Pair %d: %s) ---\n\n", pairIdx+1, pair.Target.Database)
+			w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+			fmt.Fprintln(w, "CATEGORY\tFEATURE TO TEST\tVALUE DESCRIPTION")
+			fmt.Fprintln(w, "--------\t---------------\t-----------------")
 			for _, tc := range testCases {
-				fmt.Printf("| %s | **%s** | %s |\n", tc.Category, tc.TestName, tc.ValueDesc)
+				fmt.Fprintf(w, "%s\t%s\t%s\n", tc.Category, tc.TestName, tc.ValueDesc)
 			}
+			w.Flush()
 			fmt.Println()
 
 			printSchemaTransformationConfigReference()
@@ -141,51 +145,47 @@ func RunCompatibilityTest(ctx context.Context, cfg *config.Config, dryRun bool, 
 			}
 		}
 
-		// Print compatibility report in Markdown tabular form
-		fmt.Printf("\n### TARGET DATABASE COMPATIBILITY REPORT (Pair %d: %s)\n\n", pairIdx+1, pair.Target.Database)
-		fmt.Printf("| Category | Feature Tested | Supported? | Error / Notes |\n")
-		fmt.Printf("| :--- | :--- | :--- | :--- |\n")
+		// Print compatibility report in tabular form
+		fmt.Printf("\n--- TARGET DATABASE COMPATIBILITY REPORT (Pair %d: %s) ---\n\n", pairIdx+1, pair.Target.Database)
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+		fmt.Fprintln(w, "CATEGORY\tFEATURE TESTED\tSUPPORTED?\tERROR / NOTES")
+		fmt.Fprintln(w, "--------\t--------------\t----------\t-------------")
 		for _, res := range results {
-			statusSymbol := "✅ YES"
+			statusSymbol := "YES"
 			if !res.Supported {
-				statusSymbol = "❌ NO"
+				statusSymbol = "NO"
 			}
-			fmt.Printf("| %s | **%s** | %s | %s |\n", res.Category, res.TestName, statusSymbol, res.ErrorMsg)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", res.Category, res.TestName, statusSymbol, res.ErrorMsg)
 		}
+		w.Flush()
 		fmt.Println()
 
 		// Construct recommendation notices
 		if hasUnsupportedIDs || hasUnsupportedLongKeys || hasUnsupportedEmptyKeys {
-			fmt.Printf("⚠️ **Target Compatibility Alerts:**\n\n")
+			fmt.Printf("! Target Compatibility Alerts:\n\n")
 			if hasUnsupportedIDs {
-				fmt.Printf("1. **Unsupported _id Types detected:**\n")
-				fmt.Printf("   - *Action:* Enable `convertInvalidIds: true` under `retryConfig` to auto-serialize invalid types to strings.\n")
-				fmt.Printf("   - *Transformation Example:*\n")
-				fmt.Printf("     ```\n")
+				fmt.Printf("1. Unsupported _id Types detected:\n")
+				fmt.Printf("   - Action: Enable `convertInvalidIds: true` under `retryConfig` to auto-serialize invalid types to strings.\n")
+				fmt.Printf("   - Transformation Example:\n")
 				fmt.Printf("     Source: _id: [1, 2] (Array)\n")
-				fmt.Printf("     Target: _id: \"_converted:array:[1,2]\" (String)\n")
-				fmt.Printf("     ```\n\n")
+				fmt.Printf("     Target: _id: \"_converted:array:[1,2]\" (String)\n\n")
 			}
 			if hasUnsupportedLongKeys {
-				fmt.Printf("2. **Unsupported Long Nested Keys detected:**\n")
-				fmt.Printf("   - *Action:* Enable `convertLongFieldNamesInNestedDocs: true` in your main configuration to automatically stringify nested structures containing long field names (>1000 characters).\n")
-				fmt.Printf("   - *Transformation Example:*\n")
-				fmt.Printf("     ```\n")
+				fmt.Printf("2. Unsupported Long Nested Keys detected:\n")
+				fmt.Printf("   - Action: Enable `convertLongFieldNamesInNestedDocs: true` in your main configuration to automatically stringify nested structures containing long field names (>1000 characters).\n")
+				fmt.Printf("   - Transformation Example:\n")
 				fmt.Printf("     Source: { \"nested\": { \"<key_1001_chars>\": \"value\" } }\n")
-				fmt.Printf("     Target: { \"nested\": \"{\\\"<key_1001_chars>\\\":\\\"value\\\"}\" }\n")
-				fmt.Printf("     ```\n\n")
+				fmt.Printf("     Target: { \"nested\": \"{\\\"<key_1001_chars>\\\":\\\"value\\\"}\" }\n\n")
 			}
 			if hasUnsupportedEmptyKeys {
-				fmt.Printf("3. **Unsupported Empty Field Names detected:**\n")
-				fmt.Printf("   - *Action:* Enable `dropEmptyFieldNames: true` in your main configuration to automatically drop fields with empty names (`\"\"`).\n")
-				fmt.Printf("   - *Transformation Example:*\n")
-				fmt.Printf("     ```\n")
+				fmt.Printf("3. Unsupported Empty Field Names detected:\n")
+				fmt.Printf("   - Action: Enable `dropEmptyFieldNames: true` in your main configuration to automatically drop fields with empty names (\"\").\n")
+				fmt.Printf("   - Transformation Example:\n")
 				fmt.Printf("     Source: { \"_id\": \"test\", \"\": \"empty-val\", \"name\": \"user\" }\n")
-				fmt.Printf("     Target: { \"_id\": \"test\", \"name\": \"user\" }\n")
-				fmt.Printf("     ```\n\n")
+				fmt.Printf("     Target: { \"_id\": \"test\", \"name\": \"user\" }\n\n")
 			}
 		} else {
-			fmt.Printf("✅ **Success:** Target database fully supports all tested ID datatypes, long field names, and empty field names!\n\n")
+			fmt.Printf("* Success: Target database fully supports all tested ID datatypes, long field names, and empty field names!\n\n")
 		}
 
 		printSchemaTransformationConfigReference()
@@ -198,12 +198,14 @@ func RunCompatibilityTest(ctx context.Context, cfg *config.Config, dryRun bool, 
 }
 
 func printSchemaTransformationConfigReference() {
-	fmt.Printf("### SCHEMA TRANSFORMATION CONFIGURATION REFERENCE\n\n")
+	fmt.Printf("--- SCHEMA TRANSFORMATION CONFIGURATION REFERENCE ---\n\n")
 	fmt.Printf("Below is a reference of available configuration flags and how they transform documents during migration:\n\n")
-	fmt.Printf("| Configuration Flag | Action Description | Source Document (Before) | Transformed Document (After) |\n")
-	fmt.Printf("| :--- | :--- | :--- | :--- |\n")
-	fmt.Printf("| **`convertInvalidIds: true`** | Converts unsupported target `_id` datatypes to deterministic type-prefixed strings. | `_id: [1, 2] (Array)` | `_id: \"_converted:array:[1,2]\" (String)` |\n")
-	fmt.Printf("| **`convertLongFieldNamesInNestedDocs: true`** | Stringifies nested subdocuments containing keys exceeding 1000 characters. | `{ \"nested\": { \"<long_key>\": \"value\" } }` | `{ \"nested\": \"{\\\"\"<long_key>\\\"\":\\\"\"value\\\"\"}\" }` |\n")
-	fmt.Printf("| **`dropEmptyFieldNames: true`** | Removes fields with empty key names (`\"\"`) from the document payload. | `{ \"\": \"empty-val\", \"name\": \"user\" }` | `{ \"name\": \"user\" }` |\n")
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	fmt.Fprintln(w, "CONFIGURATION FLAG\tACTION DESCRIPTION\tSOURCE DOCUMENT (BEFORE)\tTRANSFORMED DOCUMENT (AFTER)")
+	fmt.Fprintln(w, "------------------\t------------------\t------------------------\t----------------------------")
+	fmt.Fprintln(w, "convertInvalidIds: true\tConverts unsupported target _id datatypes to deterministic strings.\t_id: [1, 2] (Array)\t_id: \"_converted:array:[1,2]\" (String)")
+	fmt.Fprintln(w, "convertLongFieldNamesInNestedDocs: true\tStringifies nested subdocuments containing keys exceeding 1000 characters.\t{ \"nested\": { \"<long_key>\": \"value\" } }\t{ \"nested\": \"{\\\"<long_key>\\\":\\\"value\\\"}\" }")
+	fmt.Fprintln(w, "dropEmptyFieldNames: true\tRemoves fields with empty key names (\"\") from the document payload.\t{ \"\": \"empty-val\", \"name\": \"user\" }\t{ \"name\": \"user\" }")
+	w.Flush()
 	fmt.Println()
 }

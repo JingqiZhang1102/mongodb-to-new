@@ -451,6 +451,7 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		wg.Wait()
 		if r.backfillStatsManager != nil {
 			r.backfillStatsManager.ReportStats(true)
+			r.backfillStatsManager.Stop()
 		}
 
 		if criticalErr != nil {

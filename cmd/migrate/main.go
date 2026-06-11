@@ -112,7 +112,6 @@ func main() {
 
 	// Start migration/replication
 	startTime := time.Now()
-	log.Infof("Starting MongoDB to MongoDB %s process", *mode)
 
 	if err := migrator.Start(ctx, *mode); err != nil {
 		// Check if the error is due to context cancellation (Ctrl+C)
@@ -185,8 +184,9 @@ func displayUsage() {
 	fmt.Println("  migrate -mode=live-only -live-start-timestamp=1716234000")
 	fmt.Println("  migrate -mode=live-only -live-start-timestamp=2026-05-20T21:00:00Z")
 	fmt.Println("  migrate -mode=live-only -live-start-timestamp=2026-05-20T21:00:00Z -dry-run")
-	fmt.Println("  migrate -config=custom_config.json -mode=migrate -log-level=debug")
 	fmt.Println("  migrate -mode=live -log-file=migration.log")
+	fmt.Println("  migrate -mode=retry-dlq")
+	fmt.Println("  migrate -config=custom_config.json -mode=retry-dlq")
 }
 
 // parseStartTimestamp parses a user-provided timestamp string as either a raw Unix epoch

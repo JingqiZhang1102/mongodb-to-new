@@ -62,6 +62,7 @@ type Config struct {
 // BackfillRampUpConfig represents write ramp-up configuration for initial backfill
 type BackfillRampUpConfig struct {
 	Enabled             bool    `json:"enabled"`
+	Strategy            string  `json:"strategy"` // "static" or "adaptive"
 	StartQps            float64 `json:"startQps"`
 	RampRatePerMin      float64 `json:"rampRatePerMin"`
 	UpdateIntervalMs    int     `json:"updateIntervalMs"`
@@ -278,6 +279,9 @@ func LoadConfig(configPath string) (*Config, error) {
 	}
 	if config.BackfillRampUp.UpdateIntervalMs <= 0 {
 		config.BackfillRampUp.UpdateIntervalMs = 1000 // Default to 1 second
+	}
+	if config.BackfillRampUp.Strategy == "" {
+		config.BackfillRampUp.Strategy = "static"
 	}
 
 	// No backward compatibility needed anymore

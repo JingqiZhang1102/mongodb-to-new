@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -302,6 +303,7 @@ func (m *Migrator) processDatabasePair(ctx context.Context, pair config.Database
 		// Wait for all migrations to complete
 		wg.Wait()
 		backfillStatsManager.ReportStats(true)
+		backfillStatsManager.Stop()
 	} else if mode == "live" || mode == "live-only" {
 		// Use client-level change stream for live replication
 		if err := m.startClientLevelReplication(ctx, sourceDB, targetDB, pair.Source.Database, pair.Target.Database, collections, pair, pairIndex, liveOnly, incrementalStatsManager, backfillStatsManager); err != nil {
@@ -705,6 +707,8 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	var lastLoggedPercentage int = -1 // Start at -1 to ensure 0% is logged
 	var mu sync.Mutex                 // Mutex for thread-safe updates to successCount, failedCount, migratedCount, and lastLoggedPercentage
 
+	proactiveSkipEnabled := &atomic.Bool{}
+
 	// Start worker pool for parallel batch processing
 	workerCount := m.config.InitialMigrationWorkers
 	m.log.Infof("Starting %d workers for parallel document batch processing", workerCount)
@@ -728,7 +732,7 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 				if opts.BackfillStatsManager != nil {
 					opts.BackfillStatsManager.RecordWorkerReceived(int64(len(batch)))
 				}
-				succeeded, failed, err := m.writeBatch(ctx, targetCollection, batch, sourceDB.GetDatabaseName(), collConfig.SourceCollection, opts, retryManager, workerID)
+				succeeded, failed, err := m.writeBatch(ctx, targetCollection, batch, sourceDB.GetDatabaseName(), collConfig.SourceCollection, opts, retryManager, workerID, proactiveSkipEnabled)
 				if err != nil {
 					select {
 					case errorChan <- fmt.Errorf("worker %d failed to process batch: %w", workerID, err):
@@ -1144,6 +1148,8 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 				workerCount = 1 // Ensure at least 1 worker per partition
 			}
 
+			proactiveSkipEnabled := &atomic.Bool{}
+
 			m.log.Debugf("Starting %d workers for partition %d", workerCount, partitionIndex)
 
 			for w := 0; w < workerCount; w++ {
@@ -1156,7 +1162,7 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 							opts.BackfillStatsManager.RecordWorkerReceived(int64(len(batch)))
 						}
 						globalWorkerID := partitionIndex*100 + workerID
-						succeeded, failed, err := m.writeBatch(ctx, targetCollection, batch, sourceDB.GetDatabaseName(), collConfig.SourceCollection, opts, retryManager, globalWorkerID)
+						succeeded, failed, err := m.writeBatch(ctx, targetCollection, batch, sourceDB.GetDatabaseName(), collConfig.SourceCollection, opts, retryManager, globalWorkerID, proactiveSkipEnabled)
 						if err != nil {
 							select {
 							case partitionErrorChan <- fmt.Errorf("worker %d in partition %d failed: %w", workerID, partitionIndex, err):
@@ -1477,16 +1483,7 @@ func max(a, b int) int {
 // writeBatch processes and writes a batch of documents.
 // - If opts.DLQ is provided, it uses resilient writes (upsert fallback + DLQ routing) and returns counts.
 // - If opts.DLQ is nil, it uses fail-fast writes (standard InsertMany + RetryManager) and aborts on errors.
-func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, batch []interface{}, sourceDB, sourceCollection string, opts MigrateOptions, retryManager *RetryManager, workerID int) (int64, int64, error) {
-	// [Safety Fix 2: Connection Pool Starvation] Wait on Rate Limiting BEFORE checking out connections/sessions from target database pool.
-	// This prevents worker threads from holding onto checked-out sessions in an idle state while blocked by rate limits,
-	// which would starve other threads/replicators of available pool connections.
-	if opts.Throttler != nil {
-		if err := opts.Throttler.Wait(ctx, len(batch)); err != nil {
-			return 0, 0, err
-		}
-	}
-
+func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, batch []interface{}, sourceDB, sourceCollection string, opts MigrateOptions, retryManager *RetryManager, workerID int, proactiveSkipEnabled *atomic.Bool) (int64, int64, error) {
 	convertInvalidIds := m.config.RetryConfig.ConvertInvalidIds && m.isLive
 	transformer := NewFieldTransformer(m.config.DropEmptyFieldNames, m.config.ConvertLongFieldNamesInNestedDocs, convertInvalidIds, m.log)
 
@@ -1517,14 +1514,89 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 		var duplicateKeys int64
 		var dlqCount int64
 
+		if proactiveSkipEnabled != nil && proactiveSkipEnabled.Load() {
+			var ids []interface{}
+			for _, doc := range batch {
+				id := extractDocID(doc)
+				if id != nil {
+					ids = append(ids, id)
+				}
+			}
+
+			if len(ids) > 0 {
+				findCtx, cancelFind := context.WithTimeout(ctx, 30*time.Second)
+				filter := bson.M{"_id": bson.M{"$in": ids}}
+				projectionOpts := options.Find().SetProjection(bson.M{"_id": 1})
+				cursor, findErr := targetCol.Find(findCtx, filter, projectionOpts)
+				if findErr == nil {
+					existingKeys := make(map[interface{}]bool)
+					for cursor.Next(findCtx) {
+						var res struct {
+							ID interface{} `bson:"_id"`
+						}
+						if err := cursor.Decode(&res); err == nil && res.ID != nil {
+							existingKeys[res.ID] = true
+						}
+					}
+					cursor.Close(findCtx)
+					cancelFind()
+
+					if len(existingKeys) == len(batch) {
+						duplicateKeys = int64(len(batch))
+						m.log.Debugf("[%s.%s] Proactively skipped entire batch of %d documents (already exist)", sourceDB, sourceCollection, len(batch))
+						if opts.BackfillStatsManager != nil {
+							opts.BackfillStatsManager.RecordWriteResult(0, 0, duplicateKeys, 0, workerID)
+						}
+						return 0, 0, nil
+					} else if len(existingKeys) > 0 {
+						var filteredBatch []interface{}
+						var filteredOriginal []interface{}
+						var skippedCount int64
+						for idx, doc := range batch {
+							id := extractDocID(doc)
+							if existingKeys[id] {
+								skippedCount++
+							} else {
+								filteredBatch = append(filteredBatch, doc)
+								filteredOriginal = append(filteredOriginal, originalBatch[idx])
+							}
+						}
+						m.log.Debugf("[%s.%s] Proactively skipped %d/%d duplicate documents", sourceDB, sourceCollection, skippedCount, len(batch))
+						duplicateKeys += skippedCount
+						batch = filteredBatch
+						originalBatch = filteredOriginal
+						proactiveSkipEnabled.Store(false)
+					} else {
+						proactiveSkipEnabled.Store(false)
+					}
+				} else {
+					m.log.Warnf("[%s.%s] Proactive ID presence check failed: %v", sourceDB, sourceCollection, findErr)
+					cancelFind()
+				}
+			}
+		}
+
+		// [Safety Fix 2: Connection Pool Starvation] Wait on Rate Limiting BEFORE checking out connections/sessions from target database pool.
+		// This prevents worker threads from holding onto checked-out sessions in an idle state while blocked by rate limits,
+		// which would starve other threads/replicators of available pool connections.
+		if opts.Throttler != nil {
+			if err := opts.Throttler.Wait(ctx, len(batch)); err != nil {
+				return 0, 0, err
+			}
+		}
+
 		// [Safety Fix 3: Context Timeout Shrinkage] Construct the query-level timeout context AFTER returning from the throttler wait block.
 		// Constructing it beforehand would cause the rate-limit wait delay to count against the execution timeout
 		// (timeout shrinkage), leading to premature write context cancellation failures.
-		bulkCtx, cancelBulk := context.WithTimeout(ctx, 30*time.Second)
+		bulkCtx, cancelBulk := context.WithTimeout(ctx, 90*time.Second)
 		bulkStart := time.Now()
 		_, insertErr := targetCol.InsertMany(bulkCtx, batch, options.InsertMany().SetOrdered(false))
 		bulkDuration := time.Since(bulkStart)
 		cancelBulk()
+
+		if opts.Throttler != nil {
+			opts.Throttler.ReportResult(bulkDuration, isSystemError(insertErr))
+		}
 
 		if insertErr == nil {
 			if opts.BackfillStatsManager != nil {
@@ -1538,10 +1610,26 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 			opts.BackfillStatsManager.RecordBulkWrite(bulkDuration)
 		}
 
-		bulkWriteException, ok := insertErr.(mongo.BulkWriteException)
+		// Use errors.As instead of direct type assertion (insertErr.(mongo.BulkWriteException))
+		// because the driver or retry wrapper may wrap the underlying BulkWriteException.
+		var bulkWriteException mongo.BulkWriteException
+		ok := errors.As(insertErr, &bulkWriteException)
 		if ok {
 			m.log.Debugf("Bulk insert partially failed for %s.%s: %d failed",
 				sourceDB, sourceCollection, len(bulkWriteException.WriteErrors))
+
+			if len(bulkWriteException.WriteErrors) == len(batch) {
+				allDuplicates := true
+				for _, writeErr := range bulkWriteException.WriteErrors {
+					if writeErr.Code != 11000 {
+						allDuplicates = false
+						break
+					}
+				}
+				if allDuplicates && proactiveSkipEnabled != nil {
+					proactiveSkipEnabled.Store(true)
+				}
+			}
 
 			for _, writeErr := range bulkWriteException.WriteErrors {
 				var errDocID interface{}
@@ -1596,7 +1684,7 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 				if errType == ErrorTypeConnection || errType == ErrorTypeContention {
 					m.log.Infof("Transient error detected for %s.%s. Retrying bulk insert with backoff...", sourceDB, sourceCollection)
 					retryErr := retryManager.RetryWithBackoff(ctx, func() error {
-						retryCtx, cancelRetry := context.WithTimeout(ctx, 30*time.Second)
+						retryCtx, cancelRetry := context.WithTimeout(ctx, 90*time.Second)
 						defer cancelRetry()
 						_, retryInsertErr := targetCol.InsertMany(retryCtx, batch, options.InsertMany().SetOrdered(false))
 						return retryInsertErr
@@ -1605,6 +1693,33 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 						m.log.Infof("Bulk insert for %s.%s succeeded after retry", sourceDB, sourceCollection)
 						bulkRetrySucceeded = true
 					} else {
+						// Optimization: If the bulk retry failed solely due to duplicate key errors,
+						// it means the documents were successfully written during the first (timed-out) attempt
+						// and the remaining documents succeeded in the retry attempt. We can skip the slow fallback.
+						var bulkWriteException mongo.BulkWriteException
+						if errors.As(retryErr, &bulkWriteException) {
+							allDuplicates := true
+							for _, writeErr := range bulkWriteException.WriteErrors {
+								if writeErr.Code != 11000 {
+									allDuplicates = false
+									break
+								}
+							}
+							if allDuplicates {
+								successCount := int64(len(batch) - len(bulkWriteException.WriteErrors))
+								duplicateKeys = int64(len(bulkWriteException.WriteErrors))
+								m.log.Infof("Bulk insert for %s.%s succeeded after retry with %d duplicate keys skipped (Optimization)",
+									sourceDB, sourceCollection, duplicateKeys)
+								bulkRetrySucceeded = true
+								if proactiveSkipEnabled != nil {
+									proactiveSkipEnabled.Store(true)
+								}
+								if opts.BackfillStatsManager != nil {
+									opts.BackfillStatsManager.RecordWriteResult(successCount, 0, duplicateKeys, 0, workerID)
+								}
+								return successCount, 0, nil
+							}
+						}
 						m.log.Warnf("Bulk insert for %s.%s still failed after retries: %v. Falling back to individual operations.", sourceDB, sourceCollection, retryErr)
 					}
 				}
@@ -1663,12 +1778,20 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 		return successCount, batchFailed, nil
 	} else {
 		// Fail-Fast Mode (standard mode=migrate behavior)
+		if opts.Throttler != nil {
+			if err := opts.Throttler.Wait(ctx, len(batch)); err != nil {
+				return 0, 0, err
+			}
+		}
 		err := retryManager.RetryWithSplit(ctx, batch, sourceCollection, func(b []interface{}) error {
-			bulkCtx, cancelBulk := context.WithTimeout(ctx, 30*time.Second)
+			bulkCtx, cancelBulk := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelBulk()
 			return processBatch(bulkCtx, targetCol, b, opts.UpsertMode, sourceDB, sourceCollection, transformer)
 		})
 		writeDuration := time.Since(writeStart)
+		if opts.Throttler != nil {
+			opts.Throttler.ReportResult(writeDuration, isSystemError(err))
+		}
 		if err != nil {
 			if opts.BackfillStatsManager != nil {
 				opts.BackfillStatsManager.RecordBulkWrite(writeDuration)
@@ -1705,6 +1828,12 @@ type TargetCollection interface {
 
 // reprocessDLQ reads the DLQ file for a database pair, re-applies failures, and writes new failures to a new DLQ.
 func (m *Migrator) reprocessDLQ(ctx context.Context, pair config.DatabasePair, pairIndex int) (runErr error) {
+	statePath := m.getInitialMigrationStatePath(pairIndex)
+	initialMigrationState, err := LoadInitialMigrationState(statePath)
+	if err != nil {
+		return fmt.Errorf("failed to load initial migration state: %w", err)
+	}
+
 	dlqPath := m.getDLQPath(pairIndex)
 	tempPath := dlqPath + ".retry-temp"
 
@@ -1714,7 +1843,7 @@ func (m *Migrator) reprocessDLQ(ctx context.Context, pair config.DatabasePair, p
 		return fmt.Errorf("failed to restore leftover temp DLQ file: %w", err)
 	}
 
-	m.log.Infof("Starting DLQ reprocessing for pair %d using file: %s", pairIndex, dlqPath)
+	m.log.Infof("Starting DLQ reprocessing for pair %d (%s -> %s) using file: %s", pairIndex, pair.Source.Database, pair.Target.Database, dlqPath)
 
 	// Check if the DLQ file exists
 	if _, err := os.Stat(dlqPath); os.IsNotExist(err) {
@@ -1766,7 +1895,9 @@ func (m *Migrator) reprocessDLQ(ctx context.Context, pair config.DatabasePair, p
 	}
 
 	// Sync initial migration state if we successfully completed reprocessing for the initial phase
-	if phase == "initial" {
+	// and the original status was StatusCompletedWithFailures.
+	// If the state was StatusInProgress, we do not mark it as completed because it was interrupted mid-run.
+	if phase == "initial" && initialMigrationState != nil && initialMigrationState.Status == StatusCompletedWithFailures {
 		statePath := m.getInitialMigrationStatePath(pairIndex)
 		if failedCount == 0 {
 			m.log.Infof("DLQ retry: Initial migration completed successfully. Updating state file to StatusCompleted.")
@@ -1835,6 +1966,7 @@ func (m *Migrator) reprocessDLQLoop(ctx context.Context, tempPath string, newDLQ
 					runErr = fmt.Errorf("DLQ retry: Safety violation: encountered unsupported DLQ version %q (expected %q). Please use the correct migration tool version to reprocess this file.", header.DLQVersion, DLQVersion)
 					return "", 0, runErr
 				}
+				m.log.Infof("DLQ retry: DLQ file version %q matches tool DLQ version %q", header.DLQVersion, DLQVersion)
 				continue // skip version header line
 			}
 		}
@@ -1920,7 +2052,7 @@ func (m *Migrator) reprocessDLQLoop(ctx context.Context, tempPath string, newDLQ
 			}
 			newDLQ.WriteFailed(record.SourceDB, record.SourceCollection, record.DocumentID, writeErr, record.Phase, record.OpType, record.Document, eventTime)
 		} else {
-			m.log.Infof("DLQ retry: Successfully recovered document %v", record.DocumentID)
+			m.log.Debugf("DLQ retry: Successfully recovered document %v", record.DocumentID)
 			succeeded++
 		}
 	}
@@ -1949,4 +2081,21 @@ func (m *Migrator) restoreLeftoverTempDLQ(dlqPath, tempPath string) error {
 	m.log.Warnf("DLQ recovery: Leftover retry-temp file and incomplete active file found. Discarding active file and restoring %s to %s.", tempPath, dlqPath)
 	_ = os.Remove(dlqPath)
 	return os.Rename(tempPath, dlqPath)
+}
+
+// isSystemError checks if the write error is a general database/network error rather than a benign duplicate key error.
+func isSystemError(err error) bool {
+	if err == nil || err == context.Canceled {
+		return false
+	}
+	var bulkWriteException mongo.BulkWriteException
+	if errors.As(err, &bulkWriteException) {
+		for _, writeErr := range bulkWriteException.WriteErrors {
+			if writeErr.Code != 11000 { // 11000 is duplicate key
+				return true
+			}
+		}
+		return false
+	}
+	return true
 }

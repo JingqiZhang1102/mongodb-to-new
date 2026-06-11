@@ -12,6 +12,7 @@ Pipeline Architecture & Thread Lifecycle Map (Who Produces & Consumes):
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"strings"
@@ -923,11 +924,19 @@ func (w *Worker) executeBatchWrite(group OperationGroup) {
 	// Use a graceful shutdown context with timeout if the main context was canceled.
 	// This ensures the final queues flushed during Ctrl+C / shutdown can actually write to MongoDB.
 	writeCtx := w.ctx
+	var cancel context.CancelFunc
 	if w.ctx.Err() != nil {
-		var cancel context.CancelFunc
 		writeCtx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
+	} else {
+		// Enforce query-level timeout of 90 seconds to prevent workers getting stuck
+		// and tearing down TCP connections on driver socket timeout.
+		writeCtx, cancel = context.WithTimeout(w.ctx, 90*time.Second)
 	}
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+	}()
 
 	// Determine if we should use ordered operations
 	useOrdered := group.OpType == "update" || group.OpType == "replace" || w.forceOrderedOperations
@@ -1026,7 +1035,10 @@ func (w *Worker) handleBulkWriteResult(ctx context.Context, group *OperationGrou
 		return
 	}
 
-	bulkWriteException, ok := err.(mongo.BulkWriteException)
+	// Use errors.As instead of direct type assertion (err.(mongo.BulkWriteException))
+	// because the driver or retry wrapper may wrap the underlying BulkWriteException.
+	var bulkWriteException mongo.BulkWriteException
+	ok := errors.As(err, &bulkWriteException)
 	if ok && ctx.Err() != context.Canceled {
 		nonDupCount := 0
 		for _, writeErr := range bulkWriteException.WriteErrors {
