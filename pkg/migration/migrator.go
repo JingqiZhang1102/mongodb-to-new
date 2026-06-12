@@ -380,12 +380,8 @@ func (m *Migrator) startChangeStreamReplication(ctx context.Context, sourceDB, t
 	// Strict DLQ safety checks based on initial migration state
 	dlqPath := m.getDLQPath(pairIndex)
 	if initialMigrationState == nil || !initialMigrationState.IsCompleted() {
-		hasFailed, err := HasActiveFailedRecords(dlqPath)
-		if err != nil {
-			return fmt.Errorf("failed to check DLQ status: %w", err)
-		}
-		if hasFailed {
-			return fmt.Errorf("DLQ safety violation: active failures found in dead letter queue %s. Please reprocess these failures (using DLQ retry) or clear the queue before running the initial migration.", dlqPath)
+		if err := BackupAndClearDLQ(dlqPath, m.log); err != nil {
+			return fmt.Errorf("failed to backup and clear DLQ: %w", err)
 		}
 	} else {
 		if initialMigrationState.Status == StatusCompletedWithFailures {
@@ -455,12 +451,8 @@ func (m *Migrator) startOplogReplication(ctx context.Context, sourceDB, targetDB
 	// Strict DLQ safety checks based on initial migration state
 	dlqPath := m.getDLQPath(pairIndex)
 	if initialMigrationState == nil || !initialMigrationState.IsCompleted() {
-		hasFailed, err := HasActiveFailedRecords(dlqPath)
-		if err != nil {
-			return fmt.Errorf("failed to check DLQ status: %w", err)
-		}
-		if hasFailed {
-			return fmt.Errorf("DLQ safety violation: active failures found in dead letter queue %s. Please reprocess these failures (using DLQ retry) or clear the queue before running the initial migration.", dlqPath)
+		if err := BackupAndClearDLQ(dlqPath, m.log); err != nil {
+			return fmt.Errorf("failed to backup and clear DLQ: %w", err)
 		}
 	} else {
 		if initialMigrationState.Status == StatusCompletedWithFailures {

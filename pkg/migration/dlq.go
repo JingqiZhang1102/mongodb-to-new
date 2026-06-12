@@ -402,3 +402,20 @@ func HasActiveFailedRecords(filePath string) (bool, error) {
 	return false, scanner.Err()
 }
 
+// BackupAndClearDLQ renames the DLQ file if it exists and contains records, appending a timestamp to preserve history.
+func BackupAndClearDLQ(filePath string, log *logger.Logger) error {
+	hasFailed, err := HasActiveFailedRecords(filePath)
+	if err != nil {
+		return err
+	}
+	if !hasFailed {
+		return nil
+	}
+	backupPath := fmt.Sprintf("%s.backup-%s", filePath, time.Now().Format("20060102-150405"))
+	log.Infof("DLQ: Active failures from a previous interrupted run found. Backing up DLQ file to %s and starting fresh.", backupPath)
+	if err := os.Rename(filePath, backupPath); err != nil {
+		log.Fatalf("DLQ: Failed to backup DLQ file from %s to %s: %v", filePath, backupPath, err)
+	}
+	return nil
+}
+
