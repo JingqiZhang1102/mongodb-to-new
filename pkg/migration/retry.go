@@ -89,6 +89,7 @@ func (r *RetryManager) ClassifyError(err error) ErrorType {
 		strings.Contains(errStr, "OperationFailed") && strings.Contains(errStr, "Aborted") ||
 		strings.Contains(errStr, "TransientTransactionError") ||
 		strings.Contains(errStr, "WriteConflict") ||
+		strings.Contains(errStr, "schema change involving the indexes") ||
 		strings.Contains(errStr, "exceeded time limit") {
 		return ErrorTypeContention
 	}

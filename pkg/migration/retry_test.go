@@ -33,6 +33,9 @@ func TestClassifyError(t *testing.T) {
 	if r.ClassifyError(errors.New("TransientTransactionError")) != ErrorTypeContention {
 		t.Error("expected ErrorTypeContention")
 	}
+	if r.ClassifyError(errors.New("request was aborted due to a schema change involving the indexes used in the request. Retry the request to run against the updated schema")) != ErrorTypeContention {
+		t.Error("expected ErrorTypeContention for Firestore schema change index error")
+	}
 
 	// Invalid _id type error
 	if r.ClassifyError(errors.New("_id must be an objectId, string, long")) != ErrorTypeInvalidIdType {
