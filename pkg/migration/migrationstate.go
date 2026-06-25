@@ -67,7 +67,20 @@ func SaveInitialMigrationState(filePath string, status string, failedCount int64
 		return fmt.Errorf("failed to marshal initial migration state: %w", err)
 	}
 
-	return os.WriteFile(filePath, data, 0644)
+	return writeAtomic(filePath, data, 0644)
+}
+
+// writeAtomic writes data to a temporary file and atomically renames it to destination, preventing corruption on crashes.
+func writeAtomic(filePath string, data []byte, perm os.FileMode) error {
+	tmpPath := filePath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, perm); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, filePath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 // DeleteInitialMigrationState deletes the initial migration state file

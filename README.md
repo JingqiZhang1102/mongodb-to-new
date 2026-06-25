@@ -111,6 +111,29 @@ Here's a basic example:
 
 When no collections are specified, the tool will automatically detect all collections in the source database and migrate them to the target database with the same collection names.
 
+### Global Database-Level Upsert
+
+If you want to enable upsert mode globally for all collections (both explicitly mapped and auto-detected collections), you can specify `"upsertMode": true` at the target database level:
+
+```json
+{
+  "databasePairs": [
+    {
+      "source": {
+        "connectionString": "mongodb://localhost:27017/?replicaSet=rs0",
+        "database": "source_db"
+      },
+      "target": {
+        "connectionString": "mongodb://localhost:27017",
+        "database": "target_db",
+        "upsertMode": true
+      }
+    }
+  ],
+  "saveThreshold": 1000
+}
+```
+
 ### Specific Collections Migration
 
 If you want to migrate only specific collections or rename collections during migration, you can specify them explicitly:
@@ -146,10 +169,11 @@ If you want to migrate only specific collections or rename collections during mi
 - **databasePairs**: An array of objects, each defining a source MongoDB database and a target MongoDB database to replicate.
 - **connectionString**: The MongoDB connection string for source and target databases.
 - **database**: The name of the MongoDB database for source and target.
+- **upsertMode**: (Optional, target-level) Whether to use upsert operations globally by default for all collections in this target database instead of standard inserts. Default is false.
 - **collections**: (Optional) An array of objects, each defining a source MongoDB collection and a target MongoDB collection to replicate. If omitted, all collections will be migrated with the same names.
   - **sourceCollection**: The name of the collection in the source database.
   - **targetCollection**: The name of the collection in the target database.
-  - **upsertMode**: (Optional) Whether to use upsert operations instead of inserts. Default is false.
+  - **upsertMode**: (Optional) Whether to use upsert operations instead of inserts for this specific collection (overrides/complements the database-level default). Default is false.
 
 #### Checkpoint Configuration
 - **saveThreshold**: The number of changes to process before saving the resume token (for live replication).
@@ -162,6 +186,7 @@ If you want to migrate only specific collections or rename collections during mi
 - **initialMigrationWorkers**: Number of worker goroutines for batch processing during standard migration (default: 5).
 - **concurrentCollections**: Number of collections to process concurrently (default: 4).
 - **incrementalReadBatchSize**: Number of change events to read at once (default: 8192).
+- **incrementalStreamPartitions**: Number of parallel sharded change stream readers at MongoDB source level (default: 1).
 - **incrementalWriteBatchSize**: Maximum size of operation groups (default: 128).
 - **incrementalWorkerCount**: Number of worker goroutines for incremental replication (default: number of CPU cores).
 - **statsIntervalMinutes**: Interval for reporting change stream statistics in minutes (default: 5).
@@ -173,8 +198,20 @@ If you want to migrate only specific collections or rename collections during mi
 - **incrementalProcessingQueueSize**: Buffer size of the concurrent workers' writing batches queue channel (default: 4096). Bounding this to a small number (e.g. 2 or 4) applies strict in-memory backpressure, preventing memory backups and capping Queue Latency under slow writes.
 - **forceOrderedOperations**: Whether to force ordered operations for all operation types (default: false). When false, insert and delete operations use unordered bulk writes for better performance, while update and replace operations always use ordered bulk writes to ensure consistency.
 
+#### Write Ramp-Up Configuration (Initial Backfill Throttling)
+- **backfillRampUp**: Configuration for linear write QPS throttling during the initial migration (backfill) phase to prevent overloading target databases (e.g. Cloud Spanner) before autoscaling reacts.
+  - **enabled**: Set to `true` to enable write QPS throttling (default: `false`).
+  - **startQps**: The initial QPS rate limit from which the migration writes start (default: `0.0`).
+  - **rampRatePerMin**: The linear rate (QPS increase per minute) at which the throttler ceiling grows. Set to `0` or omit to allow the write speed limit to grow linearly forever without any ceiling cap. (default: `10000.0` - reaching 100K QPS in 10 minutes). Note: The throttler automatically disables itself (sets limit to Infinity) once the allowed rate reaches 100K QPS.
+  - **updateIntervalMs**: The interval in milliseconds at which the throttler background worker recalculates and applies the new rate limit (default: `1000` ms / 1 second).
+
 #### Parallel Reads Configuration
 - **parallelReadsEnabled**: Enable parallel reads for large collections (default: true).
+- **idTypeForPartition**: BSON Partitioning ID strategy type for collection partitioning. Supported values:
+  - `"auto"` (default): Automatically detects strategy by sampling `sampleSize` documents and choosing `"objectid"`, `"numeric"`, or `"mixed"` accordingly.
+  - `"mixed"`: Generic range-sampling strategy suitable for collections with mixed ID types.
+  - `"objectid"`: Optimized strategy for collections where `_id` values are mainly BSON `ObjectID`s.
+  - `"numeric"`: Optimized strategy for collections where `_id` values are numbers (integers or doubles).
 - **maxReadPartitions**: Maximum number of partitions for parallel reads (default: 8).
 - **minDocsPerPartition**: Minimum number of documents per partition (default: 10000).
 - **minDocsForParallelReads**: Minimum collection size for parallel reads (default: 50000).
@@ -188,7 +225,26 @@ If you want to migrate only specific collections or rename collections during mi
   - **maxDelayMs**: Maximum delay in milliseconds (default: 5000).
   - **enableBatchSplitting**: Enable batch splitting for contention errors (default: true).
   - **minBatchSize**: Minimum batch size for splitting (default: 10).
-  - **convertInvalidIds**: Automatically convert invalid _id types to string (default: true). When enabled, the system will detect errors like "_id must be an objectId, string, long; found int" and automatically convert the problematic _id fields to strings.
+  - **convertInvalidIds**: Automatically convert invalid `_id` types to string (default: `true`).
+    - **In Live Paths (Live Backfill & Live Incremental streaming):** Proactively detects unsupported `_id` datatypes before writing to the target, and serializes them into deterministic type-prefixed strings.
+      * *Example BSON ID conversion:*
+        - **Source ID:** `_id: [1, 2] (Array)`
+        - **Target ID:** `_id: "_converted:array:[1,2]" (String)`
+      * *Supported type mappings:* `bool` (`_converted:bool:`), `int` (`_converted:int:`), `int32` (`_converted:int32:`), `double` (`_converted:double:`), `float` (`_converted:float:`), `datetime` (`_converted:datetime:`), `binary` (`_converted:binary:`), `array` (`_converted:array:`), `document` (`_converted:document:`).
+    - **In Normal Backfill (`-mode=migrate`):** Reactively catches database write failures (due to invalid `_id` types), splits the batch, converts failing invalid `_id` values to string using simple formatting, and retries.
+      * *Example BSON ID conversion:*
+        - **Source ID:** `_id: [1, 2] (Array)`
+        - **Target ID:** `_id: "[1 2]" (String)`
+
+#### Field Transformation Configuration
+- **dropEmptyFieldNames**: Automatically remove empty field names (e.g., `""`) from document keys to satisfy target compatibility (default: `false`).
+  * *Example transformation:*
+    - **Source payload:** `{ "_id": "test", "": "empty-val", "name": "user" }`
+    - **Target payload:** `{ "_id": "test", "name": "user" }`
+- **convertLongFieldNamesInNestedDocs**: Automatically stringify nested subdocuments containing field names exceeding 1,000 characters to a JSON string to satisfy target key-length compatibility constraints (default: `false`).
+  * *Example transformation:*
+    - **Source payload:** `{ "nested": { "<long_key_1001_chars>": "value" } }`
+    - **Target payload:** `{ "nested": "{\"<long_key_1001_chars>\":\"value\"}" }`
 
 #### Index Synchronization Configuration
 - **syncAllIndexes**: (Optional) When set to `true`, automatically syncs all indexes (excluding `_id_`) from every source collection to the corresponding target collection. Default is `false`.
@@ -439,25 +495,45 @@ When no `collections` are specified (as above), the tool will automatically dete
 
    The application will continuously listen for changes in the specified MongoDB collections and replicate them to the target MongoDB.
 
-3. Additional Options:
+3. Dry Run and Compatibility Reports:
+
+   To dry run a migration (which runs connectivity and compatibility validation, checks target database support for various datatypes/key limits, and samples source collections to output partitioning recommendations):
+
+   ```bash
+   ./migrate -mode=migrate -dry-run
+   ```
+
+   **How it works:**
+   - **Target Connection & Validation:** The tool connects to the target database specified in the configuration file to verify connectivity and compatibility. It prints target support reports for `_id` types, long nested fields, and empty key names without writing actual records.
+   - **In Backfill Modes (`-mode=migrate` or `live` initial phase):** It runs target checks, samples a small subset of documents (e.g. 1000) from source collections to recommend partition boundaries and ID strategy configurations, and exits immediately. It skips scanning/reading full collection payloads.
+   - **In Incremental Modes (`-mode=live-only` or `live` streaming phase):** It starts change stream/oplog replication threads, pulls events from source database partitions, and outputs real-time ingestion lag stats. However, it discards events before formatting/sending writes to the target. This is useful for safely measuring network pre-fetching performance and verifying that the configured sharded change stream partitioning (`incrementalStreamPartitions`) functions correctly on active production setups.
+   - **Safety:** No write operations or state checkpoints are committed to either source or target systems.
+
+4. Additional Options:
 
    ```bash
    ./migrate -help
    ```
 
-   This will display all available command-line options:
+    This will display all available command-line options:
 
-   ```
-   Options:
-     -config string
-           Path to configuration file (default "mongodb_replication_config.json")
-     -mode string
-           Operation mode: 'migrate' or 'live' (default "migrate")
-     -log-level string
-           Log level: debug, info, warn, error (default "info")
-     -help
-           Display this help information
-   ```
+    ```
+    Options:
+      -config string
+            Path to configuration file (default "mongodb_replication_config.json")
+      -mode string
+            Operation mode: 'migrate', 'live', or 'live-only' (default "migrate")
+      -log-level string
+            Log level: debug, info, warn, error (default "info")
+      -log-file string
+            Path to log file (logs to both stdout and file when specified)
+      -live-start-timestamp string
+            Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)
+      -dry-run
+            Dry run mode (skips writes, outputs partitioning recommendations on backfill)
+      -help
+            Display this help information
+    ```
 
 ## Key Features
 
@@ -492,10 +568,12 @@ The application implements parallelism at multiple levels to maximize performanc
    - Provides an additional level of parallelism for large collections
 
 5. **Change Stream Parallelism** (Live Mode):
-   - In live mode, a client-level change stream watches all collections
-   - Change events are distributed to workers based on document ID hash
-   - Controlled by the `incrementalWorkerCount` parameter (default: CPU cores)
-   - Ensures operations for the same document are always processed by the same worker
+   - **Sharded Ingestion Partitions**: Controlled by `incrementalStreamPartitions`. The system spawns parallel sharded change streams at the MongoDB source level
+   - **Hashing-based Server-Side Filtering**: At ingestion time, the system splits the change streams lock-freely using a server-side modulo hash filter on document ID values:
+     `hash(documentKey._id) % totalPartitions == partitionIndex`
+     This ensures that each of the parallel change streams receives a completely disjoint, non-overlapping subset of oplog events, enabling parallelized high-throughput ingestion
+   - **Worker Hash Distribution**: Within the replicator, the `partition router` further distributes events across `transformer and batcher` worker threads (controlled by `incrementalWorkerCount`) using document ID key hashing
+   - **Sequential Consistency**: This ensures that all operations for the same document ID always go to the same worker and are processed in their strict chronological sequence
 
 ### Tuning Parallelism Parameters
 

@@ -1,7 +1,18 @@
 package migration
 
+/*
+Pipeline Architecture & Thread Lifecycle Map (Who Produces & Consumes):
+
+| Queue Stage     | Added to by (Producers)                                 | Removed from by (Consumers)                               | Role in the Pipeline |
+| :-------------- | :------------------------------------------------------ | :-------------------------------------------------------- | :------------------- |
+| ingestQueue     | source readers (1 per change stream source)             | partition router (1 central thread)                       | Buffers raw change stream events fetched from TCP sockets, waiting to be sorted and partitioned. |
+| batchingQueue   | partition router (1 central thread)                       | transformer and batcher (1 per active worker)             | Buffers partitioned events routed to a specific worker, waiting to be batched and grouped. |
+| batchWriteQueue | transformer and batcher (1 per active worker)             | target writers (1 per active worker)                       | Buffers finalized, ready-to-write batch task payloads (OperationGroup), waiting to be committed to target DB. |
+*/
+
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"strings"
@@ -23,8 +34,8 @@ type EventDistributor struct {
 	incrementalWorkerCount    int
 	sourceDB                  *db.MongoDB
 	targetDB                  *db.MongoDB
-	collectionMap             map[string]map[string]string
-	changeStream              *mongo.ChangeStream
+	collectionConfigs         map[string]map[string]config.CollectionConfig
+	changeStreams             []*mongo.ChangeStream
 	ctx                       context.Context
 	log                       *logger.Logger
 	resumeTokenPath           string
@@ -37,31 +48,35 @@ type EventDistributor struct {
 	retryManager              *RetryManager // Retry manager for transient errors
 
 	// Statistics tracking
-	statsManager *StatsManager // Manager for statistics and replication lag
+	incrementalStatsManager *IncrementalStatsManager // Manager for statistics and replication lag
 	cfg          *config.Config
+	DryRun       bool // Dry run flag
+
+	partitionTracker *PartitionTracker // Thread-safe ack-based progress checkpoint tracker
 }
 
 // NewEventDistributor creates a new event distributor
 func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
-	collectionMap map[string]map[string]string,
-	changeStream *mongo.ChangeStream, log *logger.Logger,
+	collectionConfigs map[string]map[string]config.CollectionConfig,
+	changeStreams []*mongo.ChangeStream, log *logger.Logger,
 	resumeTokenPath string, checkpointInterval time.Duration,
 	saveThreshold, incrementalWorkerCount, incrementalWriteBatchSize int,
-	forceOrderedOperations bool, flushInterval time.Duration, cfg *config.Config, dlq DLQ) *EventDistributor {
-
-	// Use stats interval from config
-	statsInterval := time.Duration(cfg.StatsIntervalMinutes) * time.Minute
+	forceOrderedOperations bool, flushInterval time.Duration, cfg *config.Config, dlq DLQ, incrementalStatsManager *IncrementalStatsManager) *EventDistributor {
 
 	// Create retry manager from config
 	retryMgr := NewRetryManagerFromConfig(cfg, log)
+
+	tracker := NewPartitionTracker(log, resumeTokenPath, checkpointInterval, saveThreshold, len(changeStreams))
+	// Start the periodic checkpoint flush loop
+	tracker.Start(ctx)
 
 	return &EventDistributor{
 		workers:                   make([]*Worker, incrementalWorkerCount),
 		incrementalWorkerCount:    incrementalWorkerCount,
 		sourceDB:                  sourceDB,
 		targetDB:                  targetDB,
-		collectionMap:             collectionMap,
-		changeStream:              changeStream,
+		collectionConfigs:         collectionConfigs,
+		changeStreams:             changeStreams,
 		ctx:                       ctx,
 		log:                       log,
 		resumeTokenPath:           resumeTokenPath,
@@ -73,9 +88,8 @@ func NewEventDistributor(ctx context.Context, sourceDB, targetDB *db.MongoDB,
 		dlq:                       dlq,
 		retryManager:              retryMgr,
 		cfg:                       cfg,
-
-		// Initialize statistics tracking
-		statsManager: NewStatsManager(log, statsInterval, cfg.GroupOpsByDistinctId),
+		incrementalStatsManager:              incrementalStatsManager,
+		partitionTracker:          tracker,
 	}
 }
 
@@ -88,7 +102,7 @@ func hashDocumentID(docID interface{}) int {
 	case string:
 		bytes = []byte(id)
 	case primitive.ObjectID:
-		bytes = []byte(id.Hex())
+		bytes = id[:]
 	case int, int32, int64, float64, float32:
 		bytes = []byte(fmt.Sprintf("%v", id))
 	case bson.D:
@@ -122,168 +136,325 @@ func (d *EventDistributor) getWorkerIndex(docID interface{}) int {
 	return ((hash % d.incrementalWorkerCount) + d.incrementalWorkerCount) % d.incrementalWorkerCount
 }
 
-// waitForWorkersToFinish waits for all workers to finish processing
-func (d *EventDistributor) waitForWorkersToFinish() {
-	d.log.Info("Waiting for all workers to finish processing...")
-	for _, worker := range d.workers {
-		worker.WaitForCompletion()
-	}
-	d.log.Info("All workers have completed processing.")
-}
-
+// Start begins the event distribution process
 // Start begins the event distribution process
 func (d *EventDistributor) Start() error {
-	d.log.Infof("Starting event distributor with %d workers (GroupOpsByDistinctId: %t)", d.incrementalWorkerCount, d.cfg.GroupOpsByDistinctId)
+	d.log.Infof("Starting event distributor with %d workers (GroupOpsByDistinctId: %t, changeStreams: %d)", d.incrementalWorkerCount, d.cfg.GroupOpsByDistinctId, len(d.changeStreams))
+
+	// Concurrency Architecture (Sub-Context Coordination for Fail-Fast Partitioning):
+	// We establish a cancelCtx child context linked to a thread-safe terminal error store (termErr).
+	// If any sharded partition change stream reader background thread encounters a connection drop, cursor
+	// invalidation, or EOF, it triggers cancel() via the setError helper. This fail-fast design immediately
+	// signals exit paths across all concurrent readers (unblocking changeStream.Next) and the central distributor
+	// consumer routing loop (unblocking select <-cancelCtx.Done()), preventing quiet data loss or silent freezes.
+	cancelCtx, cancel := context.WithCancel(d.ctx)
+	defer cancel()
+
+	var errOnce sync.Once
+	var termErr error
+	setError := func(err error) {
+		errOnce.Do(func() {
+			termErr = err
+		})
+		cancel()
+	}
 
 	// Start the statistics manager periodic reporting
-	if d.statsManager != nil {
-		d.statsManager.Start(d.ctx)
+	if d.incrementalStatsManager != nil {
+		d.incrementalStatsManager.Start(cancelCtx)
+	}
+
+	transformer := NewFieldTransformer(d.cfg.DropEmptyFieldNames, d.cfg.ConvertLongFieldNamesInNestedDocs, d.cfg.RetryConfig.ConvertInvalidIds, d.log)
+
+	// Pre-populate the active failed document IDs from the DLQ file on startup
+	var activeFailedIDs map[string]string
+	var activeFailedMu sync.RWMutex
+	if d.dlq != nil && d.dlq.FilePath() != "" {
+		d.log.Info("DLQ resolution ledger: performing pre-scan startup check...")
+		var scanErr error
+		activeFailedIDs, scanErr = PopulateActiveFailedIDs(d.dlq.FilePath(), d.log)
+		if scanErr != nil {
+			d.log.Warnf("DLQ resolution ledger: failed to pre-scan DLQ file: %v (continuing without resolution logging)", scanErr)
+		} else {
+			d.log.Infof("DLQ resolution ledger: loaded %d active failed IDs on startup", len(activeFailedIDs))
+			if d.incrementalStatsManager != nil {
+				d.incrementalStatsManager.SetActiveFailedIDs(activeFailedIDs, &activeFailedMu)
+			}
+		}
 	}
 
 	// Initialize workers with retry manager and stats manager
 	for i := 0; i < d.incrementalWorkerCount; i++ {
-		d.workers[i] = NewWorker(i, d.ctx, d.log, d.targetDB, d.collectionMap, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.statsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval, d.cfg.IncrementalIncomingQueueSize, d.cfg.IncrementalProcessingQueueSize)
+		d.workers[i] = NewWorker(i, cancelCtx, d.log, d.targetDB, d.collectionConfigs, d.incrementalWriteBatchSize, d.forceOrderedOperations, d.dlq, d.retryManager, d.incrementalStatsManager, d.cfg.GroupOpsByDistinctId, d.flushInterval, d.cfg.IncrementalIncomingQueueSize, d.cfg.IncrementalProcessingQueueSize, transformer)
+		d.workers[i].SetPartitionTracker(d.partitionTracker)
+		if activeFailedIDs != nil {
+			d.workers[i].SetActiveFailedIDs(activeFailedIDs, &activeFailedMu)
+		}
 	}
 
-	// Set up context cancellation handling
-	go func() {
-		<-d.ctx.Done()
-		d.log.Info("Context canceled. Shutting down workers...")
+	// Ensure all workers are shut down sequentially and safely upon exit
+	defer func() {
+		if d.incrementalStatsManager != nil {
+			d.incrementalStatsManager.RegisterQueues(nil, nil)
+		}
+		d.log.Info("Shutting down workers...")
 		for _, worker := range d.workers {
-			worker.Shutdown()
+			if worker != nil {
+				worker.Shutdown()
+			}
+		}
+		if d.partitionTracker != nil {
+			d.log.Info("Flushing final resume tokens...")
+			d.partitionTracker.Close()
 		}
 	}()
 
-	// Main loop to read from change stream and distribute events
-	var changeCount int
-	lastCheckpointTime := time.Now()
+	// Ingest queue for concurrent reader threads to publish events.
+	// Capacity scales with the number of streams to avoid memory lockups and hold multiple batches safely.
+	ingestQueue := make(chan QueueEvent, d.cfg.IncrementalIncomingQueueSize*len(d.changeStreams))
+	if d.incrementalStatsManager != nil {
+		d.incrementalStatsManager.RegisterQueues(d.workers, ingestQueue)
+	}
+	var readerWg sync.WaitGroup
 
-	for {
-		// Check for context cancellation before processing next event
-		if d.ctx.Err() != nil {
-			d.log.Info("Context canceled. Stopping event distribution...")
-			// Wait for all workers to finish processing their current operations
-			d.waitForWorkersToFinish()
-			// Return nil instead of context.Canceled to avoid error logging
-			return nil
-		}
+	// Spawn concurrent background reader threads (Producer routines) for each sharded change stream.
+	// This implements Asynchronous Prefetching (overlapping CPU allocation/routing and Network I/O):
+	// while the distributor is routing batch A, these background loops are already prefetching batch B
+	// over their respective TCP sockets, delivering a massive throughput/WPS scale-out!
+	for idx, stream := range d.changeStreams {
+		readerWg.Add(1)
+		go func(streamIndex int, changeStream *mongo.ChangeStream) {
+			defer readerWg.Done()
 
-		// Try to get next change event
-		ok := d.changeStream.Next(d.ctx)
-		if !ok {
-			// Check if this is due to an error or end of stream
-			if err := d.changeStream.Err(); err != nil {
-				// Check if the error is due to context cancellation
-				if err == context.Canceled {
-					d.log.Info("Change stream interrupted due to context cancellation")
-				} else {
-					d.log.Errorf("Change stream error: %v", err)
+			for {
+				// Block on network socket until the next batch is fetched/returned by the driver
+				startTime := time.Now()
+				ok := changeStream.Next(cancelCtx)
+				latency := time.Since(startTime)
+				readTime := time.Now()
+
+				if !ok {
+					// Reader EOF/Error Assessment:
+					// Next returning false indicates the stream partition has terminated. We analyze the root cause:
+					if err := changeStream.Err(); err != nil {
+						if err == context.Canceled {
+							// Normal shutdown path coordinated by cancelCtx sub-context
+							d.log.Infof("[Reader %d] Change stream interrupted by cancellation", streamIndex)
+							return
+						}
+						// Shard connection drop or database partition error: log and bubble up to pipeline controller
+						d.log.Errorf("[Reader %d] Change stream error: %v", streamIndex, err)
+						setError(err)
+					} else {
+						// Unexpected empty return (EOF cursor closure without explicit driver error string):
+						// Bubble up custom error so supervisor knows this partition has stopped feeding events.
+						d.log.Errorf("[Reader %d] Change stream cursor closed unexpectedly", streamIndex)
+						setError(fmt.Errorf("change stream reader %d closed unexpectedly", streamIndex))
+					}
+					return
 				}
-				// Wait for all workers to finish processing their current operations
-				d.waitForWorkersToFinish()
-				// Don't propagate context.Canceled as an error
-				if err == context.Canceled {
-					return nil
+
+				rawEvent := changeStream.Current
+				size := len(rawEvent)
+
+				if d.incrementalStatsManager != nil {
+					d.incrementalStatsManager.RecordReadMetric(streamIndex, latency, size)
 				}
-				return err
+
+				if d.DryRun {
+					if d.incrementalStatsManager != nil {
+						eventTime := ExtractEventTimeFromRaw(rawEvent)
+						d.incrementalStatsManager.RecordDryRunLag(eventTime, readTime)
+					}
+					continue
+				}
+
+				// Deep copy BSON raw bytes safely for cross-thread channel transfers
+				rawCopy := make(bson.Raw, len(rawEvent))
+				copy(rawCopy, rawEvent)
+
+				resumeToken := changeStream.ResumeToken()
+				eventTime := ExtractEventTimeFromRaw(rawCopy)
+				var seqNum uint64
+				if d.partitionTracker != nil {
+					seqNum = d.partitionTracker.Register(streamIndex, resumeToken, eventTime)
+				}
+
+				event := QueueEvent{
+					Event:       rawCopy,
+					ReadTime:    readTime,
+					StreamIndex: streamIndex,
+					SeqNum:      seqNum,
+				}
+
+				select {
+				case ingestQueue <- event:
+				case <-cancelCtx.Done():
+					if d.partitionTracker != nil {
+						d.partitionTracker.Ack(streamIndex, seqNum)
+					}
+					return
+				}
 			}
-			// End of stream, break out of the loop
-			break
-		}
-
-		// Get raw change event bytes
-		rawEvent := d.changeStream.Current
-
-		// Extract operationType via fast binary lookup
-		opTypeVal, err := rawEvent.LookupErr("operationType")
-		if err != nil {
-			d.log.Errorf("Invalid raw change event: missing operationType")
-			continue
-		}
-		opType := opTypeVal.StringValue()
-
-		if d.statsManager != nil {
-			d.statsManager.IncrementEventsReceived(opType)
-		}
-
-		// Extract documentKey._id via fast binary lookup
-		docKeyVal, err := rawEvent.LookupErr("documentKey")
-		if err != nil {
-			d.log.Errorf("Invalid raw change event: missing documentKey")
-			continue
-		}
-		docKeyRaw := docKeyVal.Document()
-		docIDVal, err := docKeyRaw.LookupErr("_id")
-		if err != nil {
-			d.log.Errorf("Invalid raw change event: missing documentKey._id")
-			continue
-		}
-
-		var docID interface{}
-		if err := docIDVal.Unmarshal(&docID); err != nil {
-			d.log.Errorf("Error unmarshaling documentKey._id from raw BSON: %v", err)
-			continue
-		}
-
-		// Determine worker based on hash modulo worker count
-		workerIndex := d.getWorkerIndex(docID)
-
-		// Safe concurrent deep copy of raw BSON bytes to prevent mutation races
-		rawCopy := make(bson.Raw, len(rawEvent))
-		copy(rawCopy, rawEvent)
-
-		// Send raw event copy to appropriate worker concurrently
-		select {
-		case d.workers[workerIndex].incomingQueue <- rawCopy:
-		case <-d.ctx.Done():
-			return nil
-		}
-
-		// Handle resume token checkpointing
-		changeCount++
-		now := time.Now()
-		timeBasedCheckpoint := now.Sub(lastCheckpointTime) >= d.checkpointInterval
-		countBasedCheckpoint := changeCount >= d.saveThreshold
-
-		if timeBasedCheckpoint || countBasedCheckpoint {
-			d.saveResumeToken(d.changeStream.ResumeToken())
-
-			// Reset counters
-			lastCheckpointTime = now
-			changeCount = 0
-		}
+		}(idx, stream)
 	}
 
-	// Wait for all workers to finish processing their current operations
-	d.waitForWorkersToFinish()
+	// Spin up cleanup supervisor to close the queue once all threads have terminated
+	go func() {
+		readerWg.Wait()
+		close(ingestQueue)
+	}()
 
-	return nil
+	// Main loop (Consumer routine) to distribute events from the shared pre-fetched queue to workers.
+	// Since background threads keep this shared queue populated, the main distributor thread loop
+	// experiences near-zero wait I/O delay and can route events lock-freely at top speeds!
+	for {
+		select {
+		case event, ok := <-ingestQueue:
+			if !ok {
+				// All reader threads completed. If there was a termination error, return it!
+				if termErr != nil {
+					return termErr
+				}
+				return nil
+			}
+			event.DistributorTime = time.Now()
+
+			rawEvent, ok := event.Event.(bson.Raw)
+			if !ok {
+				if d.partitionTracker != nil {
+					d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
+				}
+				continue
+			}
+
+			// Non-DML / Control Event Graceful Filtering (Prevent Log Pollution):
+			// Change streams report DDL/system events (like drops, invalidations, index changes) that do not have
+			// a documentKey payload. We identify these via fast BSON type-validated binary lookup.
+			// Safety Boundary: If the event is a collection drop ("drop"), we treat it as a terminal failure to prevent silent data loss.
+			// For other harmless/unsupported non-DML events, we skip them cleanly with partition progress sequence ACKs.
+			opTypeVal, err := rawEvent.LookupErr("operationType")
+			if err == nil && opTypeVal.Type == bson.TypeString {
+				opType := opTypeVal.StringValue()
+				if opType == "drop" {
+					var nsCtx string
+					if ns := ExtractNamespaceFromRawEvent(rawEvent); ns != "" {
+						nsCtx = " " + ns
+					}
+					return fmt.Errorf("terminal failure: collection drop event detected in partition %d%s", event.StreamIndex, nsCtx)
+				}
+				if opType != "insert" && opType != "update" && opType != "replace" && opType != "delete" {
+					d.log.Warnf("Skipping unsupported change stream event type %q", opType)
+					if d.incrementalStatsManager != nil {
+						d.incrementalStatsManager.RecordSkippedEvent(opType)
+					}
+					if d.partitionTracker != nil {
+						d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
+					}
+					continue
+				}
+			}
+
+			// Extract documentKey._id via fast binary lookup
+			docKeyVal, err := rawEvent.LookupErr("documentKey")
+			if err != nil {
+				d.log.Errorf("Invalid raw change event: missing documentKey")
+				if d.partitionTracker != nil {
+					d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
+				}
+				continue
+			}
+			docKeyRaw := docKeyVal.Document()
+			docIDVal, err := docKeyRaw.LookupErr("_id")
+			if err != nil {
+				d.log.Errorf("Invalid raw change event: missing documentKey._id")
+				if d.partitionTracker != nil {
+					d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
+				}
+				continue
+			}
+
+			// Determine worker index deterministically by key hashing
+			hash := hashBytes(docIDVal.Value)
+			workerIndex := ((hash % d.incrementalWorkerCount) + d.incrementalWorkerCount) % d.incrementalWorkerCount
+
+			// Dispatch event to the target worker channel
+			event.DistributorPushTime = time.Now()
+			pushStart := time.Now()
+			select {
+			case d.workers[workerIndex].batchingQueue <- event:
+				stall := time.Since(pushStart)
+				if stall > 1*time.Millisecond && d.incrementalStatsManager != nil {
+					d.incrementalStatsManager.RecordBatchingQueueStall(stall)
+				}
+			case <-cancelCtx.Done():
+				if d.partitionTracker != nil {
+					d.partitionTracker.Ack(event.StreamIndex, event.SeqNum)
+				}
+				if termErr != nil {
+					return termErr
+				}
+				return nil
+			}
+
+		case <-cancelCtx.Done():
+			if termErr != nil {
+				return termErr
+			}
+			return nil
+		}
+	}
 }
 
-// saveResumeToken saves the current resume token
+// saveResumeToken is left as a legacy stub for single-stream compatibility
 func (d *EventDistributor) saveResumeToken(resumeToken bson.Raw) {
+	d.savePartitionResumeToken(0, resumeToken)
+}
+
+// savePartitionResumeToken saves the resume token for a specific stream partition
+func (d *EventDistributor) savePartitionResumeToken(partitionIndex int, resumeToken bson.Raw) {
 	var resumeTokenDoc bson.M
 	if err := bson.Unmarshal(resumeToken, &resumeTokenDoc); err != nil {
-		d.log.Errorf("Error unmarshaling resume token: %v", err)
+		d.log.Errorf("[Reader %d] Error unmarshaling resume token: %v", partitionIndex, err)
 		return
 	}
 
-	if err := SaveResumeToken(d.resumeTokenPath, resumeTokenDoc); err != nil {
-		d.log.Errorf("Error saving resume token: %v", err)
+	path := GetPartitionResumeTokenPath(d.resumeTokenPath, partitionIndex, len(d.changeStreams))
+	if err := SaveResumeToken(path, resumeTokenDoc); err != nil {
+		d.log.Errorf("[Reader %d] Error saving resume token to %s: %v", partitionIndex, path, err)
 	} else {
-		d.log.Infof("Saved resume token successfully")
+		d.log.Debugf("[Reader %d] Saved resume token successfully to %s", partitionIndex, path)
 	}
+}
+
+// QueueEvent wraps the raw change stream or oplog event with metadata like read time
+type QueueEvent struct {
+	Event               interface{} // bson.M or bson.Raw
+	ReadTime            time.Time
+	DistributorTime     time.Time
+	DistributorPushTime time.Time
+	StreamIndex         int
+	SeqNum              uint64
 }
 
 // WriteOperation represents a single write operation
 type WriteOperation struct {
-	DocumentID        interface{}
-	Document          interface{}
-	UpdateDescription interface{} // For modifier updates ($set, $inc, etc.)
-	Namespace         string
-	OpType            string
-	EventTime         time.Time
-	ReceiveTime       time.Time
+	DocumentID          interface{}
+	Document            interface{}
+	TransformedDocument interface{} // Pre-calculated transformed document for Firestore/Spanner compatibility
+	UpdateDescription   interface{} // For modifier updates ($set, $inc, etc.)
+	Namespace           string
+	OpType              string
+	// Stats
+	EventTime         time.Time // Time when the change event occurred on the source database (clusterTime or wallTime)
+	ReadTime          time.Time // Time when the event was read from the change stream/oplog by the distributor
+	WorkerReceiveTime time.Time // Time when the event was received by the worker thread goroutine
+	SuccessTime       time.Time // Set when successfully written to target DB
+	SuccessAfterRetry bool      // Set to true if the operation succeeded after a retry
+	DLQed             bool      // Track if the operation was routed to the DLQ
+	Error             error     // Track the exact write failure error
+	StreamIndex       int
+	SeqNum            uint64
 }
 
 // OperationGroup represents a group of operations of the same type and namespace
@@ -296,21 +467,21 @@ type OperationGroup struct {
 
 // Worker processes change events for a subset of documents
 type Worker struct {
-	id            int
-	ctx           context.Context
-	log           *logger.Logger
-	targetDB      *db.MongoDB
-	collectionMap map[string]map[string]string
-	statsManager  *StatsManager
+	id                int
+	ctx               context.Context
+	log               *workerLogger
+	targetDB          *db.MongoDB
+	collectionConfigs map[string]map[string]config.CollectionConfig
+	incrementalStatsManager      *IncrementalStatsManager
 
 	// Queue of raw change events waiting to be partitioned and batched concurrently
-	incomingQueue chan interface{}
+	batchingQueue chan interface{}
 
 	// Current group being built
 	currentGroup *OperationGroup
 
 	// Queue of groups waiting to be processed
-	processingQueue chan *OperationGroup
+	batchWriteQueue chan *OperationGroup
 
 	// Maximum group size
 	incrementalWriteBatchSize int
@@ -335,20 +506,52 @@ type Worker struct {
 
 	// Dynamic grouping configurations
 	groupOpsByDistinctId bool
-	currentGroupIDs     map[int]bool
-	flushInterval       time.Duration
+	currentGroupIDs      map[int]bool
+	flushInterval        time.Duration
+	partitionTracker     *PartitionTracker
+	transformer          *FieldTransformer
+
+	// Map to track active failed document IDs for Resolution Tombstoning
+	activeFailedIDs map[string]string
+	activeFailedMu  *sync.RWMutex
 }
 
-// flushCurrentGroup moves the current group to the processing queue if it exists
+// SetPartitionTracker sets the PartitionTracker for this worker
+func (w *Worker) SetPartitionTracker(tracker *PartitionTracker) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.partitionTracker = tracker
+}
+
+// SetActiveFailedIDs sets the shared map and lock for tracking active failed document IDs
+func (w *Worker) SetActiveFailedIDs(m map[string]string, mu *sync.RWMutex) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.activeFailedIDs = m
+	w.activeFailedMu = mu
+}
+
+// pushToBatchWriteQueue sends a completed group to the batch write queue while tracking any block/stall durations
+func (w *Worker) pushToBatchWriteQueue(group *OperationGroup) {
+	start := time.Now()
+	w.batchWriteQueue <- group
+	stall := time.Since(start)
+	if stall > 1*time.Millisecond && w.incrementalStatsManager != nil {
+		w.incrementalStatsManager.RecordBatchWriteQueueStall(stall)
+	}
+}
+
+// flushCurrentGroup moves the current group to the batch write queue if it exists
 func (w *Worker) flushCurrentGroup() bool {
 	// Must be called with lock held
 	if w.currentGroup != nil && len(w.currentGroup.Operations) > 0 {
-		w.log.Debugf("Worker %d: Flushing group: %s.%s with %d operations",
-			w.id, w.currentGroup.Namespace, w.currentGroup.OpType,
+		w.log.Debugf("Flushing group: %s.%s with %d operations",
+			w.currentGroup.Namespace, w.currentGroup.OpType,
 			len(w.currentGroup.Operations))
 
-		w.processingQueue <- w.currentGroup
+		w.pushToBatchWriteQueue(w.currentGroup)
 		w.currentGroup = nil
+		w.currentGroupIDs = make(map[int]bool)
 		return true
 	}
 	return false
@@ -356,18 +559,25 @@ func (w *Worker) flushCurrentGroup() bool {
 
 type statsTrackingDLQ struct {
 	underlyingDlq DLQ
-	statsManager  *StatsManager
+	incrementalStatsManager  *IncrementalStatsManager
 }
 
-func (s *statsTrackingDLQ) WriteFailed(sourceDB, sourceCollection string, documentID interface{}, err error, phase, opType string, document interface{}) {
-	s.underlyingDlq.WriteFailed(sourceDB, sourceCollection, documentID, err, phase, opType, document)
-	if s.statsManager != nil {
-		s.statsManager.IncrementEventsFailed(opType)
-	}
+func (s *statsTrackingDLQ) WriteFailed(sourceDB, sourceCollection string, documentID interface{}, err error, phase, opType string, document interface{}, eventTime time.Time) {
+	s.underlyingDlq.WriteFailed(sourceDB, sourceCollection, documentID, err, phase, opType, document, eventTime)
+	// Incremented in incrementalStatsManager.RecordLags to prevent double counting and maintain context
+}
+
+func (s *statsTrackingDLQ) WriteResolved(sourceDB, sourceCollection string, documentID interface{}, phase string, eventTime time.Time) {
+	s.underlyingDlq.WriteResolved(sourceDB, sourceCollection, documentID, phase, eventTime)
+	s.incrementalStatsManager.RecordDLQResolution(1)
 }
 
 func (s *statsTrackingDLQ) Count() int64 {
 	return s.underlyingDlq.Count()
+}
+
+func (s *statsTrackingDLQ) FilePath() string {
+	return s.underlyingDlq.FilePath()
 }
 
 func (s *statsTrackingDLQ) Close() {
@@ -376,46 +586,49 @@ func (s *statsTrackingDLQ) Close() {
 
 // NewWorker creates a new worker
 func NewWorker(id int, ctx context.Context, log *logger.Logger,
-	targetDB *db.MongoDB, collectionMap map[string]map[string]string,
-	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager, statsManager *StatsManager, groupOpsByDistinctId bool, flushInterval time.Duration,
-	incomingQueueSize int, processingQueueSize int) *Worker {
+	targetDB *db.MongoDB, collectionConfigs map[string]map[string]config.CollectionConfig,
+	incrementalWriteBatchSize int, forceOrderedOperations bool, dlq DLQ, retryManager *RetryManager, incrementalStatsManager *IncrementalStatsManager, groupOpsByDistinctId bool, flushInterval time.Duration,
+	batchingQueueSize int, batchWriteQueueSize int, transformer *FieldTransformer) *Worker {
 
 	var workerDLQ DLQ = dlq
-	if dlq != nil && statsManager != nil {
+	if dlq != nil && incrementalStatsManager != nil {
 		workerDLQ = &statsTrackingDLQ{
 			underlyingDlq: dlq,
-			statsManager:  statsManager,
+			incrementalStatsManager:  incrementalStatsManager,
 		}
 	}
 
 	w := &Worker{
 		id:                        id,
 		ctx:                       ctx,
-		log:                       log,
+		log:                       &workerLogger{workerID: id, logger: log},
 		targetDB:                  targetDB,
-		collectionMap:             collectionMap,
-		incomingQueue:             make(chan interface{}, incomingQueueSize),
-		processingQueue:           make(chan *OperationGroup, processingQueueSize),
+		collectionConfigs:         collectionConfigs,
+		batchingQueue:             make(chan interface{}, batchingQueueSize),
+		batchWriteQueue:           make(chan *OperationGroup, batchWriteQueueSize),
 		incrementalWriteBatchSize: incrementalWriteBatchSize,
 		forceOrderedOperations:    forceOrderedOperations,
 		dlq:                       workerDLQ,
 		retryManager:              retryManager,
-		statsManager:              statsManager,
+		incrementalStatsManager:              incrementalStatsManager,
 		groupOpsByDistinctId:      groupOpsByDistinctId,
 		currentGroupIDs:           make(map[int]bool),
 		flushInterval:             flushInterval,
+		transformer:               transformer,
 	}
 
+	// Increment WaitGroup count for both background goroutines on the parent constructor thread
+	w.wg.Add(2)
+
 	// Statically spawn the worker and eventLoop threads at startup
-	go w.processGroups()
+	go w.processBatchWriteQueue()
 	go w.eventLoop()
 
 	return w
 }
 
-// eventLoop concurrently drains raw change events from the incomingQueue, partitioning and batching them lock-freely
+// eventLoop concurrently drains raw change events from the batchingQueue, partitioning and batching them lock-freely
 func (w *Worker) eventLoop() {
-	w.wg.Add(1)
 	defer w.wg.Done()
 
 	// Local worker-level ticker to flush groups that time out
@@ -424,12 +637,12 @@ func (w *Worker) eventLoop() {
 
 	for {
 		select {
-		case event, ok := <-w.incomingQueue:
+		case event, ok := <-w.batchingQueue:
 			if !ok {
 				// Queue closed, flush any remaining operations
 				w.mu.Lock()
 				w.flushCurrentGroup()
-				close(w.processingQueue) // Signal processGroups to drain and exit
+				close(w.batchWriteQueue) // Signal processBatchWriteQueue to drain and exit
 				w.mu.Unlock()
 				return
 			}
@@ -439,8 +652,8 @@ func (w *Worker) eventLoop() {
 			w.mu.Lock()
 			if w.currentGroup != nil && len(w.currentGroup.Operations) > 0 {
 				if time.Since(w.currentGroup.CreatedAt) >= w.flushInterval {
-					if w.statsManager != nil {
-						w.statsManager.IncrementTimeoutFlushes()
+					if w.incrementalStatsManager != nil {
+						w.incrementalStatsManager.IncrementTimeoutFlushes()
 					}
 					w.flushCurrentGroup()
 				}
@@ -451,7 +664,7 @@ func (w *Worker) eventLoop() {
 			// Context canceled, flush remaining and shut down
 			w.mu.Lock()
 			w.flushCurrentGroup()
-			close(w.processingQueue)
+			close(w.batchWriteQueue)
 			w.mu.Unlock()
 			return
 		}
@@ -464,21 +677,64 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 	defer w.mu.Unlock()
 
 	var event bson.M
+	var readTime time.Time
+	var streamIndex int
+	var seqNum uint64
+
 	switch e := eventArg.(type) {
+	case QueueEvent:
+		readTime = e.ReadTime
+		streamIndex = e.StreamIndex
+		seqNum = e.SeqNum
+		if w.incrementalStatsManager != nil && !e.DistributorTime.IsZero() && !e.DistributorPushTime.IsZero() {
+			ingestQueueDelay := e.DistributorTime.Sub(e.ReadTime)
+			batchingQueueDelay := time.Since(e.DistributorPushTime)
+			w.incrementalStatsManager.RecordQueueDelays(ingestQueueDelay, batchingQueueDelay)
+		}
+		switch inner := e.Event.(type) {
+		case bson.M:
+			event = inner
+		case bson.Raw:
+			if err := bson.Unmarshal(inner, &event); err != nil {
+				w.log.Errorf("Failed to unmarshal raw BSON change event: %v", err)
+				if w.partitionTracker != nil {
+					w.partitionTracker.Ack(streamIndex, seqNum)
+				}
+				return
+			}
+		default:
+			w.log.Errorf("Invalid inner event type: %T", e.Event)
+			if w.partitionTracker != nil {
+				w.partitionTracker.Ack(streamIndex, seqNum)
+			}
+			return
+		}
 	case bson.M:
 		event = e
+		if rt, exists := event["readTime"]; exists {
+			if t, ok := rt.(time.Time); ok {
+				readTime = t
+			}
+		}
 	case bson.Raw:
 		if err := bson.Unmarshal(e, &event); err != nil {
-			w.log.Errorf("Worker %d: Failed to unmarshal raw BSON change event: %v", w.id, err)
+			w.log.Errorf("Failed to unmarshal raw BSON change event: %v", err)
 			return
 		}
 	default:
-		w.log.Errorf("Worker %d: Invalid event type in ProcessEvent: %T", w.id, eventArg)
+		w.log.Errorf("Invalid event type in ProcessEvent: %T", eventArg)
 		return
+	}
+
+	if readTime.IsZero() {
+		readTime = time.Now()
 	}
 
 	// Extract operation details
 	opType, _ := event["operationType"].(string)
+	if w.incrementalStatsManager != nil {
+		w.incrementalStatsManager.IncrementEventsWorkerReceived(opType)
+	}
 	ns, _ := event["ns"].(bson.M)
 	dbName, _ := ns["db"].(string)
 	collName, _ := ns["coll"].(string)
@@ -487,13 +743,35 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 	documentKey, _ := event["documentKey"].(bson.M)
 	docID := documentKey["_id"]
 
+	if w.transformer != nil && w.transformer.convertInvalidIds && !w.transformer.isValidIDType(docID) {
+		originalType := fmt.Sprintf("%T", docID)
+		convertedID := serializeIDDeterministically(docID)
+		w.log.Infof("[%s] Proactively converting change stream documentKey _id %v (type: %s) to string: %s (Solution 1, 2 & 4)",
+			namespace, docID, originalType, convertedID)
+		docID = convertedID
+		if documentKey != nil {
+			documentKey["_id"] = docID
+		}
+	}
+
 	// Get fullDocument as interface{} to support both bson.M and map[string]interface{}
 	// This is needed because legacy oplog replicator returns map[string]interface{}
 	fullDocument := event["fullDocument"]
 
-	// If this is an update operation in the change stream path and fullDocument is nil, skip it and record metric
-	if opType == "update" && fullDocument == nil && w.statsManager != nil {
-		w.statsManager.IncrementUpdatedThenDeleted(w.id)
+	// Graceful Null Document Update Skipping (Decoupled Logic Fix):
+	// In MongoDB change streams, an update event that is immediately followed by a delete can arrive with a nil
+	// fullDocument payload. Because we process updates using complete document replacements, we cannot process
+	// the operation without a payload. We skip these events gracefully. Crucially: This check is decoupled from the
+	// incrementalStatsManager check: previously, a nil incrementalStatsManager bypassed the skip block, causing key transformation failures
+	// and unnecessary DLQ errors.
+	if opType == "update" && fullDocument == nil {
+		if w.incrementalStatsManager != nil {
+			w.incrementalStatsManager.IncrementUpdatedThenDeleted(w.id)
+			w.incrementalStatsManager.RecordSkippedEvent("update-doc-missing")
+		}
+		if w.partitionTracker != nil {
+			w.partitionTracker.Ack(streamIndex, seqNum)
+		}
 		return
 	}
 
@@ -504,8 +782,8 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 	eventTime := ExtractEventTime(event)
 
 	// Debug log for worker events
-	w.log.Debugf("Worker %d received event: type=%s, namespace=%s, docID=%v, hasFullDoc=%v, hasUpdateDesc=%v",
-		w.id, opType, namespace, docID, fullDocument != nil, updateDescription != nil)
+	w.log.Debugf("received event: type=%s, namespace=%s, docID=%v, hasFullDoc=%v, hasUpdateDesc=%v",
+		opType, namespace, docID, fullDocument != nil, updateDescription != nil)
 
 	// Create write operation
 	op := WriteOperation{
@@ -515,7 +793,10 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 		Namespace:         namespace,
 		OpType:            opType,
 		EventTime:         eventTime,
-		ReceiveTime:       time.Now(),
+		ReadTime:          readTime,
+		WorkerReceiveTime: time.Now(),
+		StreamIndex:       streamIndex,
+		SeqNum:            seqNum,
 	}
 
 	docHash := hashDocumentID(docID)
@@ -535,21 +816,21 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 	}
 
 	if needNewGroup && w.currentGroup != nil {
-		if w.statsManager != nil {
+		if w.incrementalStatsManager != nil {
 			// Determine the reason the group had to be flushed
 			if w.groupOpsByDistinctId && w.currentGroupIDs[docHash] {
-				w.statsManager.IncrementGroupFlushReason("collision")
+				w.incrementalStatsManager.IncrementGroupFlushReason("collision")
 			} else if w.currentGroup.Namespace != namespace {
-				w.statsManager.IncrementGroupFlushReason("namespace")
+				w.incrementalStatsManager.IncrementGroupFlushReason("namespace")
 			} else if len(w.currentGroup.Operations) >= w.incrementalWriteBatchSize {
-				w.statsManager.IncrementGroupFlushReason("batchfull")
+				w.incrementalStatsManager.IncrementGroupFlushReason("batchfull")
 			} else if w.currentGroup.OpType != opType {
-				w.statsManager.IncrementGroupFlushReason("optype")
+				w.incrementalStatsManager.IncrementGroupFlushReason("optype")
 			}
 		}
 
 		// Add current group to processing queue
-		w.processingQueue <- w.currentGroup
+		w.pushToBatchWriteQueue(w.currentGroup)
 		w.currentGroup = nil
 		w.currentGroupIDs = make(map[int]bool)
 	}
@@ -576,41 +857,45 @@ func (w *Worker) ProcessEvent(eventArg interface{}) {
 
 	// If current group has reached max size, add it to the queue
 	if len(w.currentGroup.Operations) >= w.incrementalWriteBatchSize {
-		if w.statsManager != nil {
-			w.statsManager.IncrementGroupFlushReason("batchfull")
+		if w.incrementalStatsManager != nil {
+			w.incrementalStatsManager.IncrementGroupFlushReason("batchfull")
 		}
-		w.processingQueue <- w.currentGroup
+		w.pushToBatchWriteQueue(w.currentGroup)
 		w.currentGroup = nil
 	}
 }
 
-// processGroups processes groups in the queue sequentially
-func (w *Worker) processGroups() {
-	w.wg.Add(1)
+// processBatchWriteQueue processes groups in the batch write queue sequentially.
+// [Safety Fix 6: Graceful Worker Shutdown Data Loss]
+// This uses a direct range loop over batchWriteQueue instead of selecting on w.ctx.Done().
+// Selecting on w.ctx.Done() would cause the consumer thread to exit immediately upon cancellation,
+// losing any remaining flushed batches. Using range guarantees that all remaining records
+// in the queue are fully processed and drained before the goroutine exits on shutdown.
+func (w *Worker) processBatchWriteQueue() {
 	defer w.wg.Done()
 
-	for {
-		select {
-		case group, ok := <-w.processingQueue:
-			if !ok {
-				// Channel closed, shutdown worker
-				if w.shutdownInProgress {
-					w.log.Debugf("Worker %d: Completed processing all groups during shutdown", w.id)
-				}
-				return
-			}
-			// Process the group
-			w.processGroup(*group)
-		case <-w.ctx.Done():
-			return
-		}
+	for group := range w.batchWriteQueue {
+		// Process the group
+		w.executeBatchWrite(*group)
+	}
+
+	if w.isShutdownInProgress() {
+		w.log.Debugf("Completed processing all groups during shutdown")
 	}
 }
 
-// processGroup processes a single operation group
-func (w *Worker) processGroup(group OperationGroup) {
-	w.log.Debugf("Worker %d: Processing group: %s.%s with %d operations",
-		w.id, group.Namespace, group.OpType, len(group.Operations))
+// executeBatchWrite processes a single operation group
+func (w *Worker) executeBatchWrite(group OperationGroup) {
+	if w.partitionTracker != nil {
+		defer func() {
+			for _, op := range group.Operations {
+				w.partitionTracker.Ack(op.StreamIndex, op.SeqNum)
+			}
+		}()
+	}
+
+	w.log.Debugf("Processing group: %s.%s with %d operations",
+		group.Namespace, group.OpType, len(group.Operations))
 
 	// Get target collection
 	parts := strings.SplitN(group.Namespace, ".", 2)
@@ -622,492 +907,234 @@ func (w *Worker) processGroup(group OperationGroup) {
 
 	// Get mapped collection name
 	targetCollName := w.getTargetCollectionName(dbName, collName)
+
+	if w.targetDB == nil {
+		now := time.Now()
+		for i := range group.Operations {
+			group.Operations[i].SuccessTime = now
+		}
+		if w.incrementalStatsManager != nil {
+			w.incrementalStatsManager.RecordLags(group.Operations)
+		}
+		return
+	}
+
 	targetCollection := w.targetDB.GetCollection(targetCollName)
+
+	// Use a graceful shutdown context with timeout if the main context was canceled.
+	// This ensures the final queues flushed during Ctrl+C / shutdown can actually write to MongoDB.
+	writeCtx := w.ctx
+	var cancel context.CancelFunc
+	if w.ctx.Err() != nil {
+		writeCtx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+	} else {
+		// Enforce query-level timeout of 90 seconds to prevent workers getting stuck
+		// and tearing down TCP connections on driver socket timeout.
+		writeCtx, cancel = context.WithTimeout(w.ctx, 90*time.Second)
+	}
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+	}()
 
 	// Determine if we should use ordered operations
 	useOrdered := group.OpType == "update" || group.OpType == "replace" || w.forceOrderedOperations
 
-	if w.statsManager != nil {
-		w.statsManager.RecordBulkWrite(len(group.Operations), useOrdered)
+	if w.incrementalStatsManager != nil {
+		w.incrementalStatsManager.RecordBulkWrite(len(group.Operations), useOrdered)
 	}
 
 	// Process based on operation type
-	switch group.OpType {
-	case "mixed":
+	collConfig, exists := w.collectionConfigs[dbName][collName]
+	isUpsertInsert := group.OpType == "insert" && exists && collConfig.UpsertMode
+	isBulkWrite := group.OpType == "mixed" || group.OpType == "update" || group.OpType == "replace" || group.OpType == "delete" || isUpsertInsert
+
+	if isBulkWrite {
 		var models []mongo.WriteModel
-		for _, op := range group.Operations {
-			switch op.OpType {
-			case "insert":
-				transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
-				if err != nil {
-					w.log.Errorf("[%s.%s] Field name transformation failed for mixed insert, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-					if w.dlq != nil {
-						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
-					}
-					continue
-				}
-				model := mongo.NewInsertOneModel().SetDocument(transformed)
-				models = append(models, model)
-
-			case "update":
-				if op.Document != nil {
-					transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
-					if err != nil {
-						w.log.Errorf("[%s.%s] Field name transformation failed for mixed update replacement, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-						if w.dlq != nil {
-							w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
-						}
-						continue
-					}
-					model := mongo.NewReplaceOneModel().
-						SetFilter(bson.M{"_id": op.DocumentID}).
-						SetReplacement(transformed).
-						SetUpsert(true)
-					models = append(models, model)
-				} else {
-					w.log.Errorf("[%s.%s] Mixed update failed: document payload is nil for _id=%v", dbName, collName, op.DocumentID)
-				}
-
-			case "replace":
-				transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
-				if err != nil {
-					w.log.Errorf("[%s.%s] Field name transformation failed for mixed replace, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-					if w.dlq != nil {
-						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
-					}
-					continue
-				}
-				model := mongo.NewReplaceOneModel().
-					SetFilter(bson.M{"_id": op.DocumentID}).
-					SetReplacement(transformed).
-					SetUpsert(true)
-				models = append(models, model)
-
-			case "delete":
-				model := mongo.NewDeleteOneModel().SetFilter(bson.M{"_id": op.DocumentID})
-				models = append(models, model)
+		for idx := range group.Operations {
+			op := &group.Operations[idx]
+			model, err := w.buildWriteModel(op, dbName, collName)
+			if err != nil {
+				w.handleTransformationFailure(op, dbName, collName, err)
+				continue
 			}
+			models = append(models, model)
 		}
 
 		if len(models) > 0 {
-			issueTime := time.Now()
-			_, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(true))
-			if w.statsManager != nil {
-				w.statsManager.RecordLatency("mixed", group.Operations, issueTime, time.Since(issueTime), w.id)
+			startTime := time.Now()
+			_, err := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
+			if w.incrementalStatsManager != nil {
+				w.incrementalStatsManager.RecordLatency(group.OpType, group.Operations, time.Since(startTime), w.id, err == nil)
 			}
-			if err != nil {
-				bulkWriteException, ok := err.(mongo.BulkWriteException)
-				if ok && w.ctx.Err() != context.Canceled {
-					w.log.Errorf("[%s.%s] Bulk mixed operations partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
-
-					// Handle individual failures by fallback retries
-					for _, writeErr := range bulkWriteException.WriteErrors {
-						var failedDocID interface{}
-						var op WriteOperation
-						if writeErr.Index < len(group.Operations) {
-							op = group.Operations[writeErr.Index]
-							failedDocID = op.DocumentID
-						}
-
-						isDupInsert := op.OpType == "insert" && isDuplicateKeyError(writeErr.Code, writeErr.Message)
-						if isDupInsert {
-							w.log.Debugf("[%s.%s] Mixed insert had duplicate key occurrence for _id=%v, gracefully falling back to upsert", dbName, collName, failedDocID)
-						} else {
-							w.log.Errorf("[%s.%s] Mixed write error at index %d (opType=%s), _id=%v: %v", dbName, collName, writeErr.Index, op.OpType, failedDocID, writeErr.Message)
-						}
-
-						// Fallback retry for the single failed operation
-						if writeErr.Index < len(group.Operations) {
-							w.retryIndividualOperation(targetCollection, op, dbName, collName, writeErr.Message)
-						}
-					}
-				} else {
-					if err == context.Canceled || w.ctx.Err() == context.Canceled {
-						w.log.Debugf("[%s.%s] Bulk mixed operations canceled due to context cancellation", dbName, collName)
-					} else {
-						w.log.Errorf("[%s.%s] Error performing bulk mixed operations: %v", dbName, collName, err)
-
-						// For transient errors, retry the bulk operation with backoff before falling back to DLQ
-						bulkRetrySucceeded := false
-						if w.retryManager != nil {
-							errType := w.retryManager.ClassifyError(err)
-							if errType == ErrorTypeConnection || errType == ErrorTypeContention {
-								w.log.Infof("[%s.%s] Transient error detected. Retrying bulk mixed operations with backoff...", dbName, collName)
-								retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
-									_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(true))
-									return retryBulkErr
-								})
-								if retryErr == nil {
-									w.log.Infof("[%s.%s] Bulk mixed operations succeeded after retry", dbName, collName)
-									bulkRetrySucceeded = true
-								} else {
-									w.log.Warnf("[%s.%s] Bulk mixed operations still failed after retries: %v. Routing to DLQ.", dbName, collName, retryErr)
-									err = retryErr
-								}
-							}
-						}
-
-						if !bulkRetrySucceeded {
-							// Fall back to individual operations one-by-one to isolate errors and prevent DLQ victim colocation!
-							w.log.Warnf("[%s.%s] Bulk mixed operations failed: %v. Falling back to individual operations one-by-one.", dbName, collName, err)
-							for _, op := range group.Operations {
-								w.retryIndividualOperation(targetCollection, op, dbName, collName, err.Error())
-							}
-						}
-					}
-				}
-			}
+			w.handleBulkWriteResult(writeCtx, &group, err, targetCollection, dbName, collName, func() error {
+				_, retryBulkErr := targetCollection.BulkWrite(writeCtx, models, options.BulkWrite().SetOrdered(useOrdered))
+				return retryBulkErr
+			})
 		}
-
-	case "insert":
+	} else if group.OpType == "insert" {
 		var docs []interface{}
-		for _, op := range group.Operations {
-			// Transform __*__ field names to _*_ for Firestore compatibility
-			transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
+		for idx := range group.Operations {
+			op := &group.Operations[idx]
+			transformed, err := w.transformer.Transform(op.Document, dbName, collName, op.DocumentID)
 			if err != nil {
-				w.log.Errorf("[%s.%s] Field name transformation failed for insert operation, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-				if w.dlq != nil {
-					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
-				}
+				w.handleTransformationFailure(op, dbName, collName, err)
 				continue
 			}
+			op.TransformedDocument = transformed
 			docs = append(docs, transformed)
 		}
 
-		issueTime := time.Now()
-		_, err := targetCollection.InsertMany(w.ctx, docs, options.InsertMany().SetOrdered(useOrdered))
-		if w.statsManager != nil {
-			w.statsManager.RecordLatency("insert", group.Operations, issueTime, time.Since(issueTime), w.id)
-		}
-		if err != nil {
-			bulkWriteException, ok := err.(mongo.BulkWriteException)
-			if ok && w.ctx.Err() != context.Canceled {
-				// Check if all write errors are simply duplicate key errors (gracefully handled by upsert fallback)
-				hasRealErrors := false
-				// Check if it's a duplicate key error
-				for _, writeErr := range bulkWriteException.WriteErrors {
-					if !isDuplicateKeyError(writeErr.Code, writeErr.Message) {
-						hasRealErrors = true
-						break
-					}
-				}
-				if hasRealErrors {
-					w.log.Errorf("[%s.%s] Bulk insert partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
-				} else {
-					w.log.Debugf("[%s.%s] Bulk insert had %d duplicate key occurrences (gracefully falling back to upserts)", dbName, collName, len(bulkWriteException.WriteErrors))
-				}
-
-				// Process individual errors
-				for _, writeErr := range bulkWriteException.WriteErrors {
-					var failedDocID interface{}
-					var op WriteOperation
-					if writeErr.Index < len(group.Operations) {
-						op = group.Operations[writeErr.Index]
-						failedDocID = op.DocumentID
-					}
-					w.log.Debugf("[%s.%s] Insert error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
-
-					if writeErr.Index < len(group.Operations) {
-						w.retryIndividualOperation(targetCollection, op, dbName, collName, writeErr.Message)
-					}
-				}
-			} else {
-				// Handle non-bulk write errors (e.g., broken pipe, connection reset, deadline exceeded)
-				if err == context.Canceled || w.ctx.Err() == context.Canceled {
-					w.log.Debugf("[%s.%s] Bulk insert canceled due to context cancellation", dbName, collName)
-				} else {
-					w.log.Errorf("[%s.%s] Error performing bulk insert: %v", dbName, collName, err)
-				}
-
-				// For transient errors, retry the bulk operation with backoff before falling back
-				bulkRetrySucceeded := false
-				if w.retryManager != nil && err != context.Canceled {
-					errType := w.retryManager.ClassifyError(err)
-					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
-						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk insert with backoff...", dbName, collName)
-						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
-							_, retryInsertErr := targetCollection.InsertMany(w.ctx, docs, options.InsertMany().SetOrdered(useOrdered))
-							return retryInsertErr
-						})
-						if retryErr == nil {
-							w.log.Infof("[%s.%s] Bulk insert succeeded after retry", dbName, collName)
-							bulkRetrySucceeded = true
-						} else {
-							w.log.Warnf("[%s.%s] Bulk insert still failed after retries: %v. Falling back to individual operations.", dbName, collName, retryErr)
-						}
-					}
-				}
-
-				if !bulkRetrySucceeded {
-					// Fall back to individual operations one-by-one to isolate errors and prevent DLQ victim colocation!
-					w.log.Warnf("[%s.%s] Bulk insert failed: %v. Falling back to individual operations one-by-one.", dbName, collName, err)
-					for _, op := range group.Operations {
-						w.retryIndividualOperation(targetCollection, op, dbName, collName, err.Error())
-					}
-				}
+		if len(docs) > 0 {
+			startTime := time.Now()
+			_, err := targetCollection.InsertMany(writeCtx, docs, options.InsertMany().SetOrdered(useOrdered))
+			if w.incrementalStatsManager != nil {
+				w.incrementalStatsManager.RecordLatency("insert", group.Operations, time.Since(startTime), w.id, err == nil)
 			}
-		} else {
-			w.log.Debugf("[%s.%s] Bulk inserted %d documents", dbName, collName, len(docs))
-		}
-
-	case "update":
-		var models []mongo.WriteModel
-		for _, op := range group.Operations {
-			// Unify all incremental updates into full ReplaceOne replacement upserts using op.Document
-			if op.Document != nil {
-				// Full document replacement - use ReplaceOne
-				// Transform __*__ field names to _*_ for Firestore compatibility
-				transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
-				if err != nil {
-					w.log.Errorf("[%s.%s] Field name transformation failed for update replacement operation, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-					if w.dlq != nil {
-						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
-					}
-					continue
-				}
-				model := mongo.NewReplaceOneModel().
-					SetFilter(bson.M{"_id": op.DocumentID}).
-					SetReplacement(transformed).
-					SetUpsert(true)
-				models = append(models, model)
-			} else {
-				w.log.Errorf("[%s.%s] Update operation failed: document payload is nil for _id=%v", dbName, collName, op.DocumentID)
-				continue
-			}
-		}
-
-		issueTime := time.Now()
-		_, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
-		if w.statsManager != nil {
-			w.statsManager.RecordLatency("update", group.Operations, issueTime, time.Since(issueTime), w.id)
-		}
-		if err != nil {
-			bulkWriteException, ok := err.(mongo.BulkWriteException)
-			if ok && w.ctx.Err() != context.Canceled {
-				w.log.Errorf("[%s.%s] Bulk update partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
-
-				// Process individual errors
-				for _, writeErr := range bulkWriteException.WriteErrors {
-					var failedDocID interface{}
-					var op WriteOperation
-					if writeErr.Index < len(group.Operations) {
-						op = group.Operations[writeErr.Index]
-						failedDocID = op.DocumentID
-					}
-					w.log.Errorf("[%s.%s] Update error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
-
-					if writeErr.Index < len(group.Operations) {
-						w.retryIndividualOperation(targetCollection, op, dbName, collName, writeErr.Message)
-					}
-				}
-			} else {
-				// Handle non-bulk write errors
-				if err == context.Canceled || w.ctx.Err() == context.Canceled {
-					w.log.Debugf("[%s.%s] Bulk update canceled due to context cancellation", dbName, collName)
-				} else {
-					w.log.Errorf("[%s.%s] Error performing bulk update: %v", dbName, collName, err)
-				}
-
-				// For transient errors, retry the bulk operation with backoff before falling back
-				bulkRetrySucceeded := false
-				if w.retryManager != nil && err != context.Canceled {
-					errType := w.retryManager.ClassifyError(err)
-					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
-						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk update with backoff...", dbName, collName)
-						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
-							_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
-							return retryBulkErr
-						})
-						if retryErr == nil {
-							w.log.Infof("[%s.%s] Bulk update succeeded after retry", dbName, collName)
-							bulkRetrySucceeded = true
-						} else {
-							w.log.Warnf("[%s.%s] Bulk update still failed after retries: %v. Falling back to individual operations.", dbName, collName, retryErr)
-						}
-					}
-				}
-
-				if bulkRetrySucceeded {
-					break
-				}
-
-				// Fall back to individual updates
-				for _, op := range group.Operations {
-					w.retryIndividualOperation(targetCollection, op, dbName, collName, err.Error())
-				}
-			}
-		} else {
-			w.log.Debugf("[%s.%s] Bulk updated %d documents", dbName, collName, len(models))
-		}
-
-	case "delete":
-		var models []mongo.WriteModel
-		for _, op := range group.Operations {
-			model := mongo.NewDeleteOneModel().
-				SetFilter(bson.M{"_id": op.DocumentID})
-			models = append(models, model)
-		}
-
-		issueTime := time.Now()
-		_, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
-		if w.statsManager != nil {
-			w.statsManager.RecordLatency("delete", group.Operations, issueTime, time.Since(issueTime), w.id)
-		}
-		if err != nil {
-			bulkWriteException, ok := err.(mongo.BulkWriteException)
-			if ok && w.ctx.Err() != context.Canceled {
-				w.log.Errorf("[%s.%s] Bulk delete partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
-
-				// Process individual errors
-				for _, writeErr := range bulkWriteException.WriteErrors {
-					var failedDocID interface{}
-					var op WriteOperation
-					if writeErr.Index < len(group.Operations) {
-						op = group.Operations[writeErr.Index]
-						failedDocID = op.DocumentID
-					}
-					w.log.Errorf("[%s.%s] Delete error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
-
-					if writeErr.Index < len(group.Operations) {
-						w.retryIndividualOperation(targetCollection, op, dbName, collName, writeErr.Message)
-					}
-				}
-			} else {
-				// Handle non-bulk write errors
-				if err == context.Canceled || w.ctx.Err() == context.Canceled {
-					w.log.Debugf("[%s.%s] Bulk delete canceled due to context cancellation", dbName, collName)
-				} else {
-					w.log.Errorf("[%s.%s] Error performing bulk delete: %v", dbName, collName, err)
-				}
-
-				// For transient errors, retry the bulk operation with backoff before falling back
-				bulkRetrySucceeded := false
-				if w.retryManager != nil && err != context.Canceled {
-					errType := w.retryManager.ClassifyError(err)
-					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
-						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk delete with backoff...", dbName, collName)
-						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
-							_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
-							return retryBulkErr
-						})
-						if retryErr == nil {
-							w.log.Infof("[%s.%s] Bulk delete succeeded after retry", dbName, collName)
-							bulkRetrySucceeded = true
-						} else {
-							w.log.Warnf("[%s.%s] Bulk delete still failed after retries: %v. Falling back to individual operations.", dbName, collName, retryErr)
-						}
-					}
-				}
-
-				if bulkRetrySucceeded {
-					break
-				}
-
-				// Fall back to individual deletes
-				for _, op := range group.Operations {
-					w.retryIndividualOperation(targetCollection, op, dbName, collName, err.Error())
-				}
-			}
-		} else {
-			w.log.Debugf("[%s.%s] Bulk deleted %d documents", dbName, collName, len(models))
-		}
-
-	case "replace":
-		var models []mongo.WriteModel
-		for _, op := range group.Operations {
-			// Transform __*__ field names to _*_ for Firestore compatibility
-			transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
-			if err != nil {
-				w.log.Errorf("[%s.%s] Field name transformation failed for replace operation, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-				if w.dlq != nil {
-					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
-				}
-				continue
-			}
-			model := mongo.NewReplaceOneModel().
-				SetFilter(bson.M{"_id": op.DocumentID}).
-				SetReplacement(transformed).
-				SetUpsert(true)
-			models = append(models, model)
-		}
-
-		issueTime := time.Now()
-		_, err := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
-		if w.statsManager != nil {
-			w.statsManager.RecordLatency("replace", group.Operations, issueTime, time.Since(issueTime), w.id)
-		}
-		if err != nil {
-			bulkWriteException, ok := err.(mongo.BulkWriteException)
-			if ok {
-				w.log.Errorf("[%s.%s] Bulk replace partially failed: %d failed", dbName, collName, len(bulkWriteException.WriteErrors))
-
-				// Process individual errors
-				for _, writeErr := range bulkWriteException.WriteErrors {
-					var failedDocID interface{}
-					var op WriteOperation
-					if writeErr.Index < len(group.Operations) {
-						op = group.Operations[writeErr.Index]
-						failedDocID = op.DocumentID
-					}
-					w.log.Errorf("[%s.%s] Replace error at index %d, _id=%v: %v", dbName, collName, writeErr.Index, failedDocID, writeErr.Message)
-
-					if writeErr.Index < len(group.Operations) {
-						w.retryIndividualOperation(targetCollection, op, dbName, collName, writeErr.Message)
-					}
-				}
-			} else {
-				// Handle non-bulk write errors
-				if err == context.Canceled {
-					w.log.Debugf("[%s.%s] Bulk replace canceled due to context cancellation", dbName, collName)
-				} else {
-					w.log.Errorf("[%s.%s] Error performing bulk replace: %v", dbName, collName, err)
-				}
-
-				// For transient errors, retry the bulk operation with backoff before falling back
-				bulkRetrySucceeded := false
-				if w.retryManager != nil && err != context.Canceled {
-					errType := w.retryManager.ClassifyError(err)
-					if errType == ErrorTypeConnection || errType == ErrorTypeContention {
-						w.log.Infof("[%s.%s] Transient error detected. Retrying bulk replace with backoff...", dbName, collName)
-						retryErr := w.retryManager.RetryWithBackoff(w.ctx, func() error {
-							_, retryBulkErr := targetCollection.BulkWrite(w.ctx, models, options.BulkWrite().SetOrdered(useOrdered))
-							return retryBulkErr
-						})
-						if retryErr == nil {
-							w.log.Infof("[%s.%s] Bulk replace succeeded after retry", dbName, collName)
-							bulkRetrySucceeded = true
-						} else {
-							w.log.Warnf("[%s.%s] Bulk replace still failed after retries: %v. Falling back to individual operations.", dbName, collName, retryErr)
-						}
-					}
-				}
-
-				if bulkRetrySucceeded {
-					break
-				}
-
-				// Fall back to individual replaces
-				for _, op := range group.Operations {
-					w.retryIndividualOperation(targetCollection, op, dbName, collName, err.Error())
-				}
-			}
-		} else {
-			w.log.Debugf("[%s.%s] Bulk replaced %d documents", dbName, collName, len(models))
+			w.handleBulkWriteResult(writeCtx, &group, err, targetCollection, dbName, collName, func() error {
+				_, retryInsertErr := targetCollection.InsertMany(writeCtx, docs, options.InsertMany().SetOrdered(useOrdered))
+				return retryInsertErr
+			})
 		}
 	}
 
 	// Record replication lag for successfully processed operations
-	if w.statsManager != nil {
-		w.statsManager.RecordLags(group.Operations, time.Now())
+	if w.incrementalStatsManager != nil {
+		w.incrementalStatsManager.RecordLags(group.Operations)
+	}
+
+	// Scan group operations for successful updates resolving previously failed documents
+	if w.activeFailedMu != nil {
+		w.activeFailedMu.Lock()
+		if w.activeFailedIDs != nil {
+			for _, op := range group.Operations {
+				if !op.SuccessTime.IsZero() && !op.DLQed {
+					key := MakeDLQKey(dbName, collName, op.DocumentID)
+					if originalPhase, exists := w.activeFailedIDs[key]; exists {
+						if w.dlq != nil {
+							w.dlq.WriteResolved(dbName, collName, op.DocumentID, originalPhase, op.EventTime)
+						}
+						delete(w.activeFailedIDs, key)
+					}
+				}
+			}
+		}
+		w.activeFailedMu.Unlock()
+	}
+}
+
+// handleBulkWriteResult processes the outcome of a bulk write operation, setting SuccessTime for succeeded operations and executing fallbacks for failed ones.
+func (w *Worker) handleBulkWriteResult(ctx context.Context, group *OperationGroup, err error, targetCollection *mongo.Collection, dbName, collName string, transientRetryFunc func() error) {
+	if err == nil {
+		now := time.Now()
+		for i := range group.Operations {
+			group.Operations[i].SuccessTime = now
+		}
+		w.log.Debugf("[%s.%s] Bulk %s operations processed successfully: %d documents", dbName, collName, group.OpType, len(group.Operations))
+		return
+	}
+
+	// Use errors.As instead of direct type assertion (err.(mongo.BulkWriteException))
+	// because the driver or retry wrapper may wrap the underlying BulkWriteException.
+	var bulkWriteException mongo.BulkWriteException
+	ok := errors.As(err, &bulkWriteException)
+	if ok && ctx.Err() != context.Canceled {
+		nonDupCount := 0
+		for _, writeErr := range bulkWriteException.WriteErrors {
+			if !isDuplicateKeyError(writeErr.Code, writeErr.Message) {
+				nonDupCount++
+			}
+		}
+
+		if nonDupCount > 0 {
+			w.log.Errorf("[%s.%s] Bulk %s operations partially failed: %d failed", dbName, collName, group.OpType, len(bulkWriteException.WriteErrors))
+		} else {
+			w.log.Debugf("[%s.%s] Bulk %s operations partially failed: %d failed (all duplicate key errors)", dbName, collName, group.OpType, len(bulkWriteException.WriteErrors))
+		}
+
+		failedIndices := make(map[int]bool)
+		for _, writeErr := range bulkWriteException.WriteErrors {
+			failedIndices[writeErr.Index] = true
+		}
+		now := time.Now()
+		for i := range group.Operations {
+			if !failedIndices[i] {
+				group.Operations[i].SuccessTime = now
+			}
+		}
+
+		// Process individual errors
+		for _, writeErr := range bulkWriteException.WriteErrors {
+			var failedDocID interface{}
+			var op WriteOperation
+			if writeErr.Index < len(group.Operations) {
+				op = group.Operations[writeErr.Index]
+				failedDocID = op.DocumentID
+			}
+
+			isDup := isDuplicateKeyError(writeErr.Code, writeErr.Message)
+			if isDup {
+				if w.incrementalStatsManager != nil {
+					w.incrementalStatsManager.IncrementDuplicateKeys(1)
+				}
+				w.log.Debugf("[%s.%s] Duplicate key occurrence at index %d (opType=%s), _id=%v: %v. Gracefully falling back.", dbName, collName, writeErr.Index, op.OpType, failedDocID, writeErr.Message)
+			} else {
+				w.log.Errorf("[%s.%s] Write error at index %d (opType=%s), _id=%v: %v", dbName, collName, writeErr.Index, op.OpType, failedDocID, writeErr.Message)
+			}
+
+			// Note: We do not classify the error here to decide whether to skip the fallback.
+			// Attempting fallback write first is safer: (1) if classification regexes are incomplete,
+			// we avoid dropping valid writes; (2) some errors are batch-specific and succeed individually.
+			if writeErr.Index < len(group.Operations) {
+				w.retryIndividualOperation(ctx, targetCollection, &group.Operations[writeErr.Index], dbName, collName, writeErr.Message)
+			}
+		}
+	} else {
+		// Handle non-bulk write errors
+		if err == context.Canceled || ctx.Err() == context.Canceled {
+			w.log.Debugf("[%s.%s] Bulk %s operations canceled due to context cancellation", dbName, collName, group.OpType)
+			return
+		}
+
+		w.log.Errorf("[%s.%s] Error performing bulk %s operations: %v", dbName, collName, group.OpType, err)
+
+		// For transient errors, retry the bulk operation with backoff before falling back
+		bulkRetrySucceeded := false
+		if w.retryManager != nil && transientRetryFunc != nil {
+			errType := w.retryManager.ClassifyError(err)
+			if errType == ErrorTypeConnection || errType == ErrorTypeContention {
+				w.log.Infof("[%s.%s] Transient error detected. Retrying bulk %s operations with backoff...", dbName, collName, group.OpType)
+				retryErr := w.retryManager.RetryWithBackoff(ctx, transientRetryFunc)
+				if retryErr == nil {
+					w.log.Infof("[%s.%s] Bulk %s operations succeeded after retry", dbName, collName, group.OpType)
+					bulkRetrySucceeded = true
+					now := time.Now()
+					for i := range group.Operations {
+						group.Operations[i].SuccessTime = now
+						group.Operations[i].SuccessAfterRetry = true
+					}
+				} else {
+					w.log.Warnf("[%s.%s] Bulk %s operations still failed after retries: %v. Falling back to individual operations.", dbName, collName, group.OpType, retryErr)
+				}
+			}
+		}
+
+		if !bulkRetrySucceeded {
+			// Fall back to individual updates/deletes/replaces
+			for i := range group.Operations {
+				w.retryIndividualOperation(ctx, targetCollection, &group.Operations[i], dbName, collName, err.Error())
+			}
+		}
 	}
 }
 
 // getTargetCollectionName gets the target collection name for a source collection
 func (w *Worker) getTargetCollectionName(dbName, collName string) string {
 	// Check if we have a mapping for this collection
-	if w.collectionMap[dbName] != nil {
-		if targetColl, exists := w.collectionMap[dbName][collName]; exists {
-			return targetColl
+	if w.collectionConfigs[dbName] != nil {
+		if collConfig, exists := w.collectionConfigs[dbName][collName]; exists {
+			return collConfig.TargetCollection
 		}
 	}
 
@@ -1115,10 +1142,17 @@ func (w *Worker) getTargetCollectionName(dbName, collName string) string {
 	return collName
 }
 
+// isShutdownInProgress returns if a shutdown task is currently in progress thread-safely
+func (w *Worker) isShutdownInProgress() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.shutdownInProgress
+}
+
 // WaitForCompletion waits for all processing to complete
 func (w *Worker) WaitForCompletion() {
 	w.wg.Wait()
-	w.log.Debugf("Worker %d: All operations processed successfully", w.id)
+	w.log.Debugf("All operations processed successfully")
 }
 
 // Shutdown ensures any pending operations are processed
@@ -1127,20 +1161,18 @@ func (w *Worker) Shutdown() {
 	w.shutdownInProgress = true
 	w.mu.Unlock()
 
-	// Close raw incoming queue to signal eventLoop to drain and close processingQueue
-	close(w.incomingQueue)
+	// Close raw incoming queue to signal eventLoop to drain and close batchWriteQueue
+	close(w.batchingQueue)
 
 	// Wait for both eventLoop and processGroups goroutines to complete
 	w.WaitForCompletion()
 }
 
-
-
 // retryIndividualOperation retries a single failed write operation of a batch using fallback execution.
-func (w *Worker) retryIndividualOperation(targetCollection *mongo.Collection, op WriteOperation, dbName, collName string, originalErrorMsg string) {
+func (w *Worker) retryIndividualOperation(ctx context.Context, targetCollection *mongo.Collection, op *WriteOperation, dbName, collName string, originalErrorMsg string) {
 	filter := bson.M{"_id": op.DocumentID}
-	if w.statsManager != nil {
-		w.statsManager.IncrementSequentialRetries(op.OpType, 1)
+	if w.incrementalStatsManager != nil {
+		w.incrementalStatsManager.IncrementSequentialRetries(op.OpType, 1)
 	}
 
 	// Check if this error represents a duplicate key/already exists constraint failure
@@ -1148,121 +1180,539 @@ func (w *Worker) retryIndividualOperation(targetCollection *mongo.Collection, op
 
 	switch op.OpType {
 	case "insert":
-		transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
-		if err != nil {
-			w.log.Errorf("[%s.%s] Field name transformation failed for fallback insert, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-			if w.dlq != nil {
-				w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
+		var transformed interface{}
+		if op.TransformedDocument != nil {
+			transformed = op.TransformedDocument
+		} else {
+			var err error
+			transformed, err = w.transformer.Transform(op.Document, dbName, collName, op.DocumentID)
+			if err != nil {
+				w.log.Errorf("[%s.%s] Field name transformation failed for fallback insert, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+				w.markDLQ(op, dbName, collName, err)
+				return
 			}
-			return
+			op.TransformedDocument = transformed
 		}
 
 		if isDup {
 			// If duplicate key, retry using ReplaceOne with upsert=true to overwrite
 			w.log.Debugf("[%s.%s] Fallback upserting duplicate insert document _id=%v", dbName, collName, op.DocumentID)
-			if _, err := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
+			err := w.executeWithRetry(ctx, func() error {
+				_, replaceErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true))
+				return replaceErr
+			})
+			if err != nil {
 				w.log.Debugf("[%s.%s] Fallback upsert failed for insert document _id=%v: %v", dbName, collName, op.DocumentID, err)
-				if w.dlq != nil {
-					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
-				}
+				w.markDLQ(op, dbName, collName, err)
 			} else {
 				w.log.Debugf("[%s.%s] Successfully upserted document _id=%v after duplicate key error", dbName, collName, op.DocumentID)
+				op.SuccessTime = time.Now()
+				op.SuccessAfterRetry = true
 			}
 		} else {
 			// For non-duplicate key errors, retry with standard InsertOne
-			if _, err := targetCollection.InsertOne(w.ctx, transformed); err != nil {
-				w.log.Errorf("[%s.%s] Fallback insert failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
-				if w.dlq != nil {
-					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "insert", op.Document)
+			err := w.executeWithRetry(ctx, func() error {
+				_, insertErr := targetCollection.InsertOne(ctx, transformed)
+				return insertErr
+			})
+			if err != nil {
+				// If it actually already exists (e.g. concurrent write or socket retry pre-exist), fallback to ReplaceOne upsert
+				if isDuplicateKeyError(0, err.Error()) {
+					if w.incrementalStatsManager != nil {
+						w.incrementalStatsManager.IncrementDuplicateKeys(1)
+					}
+					w.log.Debugf("[%s.%s] Fallback InsertOne got duplicate key, retrying with upsert overwrite for _id=%v", dbName, collName, op.DocumentID)
+					replaceErr := w.executeWithRetry(ctx, func() error {
+						_, repErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true))
+						return repErr
+					})
+					if replaceErr != nil {
+						w.log.Errorf("[%s.%s] Fallback upsert replace after duplicate insert failed for document _id=%v: %v", dbName, collName, op.DocumentID, replaceErr)
+						w.markDLQ(op, dbName, collName, replaceErr)
+					} else {
+						op.SuccessTime = time.Now()
+						op.SuccessAfterRetry = true
+					}
+				} else {
+					w.log.Errorf("[%s.%s] Fallback insert failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
+					w.markDLQ(op, dbName, collName, err)
 				}
+			} else {
+				op.SuccessTime = time.Now()
+				op.SuccessAfterRetry = true
 			}
 		}
 
 	case "update":
 		if op.Document != nil {
-			transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
-			if err != nil {
-				w.log.Errorf("[%s.%s] Field name transformation failed for fallback replace update, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-				if w.dlq != nil {
-					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
+			var transformed interface{}
+			if op.TransformedDocument != nil {
+				transformed = op.TransformedDocument
+			} else {
+				var err error
+				transformed, err = w.transformer.Transform(op.Document, dbName, collName, op.DocumentID)
+				if err != nil {
+					w.log.Errorf("[%s.%s] Field name transformation failed for fallback replace update, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+					w.markDLQ(op, dbName, collName, err)
+					return
 				}
-				return
+				op.TransformedDocument = transformed
 			}
-			if _, err := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
-				if err == context.Canceled || w.ctx.Err() == context.Canceled {
+			err := w.executeWithRetry(ctx, func() error {
+				_, replaceErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true))
+				return replaceErr
+			})
+			if err != nil {
+				if err == context.Canceled || ctx.Err() == context.Canceled {
 					w.log.Debugf("[%s.%s] Fallback replace update for document _id=%v canceled", dbName, collName, op.DocumentID)
 					return
 				}
 
 				// If it failed because the document already exists (concurrent upsert collision), retry with upsert=false
 				if isDuplicateKeyError(0, err.Error()) {
+					if w.incrementalStatsManager != nil {
+						w.incrementalStatsManager.IncrementDuplicateKeys(1)
+					}
 					w.log.Debugf("[%s.%s] Concurrent upsert collision detected for replace document _id=%v, retrying without upsert", dbName, collName, op.DocumentID)
-					if _, retryErr := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(false)); retryErr != nil {
+					retryErr := w.executeWithRetry(ctx, func() error {
+						_, repErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(false))
+						return repErr
+					})
+					if retryErr != nil {
 						w.log.Errorf("[%s.%s] Fallback replace update without upsert failed for document _id=%v: %v", dbName, collName, op.DocumentID, retryErr)
-						if w.dlq != nil {
-							w.dlq.WriteFailed(dbName, collName, op.DocumentID, retryErr, "incremental", "update", op.Document)
-						}
+						w.markDLQ(op, dbName, collName, retryErr)
 					} else {
 						w.log.Debugf("[%s.%s] Successfully completed replace update for document _id=%v after concurrent upsert resolution", dbName, collName, op.DocumentID)
+						op.SuccessTime = time.Now()
+						op.SuccessAfterRetry = true
 					}
 				} else {
 					w.log.Errorf("[%s.%s] Fallback replace update failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
-					if w.dlq != nil {
-						w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "update", op.Document)
-					}
+					w.markDLQ(op, dbName, collName, err)
 				}
+			} else {
+				op.SuccessTime = time.Now()
+				op.SuccessAfterRetry = true
 			}
 		} else {
 			w.log.Errorf("[%s.%s] Fallback update failed: document payload is nil for _id=%v", dbName, collName, op.DocumentID)
 		}
 
 	case "replace":
-		transformed, err := TransformFieldNames(op.Document, w.log, dbName, collName, op.DocumentID)
-		if err != nil {
-			w.log.Errorf("[%s.%s] Field name transformation failed for fallback replace, document _id=%v: %v", dbName, collName, op.DocumentID, err)
-			if w.dlq != nil {
-				w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
+		var transformed interface{}
+		if op.TransformedDocument != nil {
+			transformed = op.TransformedDocument
+		} else {
+			var err error
+			transformed, err = w.transformer.Transform(op.Document, dbName, collName, op.DocumentID)
+			if err != nil {
+				w.log.Errorf("[%s.%s] Field name transformation failed for fallback replace, document _id=%v: %v", dbName, collName, op.DocumentID, err)
+				w.markDLQ(op, dbName, collName, err)
+				return
 			}
-			return
+			op.TransformedDocument = transformed
 		}
-		if _, err := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(true)); err != nil {
-			if err == context.Canceled || w.ctx.Err() == context.Canceled {
+		err := w.executeWithRetry(ctx, func() error {
+			_, replaceErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(true))
+			return replaceErr
+		})
+		if err != nil {
+			if err == context.Canceled || ctx.Err() == context.Canceled {
 				w.log.Debugf("[%s.%s] Fallback replace for document _id=%v canceled due to context cancellation", dbName, collName, op.DocumentID)
 				return
 			}
 
 			// If it failed because the document already exists (concurrent upsert collision), retry with upsert=false
 			if isDuplicateKeyError(0, err.Error()) {
+				if w.incrementalStatsManager != nil {
+					w.incrementalStatsManager.IncrementDuplicateKeys(1)
+				}
 				w.log.Debugf("[%s.%s] Concurrent upsert collision detected for replace document _id=%v, retrying without upsert", dbName, collName, op.DocumentID)
-				if _, retryErr := targetCollection.ReplaceOne(w.ctx, filter, transformed, options.Replace().SetUpsert(false)); retryErr != nil {
+				retryErr := w.executeWithRetry(ctx, func() error {
+					_, repErr := targetCollection.ReplaceOne(ctx, filter, transformed, options.Replace().SetUpsert(false))
+					return repErr
+				})
+				if retryErr != nil {
 					w.log.Errorf("[%s.%s] Fallback replace without upsert failed for document _id=%v: %v", dbName, collName, op.DocumentID, retryErr)
-					if w.dlq != nil {
-						w.dlq.WriteFailed(dbName, collName, op.DocumentID, retryErr, "incremental", "replace", op.Document)
-					}
+					w.markDLQ(op, dbName, collName, retryErr)
 				} else {
 					w.log.Debugf("[%s.%s] Successfully completed replace for document _id=%v after concurrent upsert resolution", dbName, collName, op.DocumentID)
+					op.SuccessTime = time.Now()
+					op.SuccessAfterRetry = true
 				}
 			} else {
 				w.log.Errorf("[%s.%s] Fallback replace failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
-				if w.dlq != nil {
-					w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "replace", op.Document)
-				}
+				w.markDLQ(op, dbName, collName, err)
 			}
+		} else {
+			op.SuccessTime = time.Now()
+			op.SuccessAfterRetry = true
 		}
 
 	case "delete":
-		if _, err := targetCollection.DeleteOne(w.ctx, filter); err != nil {
+		err := w.executeWithRetry(ctx, func() error {
+			_, deleteErr := targetCollection.DeleteOne(ctx, filter)
+			return deleteErr
+		})
+		if err != nil {
 			w.log.Errorf("[%s.%s] Fallback delete failed for document _id=%v: %v", dbName, collName, op.DocumentID, err)
-			if w.dlq != nil {
-				w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", "delete", nil)
-			}
+			w.markDLQ(op, dbName, collName, err)
+		} else {
+			op.SuccessTime = time.Now()
+			op.SuccessAfterRetry = true
 		}
 	}
 }
 
+func (w *Worker) markDLQ(op *WriteOperation, dbName, collName string, err error) {
+	if w.dlq != nil {
+		w.dlq.WriteFailed(dbName, collName, op.DocumentID, err, "incremental", op.OpType, op.Document, op.EventTime)
+	}
+	op.DLQed = true
+	op.Error = err
+
+	// Track the failed document ID for Resolution Tombstoning
+	if w.activeFailedMu != nil {
+		w.activeFailedMu.Lock()
+		if w.activeFailedIDs != nil {
+			key := MakeDLQKey(dbName, collName, op.DocumentID)
+			w.activeFailedIDs[key] = "incremental"
+		}
+		w.activeFailedMu.Unlock()
+	}
+}
+
+func (w *Worker) handleTransformationFailure(op *WriteOperation, dbName, collName string, err error) {
+	w.log.Errorf("[%s.%s] Field name transformation failed for %s, document _id=%v: %v", dbName, collName, op.OpType, op.DocumentID, err)
+	w.markDLQ(op, dbName, collName, err)
+}
+
 // isDuplicateKeyError checks if a write error code or message represents a duplicate key/document already exists constraint failure.
 func isDuplicateKeyError(code int, msg string) bool {
-	return code == 11000 || 
-		strings.Contains(msg, "Document already exists") || 
+	return code == 11000 ||
+		strings.Contains(msg, "Document already exists") ||
 		strings.Contains(msg, "E11000")
 }
+
+// buildWriteModel builds a single mongo.WriteModel from a WriteOperation, transforming Firestore-incompatible keys.
+func (w *Worker) buildWriteModel(op *WriteOperation, dbName, collName string) (mongo.WriteModel, error) {
+	if op.OpType == "delete" {
+		return mongo.NewDeleteOneModel().SetFilter(bson.M{"_id": op.DocumentID}), nil
+	}
+
+	if op.OpType == "insert" || op.OpType == "update" || op.OpType == "replace" {
+		if (op.OpType == "update" || op.OpType == "replace") && op.Document == nil {
+			return nil, fmt.Errorf("document payload is nil for _id=%v", op.DocumentID)
+		}
+
+		transformed, err := w.transformer.Transform(op.Document, dbName, collName, op.DocumentID)
+		if err != nil {
+			return nil, err
+		}
+		op.TransformedDocument = transformed
+
+		collConfig, exists := w.collectionConfigs[dbName][collName]
+		useUpsert := op.OpType == "update" || op.OpType == "replace" || (exists && collConfig.UpsertMode)
+
+		if useUpsert {
+			return mongo.NewReplaceOneModel().
+				SetFilter(bson.M{"_id": op.DocumentID}).
+				SetReplacement(transformed).
+				SetUpsert(true), nil
+		}
+
+		return mongo.NewInsertOneModel().SetDocument(transformed), nil
+	}
+
+	return nil, fmt.Errorf("unsupported operation type: %s", op.OpType)
+}
+
+type workerLogger struct {
+	workerID int
+	logger   *logger.Logger
+}
+
+func (wl *workerLogger) Debug(args ...interface{}) {
+	newArgs := append([]interface{}{fmt.Sprintf("Worker %d: ", wl.workerID)}, args...)
+	wl.logger.Debug(newArgs...)
+}
+
+func (wl *workerLogger) Debugf(format string, args ...interface{}) {
+	newArgs := make([]interface{}, 1+len(args))
+	newArgs[0] = wl.workerID
+	copy(newArgs[1:], args)
+	wl.logger.Debugf("Worker %d: "+format, newArgs...)
+}
+
+func (wl *workerLogger) Info(args ...interface{}) {
+	newArgs := append([]interface{}{fmt.Sprintf("Worker %d: ", wl.workerID)}, args...)
+	wl.logger.Info(newArgs...)
+}
+
+func (wl *workerLogger) Infof(format string, args ...interface{}) {
+	newArgs := make([]interface{}, 1+len(args))
+	newArgs[0] = wl.workerID
+	copy(newArgs[1:], args)
+	wl.logger.Infof("Worker %d: "+format, newArgs...)
+}
+
+func (wl *workerLogger) Warn(args ...interface{}) {
+	newArgs := append([]interface{}{fmt.Sprintf("Worker %d: ", wl.workerID)}, args...)
+	wl.logger.Warn(newArgs...)
+}
+
+func (wl *workerLogger) Warnf(format string, args ...interface{}) {
+	newArgs := make([]interface{}, 1+len(args))
+	newArgs[0] = wl.workerID
+	copy(newArgs[1:], args)
+	wl.logger.Warnf("Worker %d: "+format, newArgs...)
+}
+
+func (wl *workerLogger) Error(args ...interface{}) {
+	newArgs := append([]interface{}{fmt.Sprintf("Worker %d: ", wl.workerID)}, args...)
+	wl.logger.Error(newArgs...)
+}
+
+func (wl *workerLogger) Errorf(format string, args ...interface{}) {
+	newArgs := make([]interface{}, 1+len(args))
+	newArgs[0] = wl.workerID
+	copy(newArgs[1:], args)
+	wl.logger.Errorf("Worker %d: "+format, newArgs...)
+}
+
+const fnvOffset32 = 2166136261
+const fnvPrime32 = 16777619
+
+func hashBytes(data []byte) int {
+	hash := uint32(fnvOffset32)
+	for _, b := range data {
+		hash ^= uint32(b)
+		hash *= fnvPrime32
+	}
+	return int(hash)
+}
+
+// StartPeriodicFlushLoop starts a goroutine that periodically checks all workers and flushes timed out groups
+func StartPeriodicFlushLoop(ctx context.Context, workers []*Worker, flushInterval time.Duration, log *logger.Logger) {
+	go func() {
+		ticker := time.NewTicker(flushInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				for _, worker := range workers {
+					if worker == nil {
+						continue
+					}
+					worker.mu.Lock()
+					if worker.currentGroup != nil && len(worker.currentGroup.Operations) > 0 {
+						if time.Since(worker.currentGroup.CreatedAt) >= flushInterval {
+							log.Debugf("Flushing group in worker %d due to timeout: %s.%s with %d operations",
+								worker.id, worker.currentGroup.Namespace, worker.currentGroup.OpType,
+								len(worker.currentGroup.Operations))
+							worker.flushCurrentGroup()
+						}
+					}
+					worker.mu.Unlock()
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// InFlightEvent represents a change stream event that is currently in-flight/processing
+type InFlightEvent struct {
+	SeqNum      uint64
+	ResumeToken bson.Raw
+	Acked       bool
+	EventTime   time.Time
+}
+
+// PartitionTracker coordinates safe, backlogged-aware checkpointing of multi-partition change streams
+type PartitionTracker struct {
+	mu                 sync.Mutex
+	log                *logger.Logger
+	resumeTokenPath    string
+	unackedEvents      map[int]map[uint64]*InFlightEvent
+	pendingSeqs        map[int][]uint64
+	nextSeqNum         map[int]uint64
+	lastCheckpointSeq  map[int]uint64
+	ackCountSinceSave  int
+	saveThreshold      int
+	checkpointInterval time.Duration
+	lastSaveTime       time.Time
+	totalPartitions    int
+}
+
+// NewPartitionTracker creates a new PartitionTracker
+func NewPartitionTracker(log *logger.Logger, resumeTokenPath string, checkpointInterval time.Duration, saveThreshold int, totalPartitions int) *PartitionTracker {
+	if checkpointInterval <= 0 {
+		checkpointInterval = time.Minute
+	}
+	if saveThreshold <= 0 {
+		saveThreshold = 1000
+	}
+	return &PartitionTracker{
+		log:                log,
+		resumeTokenPath:    resumeTokenPath,
+		unackedEvents:      make(map[int]map[uint64]*InFlightEvent),
+		pendingSeqs:        make(map[int][]uint64),
+		nextSeqNum:         make(map[int]uint64),
+		lastCheckpointSeq:  make(map[int]uint64),
+		saveThreshold:      saveThreshold,
+		checkpointInterval: checkpointInterval,
+		lastSaveTime:       time.Now(),
+		totalPartitions:    totalPartitions,
+	}
+}
+
+// Start spawns a background periodic flush goroutine for PartitionTracker checkpoints
+func (t *PartitionTracker) Start(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(t.checkpointInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				t.mu.Lock()
+				if t.ackCountSinceSave > 0 || time.Since(t.lastSaveTime) >= t.checkpointInterval {
+					t.saveCheckpointsLocked()
+				}
+				t.mu.Unlock()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// Register registers a newly read event for the given partition/streamIndex, returns its unique sequence number
+func (t *PartitionTracker) Register(streamIndex int, resumeToken bson.Raw, eventTime time.Time) uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	seq := t.nextSeqNum[streamIndex]
+	if seq == 0 {
+		seq = 1
+	}
+	t.nextSeqNum[streamIndex] = seq + 1
+
+	event := &InFlightEvent{
+		SeqNum:      seq,
+		ResumeToken: resumeToken,
+		Acked:       false,
+		EventTime:   eventTime,
+	}
+
+	if t.unackedEvents[streamIndex] == nil {
+		t.unackedEvents[streamIndex] = make(map[uint64]*InFlightEvent)
+	}
+	t.unackedEvents[streamIndex][seq] = event
+	t.pendingSeqs[streamIndex] = append(t.pendingSeqs[streamIndex], seq)
+
+	return seq
+}
+
+// Ack marks the given sequence number in the partition/streamIndex as successfully processed/completed
+func (t *PartitionTracker) Ack(streamIndex int, seq uint64) {
+	if seq == 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if events, ok := t.unackedEvents[streamIndex]; ok {
+		if event, ok := events[seq]; ok {
+			if !event.Acked {
+				event.Acked = true
+				t.ackCountSinceSave++
+			}
+		}
+	}
+
+	if t.ackCountSinceSave >= t.saveThreshold || time.Since(t.lastSaveTime) >= t.checkpointInterval {
+		t.saveCheckpointsLocked()
+	}
+}
+
+// Close flushes final checkpoints and logs outstanding in-flight warnings
+func (t *PartitionTracker) Close() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.saveCheckpointsLocked()
+
+	for streamIndex, seqs := range t.pendingSeqs {
+		if len(seqs) > 0 {
+			t.log.Warnf("[PartitionTracker] Shutdown complete with %d unacknowledged events in partition %d (first unacked seq: %d)", 
+				len(seqs), streamIndex, seqs[0])
+		}
+	}
+}
+
+// saveCheckpointsLocked evaluates the consecutive ACK boundary and advances checkpoints on disk
+func (t *PartitionTracker) saveCheckpointsLocked() {
+	t.lastSaveTime = time.Now()
+	t.ackCountSinceSave = 0
+
+	for streamIndex, seqs := range t.pendingSeqs {
+		var prunedCount int
+		var highestSafeToken bson.Raw
+		var highestSafeTime time.Time
+		var highestSafeSeq uint64
+
+		for _, seq := range seqs {
+			event := t.unackedEvents[streamIndex][seq]
+			if event != nil && event.Acked {
+				highestSafeToken = event.ResumeToken
+				highestSafeTime = event.EventTime
+				highestSafeSeq = seq
+				delete(t.unackedEvents[streamIndex], seq)
+				prunedCount++
+			} else {
+				break
+			}
+		}
+
+		if prunedCount > 0 {
+			t.pendingSeqs[streamIndex] = t.pendingSeqs[streamIndex][prunedCount:]
+		}
+
+		if highestSafeSeq > 0 && highestSafeSeq > t.lastCheckpointSeq[streamIndex] {
+			t.lastCheckpointSeq[streamIndex] = highestSafeSeq
+			t.savePartitionResumeToken(streamIndex, highestSafeToken, highestSafeTime)
+		}
+	}
+}
+
+// savePartitionResumeToken persists the partition-specific resume token with rotation backups
+func (t *PartitionTracker) savePartitionResumeToken(partitionIndex int, resumeToken bson.Raw, eventTime time.Time) {
+	var resumeTokenDoc bson.M
+	if err := bson.Unmarshal(resumeToken, &resumeTokenDoc); err != nil {
+		t.log.Errorf("[PartitionTracker %d] Error unmarshaling resume token: %v", partitionIndex, err)
+		return
+	}
+
+	path := GetPartitionResumeTokenPath(t.resumeTokenPath, partitionIndex, t.totalPartitions)
+	if err := SaveResumeToken(path, resumeTokenDoc, eventTime); err != nil {
+		t.log.Errorf("[PartitionTracker %d] Error saving resume token to %s: %v", partitionIndex, path, err)
+	} else {
+		t.log.Debugf("[PartitionTracker %d] Saved resume token successfully to %s (seq: %d)", partitionIndex, path, t.lastCheckpointSeq[partitionIndex])
+	}
+}
+
+func (w *Worker) executeWithRetry(ctx context.Context, op func() error) error {
+	err := op()
+	if err != nil && w.retryManager != nil && err != context.Canceled && ctx.Err() != context.Canceled {
+		errType := w.retryManager.ClassifyError(err)
+		if errType == ErrorTypeConnection || errType == ErrorTypeContention {
+			w.log.Infof("Transient error during fallback execution. Retrying with backoff...")
+			err = w.retryManager.RetryWithBackoff(ctx, op)
+		}
+	}
+	return err
+}
+

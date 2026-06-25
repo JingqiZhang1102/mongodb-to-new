@@ -29,6 +29,7 @@ type Config struct {
 
 	// Parameters for incremental replication
 	IncrementalReadBatchSize       int  `json:"incrementalReadBatchSize"`       // Number of change events to read at once
+	IncrementalStreamPartitions    int  `json:"incrementalStreamPartitions"`    // Number of parallel change stream partitions
 	IncrementalWriteBatchSize      int  `json:"incrementalWriteBatchSize"`      // Maximum size of operation groups
 	IncrementalWorkerCount         int  `json:"incrementalWorkerCount"`         // Number of worker goroutines
 	StatsIntervalMinutes           int  `json:"statsIntervalMinutes"`           // Interval for reporting change stream statistics in minutes
@@ -37,15 +38,36 @@ type Config struct {
 	IncrementalProcessingQueueSize int  `json:"incrementalProcessingQueueSize"` // Buffer size of workers' writing batches queue
 
 	// Parallel read configuration for large collections
-	ParallelReadsEnabled    bool `json:"parallelReadsEnabled"`    // Enable parallel reads for large collections
-	MaxReadPartitions       int  `json:"maxReadPartitions"`       // Maximum number of partitions for parallel reads
-	MinDocsPerPartition     int  `json:"minDocsPerPartition"`     // Minimum number of documents per partition
-	MinDocsForParallelReads int  `json:"minDocsForParallelReads"` // Minimum collection size for parallel reads
-	SampleSize              int  `json:"sampleSize"`              // Number of documents to sample for partitioning
-	WorkersPerPartition     int  `json:"workersPerPartition"`     // Number of worker goroutines per partition
+	ParallelReadsEnabled    bool   `json:"parallelReadsEnabled"`    // Enable parallel reads for large collections
+	MaxReadPartitions       int    `json:"maxReadPartitions"`       // Maximum number of partitions for parallel reads
+	MinDocsPerPartition     int    `json:"minDocsPerPartition"`     // Minimum number of documents per partition
+	MinDocsForParallelReads int    `json:"minDocsForParallelReads"` // Minimum collection size for parallel reads
+	SampleSize              int    `json:"sampleSize"`              // Number of documents to sample for partitioning
+	WorkersPerPartition     int    `json:"workersPerPartition"`     // Number of worker goroutines per partition
+	IDTypeForPartition      string `json:"idTypeForPartition"`      // Partitioning ID type: "mixed", "objectid", or "numeric"
+
+	// Write ramp-up configuration for initial migration
+	BackfillRampUp BackfillRampUpConfig `json:"backfillRampUp"`
 
 	// Retry configuration
 	RetryConfig RetryConfig `json:"retryConfig"` // Configuration for retry mechanisms
+
+	// Drop empty field names (defaults to false)
+	DropEmptyFieldNames bool `json:"dropEmptyFieldNames"`
+
+	// Convert long field names in nested documents (defaults to false)
+	ConvertLongFieldNamesInNestedDocs bool `json:"convertLongFieldNamesInNestedDocs"`
+}
+
+// BackfillRampUpConfig represents write ramp-up configuration for initial backfill
+type BackfillRampUpConfig struct {
+	Enabled             bool    `json:"enabled"`
+	Strategy            string  `json:"strategy"` // "static" or "adaptive"
+	StartQps            float64 `json:"startQps"`
+	RampRatePerMin      float64 `json:"rampRatePerMin"`
+	UpdateIntervalMs    int     `json:"updateIntervalMs"`
+	UseStaggeredWorkers bool    `json:"useStaggeredWorkers"`
+	WorkerDelayMs       int     `json:"workerDelayMs"`
 }
 
 // RetryConfig represents retry configuration
@@ -78,6 +100,7 @@ type TargetConfig struct {
 	Collections      []CollectionConfig `json:"collections,omitempty"`
 	SyncAllIndexes   bool               `json:"syncAllIndexes,omitempty"` // Sync all indexes (excluding _id_) from source
 	IndexOnly        bool               `json:"indexOnly,omitempty"`      // Only sync indexes, skip data migration
+	UpsertMode       bool               `json:"upsertMode,omitempty"`     // Use upsert by default for all collections in this database target
 	Indexes          []IndexSyncConfig  `json:"indexes,omitempty"`
 }
 
@@ -133,6 +156,10 @@ func LoadConfig(configPath string) (*Config, error) {
 	// Set default values for incremental replication parameters
 	if config.IncrementalReadBatchSize <= 0 {
 		config.IncrementalReadBatchSize = 8192 // Default to 8192 change events
+	}
+
+	if config.IncrementalStreamPartitions <= 0 {
+		config.IncrementalStreamPartitions = 1
 	}
 
 	if config.IncrementalWriteBatchSize <= 0 {
@@ -216,6 +243,10 @@ func LoadConfig(configPath string) (*Config, error) {
 		config.WorkersPerPartition = 3 // Default to 3 workers per partition
 	}
 
+	if config.IDTypeForPartition == "" {
+		config.IDTypeForPartition = "auto"
+	}
+
 	// Set default values for retry configuration
 	if config.RetryConfig.MaxRetries <= 0 {
 		config.RetryConfig.MaxRetries = 5 // Default to 5 retries
@@ -237,6 +268,18 @@ func LoadConfig(configPath string) (*Config, error) {
 	// Default to true to automatically convert invalid _id types
 	if !config.RetryConfig.ConvertInvalidIds {
 		config.RetryConfig.ConvertInvalidIds = true
+	}
+
+	// Initialize default values for BackfillRampUpConfig
+	// targetQps == 0 or omitted signifies uncapped linear growth (no ceiling).
+	if config.BackfillRampUp.RampRatePerMin <= 0 {
+		config.BackfillRampUp.RampRatePerMin = 10000.0 // Balanced profile: 10K QPS increase per minute
+	}
+	if config.BackfillRampUp.UpdateIntervalMs <= 0 {
+		config.BackfillRampUp.UpdateIntervalMs = 1000 // Default to 1 second
+	}
+	if config.BackfillRampUp.Strategy == "" {
+		config.BackfillRampUp.Strategy = "static"
 	}
 
 	// No backward compatibility needed anymore
@@ -276,6 +319,10 @@ func validateConfig(config *Config) error {
 				return fmt.Errorf("target collection name is required for collection mapping at index %d in database pair %d", j, i)
 			}
 		}
+	}
+
+	if config.IDTypeForPartition != "" && config.IDTypeForPartition != "auto" && config.IDTypeForPartition != "mixed" && config.IDTypeForPartition != "objectid" && config.IDTypeForPartition != "numeric" {
+		return fmt.Errorf("invalid idTypeForPartition: %s. Must be 'auto', 'mixed', 'objectid', or 'numeric'", config.IDTypeForPartition)
 	}
 
 	return nil

@@ -2,7 +2,10 @@ package migration
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -13,29 +16,43 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // ClientLevelReplicator handles replication using a client-level change stream
 type ClientLevelReplicator struct {
-	sourceDB      *db.MongoDB
-	targetDB      *db.MongoDB
-	config        *config.Config
-	log           *logger.Logger
-	collectionMap map[string]map[string]string // Map of database -> source collection -> target collection
-	mu            sync.Mutex                   // Mutex for thread-safe operations
-	dlq           DLQ                          // Dead Letter Queue for failed documents
+	sourceDB                *db.MongoDB
+	targetDB                *db.MongoDB
+	config                  *config.Config
+	log                     *logger.Logger
+	collectionMap           map[string]map[string]string                  // Map of database -> source collection -> target collection
+	collectionConfigs       map[string]map[string]config.CollectionConfig // Map of database -> source collection -> full config
+	mu                      sync.Mutex                                    // Mutex for thread-safe operations
+	dlq                     DLQ                                           // Dead Letter Queue for failed documents
+	incrementalStatsManager *IncrementalStatsManager                      // Statistics manager
+	backfillStatsManager    *BackfillStatsManager                         // Backfill statistics manager
+	DryRun                  bool                                          // Dry run flag
 }
 
 // NewClientLevelReplicator creates a new client-level replicator
 func NewClientLevelReplicator(sourceDB, targetDB *db.MongoDB, cfg *config.Config, log *logger.Logger) *ClientLevelReplicator {
 	return &ClientLevelReplicator{
-		sourceDB:      sourceDB,
-		targetDB:      targetDB,
-		config:        cfg,
-		log:           log,
-		collectionMap: make(map[string]map[string]string),
+		sourceDB:          sourceDB,
+		targetDB:          targetDB,
+		config:            cfg,
+		log:               log,
+		collectionMap:     make(map[string]map[string]string),
+		collectionConfigs: make(map[string]map[string]config.CollectionConfig),
 	}
+}
+
+// SetIncrementalStatsManager sets the stats manager for this replicator
+func (r *ClientLevelReplicator) SetIncrementalStatsManager(sm *IncrementalStatsManager) {
+	r.incrementalStatsManager = sm
+}
+
+// SetBackfillStatsManager sets the backfill stats manager for this replicator
+func (r *ClientLevelReplicator) SetBackfillStatsManager(sm *BackfillStatsManager) {
+	r.backfillStatsManager = sm
 }
 
 // SetDLQ sets the Dead Letter Queue writer for this replicator
@@ -44,7 +61,7 @@ func (r *ClientLevelReplicator) SetDLQ(dlq DLQ) {
 }
 
 // AddCollection adds a collection to be watched
-func (r *ClientLevelReplicator) AddCollection(sourceDB, targetDB, sourceCollection, targetCollection string) {
+func (r *ClientLevelReplicator) AddCollection(sourceDB, targetDB string, collConfig config.CollectionConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -52,15 +69,170 @@ func (r *ClientLevelReplicator) AddCollection(sourceDB, targetDB, sourceCollecti
 	if r.collectionMap[sourceDB] == nil {
 		r.collectionMap[sourceDB] = make(map[string]string)
 	}
+	if r.collectionConfigs == nil {
+		r.collectionConfigs = make(map[string]map[string]config.CollectionConfig)
+	}
+	if r.collectionConfigs[sourceDB] == nil {
+		r.collectionConfigs[sourceDB] = make(map[string]config.CollectionConfig)
+	}
 
 	// Add collection mapping
-	r.collectionMap[sourceDB][sourceCollection] = targetCollection
+	r.collectionMap[sourceDB][collConfig.SourceCollection] = collConfig.TargetCollection
+	r.collectionConfigs[sourceDB][collConfig.SourceCollection] = collConfig
 
-	r.log.Infof("Added collection mapping: %s.%s -> %s.%s", sourceDB, sourceCollection, targetDB, targetCollection)
+	r.log.Infof("Added collection mapping: %s.%s -> %s.%s (UpsertMode: %t)",
+		sourceDB, collConfig.SourceCollection, targetDB, collConfig.TargetCollection, collConfig.UpsertMode)
 }
 
 // StartReplication starts the client-level replication
-func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResumeToken interface{}, globalResumeTokenPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, liveOnly bool, cdcStartTime *primitive.Timestamp, migrator *Migrator) error {
+func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResumeToken interface{}, globalResumeTokenPath string, initialMigrationState *InitialMigrationState, initialMigrationStatePath string, pair config.DatabasePair, liveOnly bool, liveStartTime *primitive.Timestamp, migrator *Migrator) error {
+	if r.log == nil {
+		r.log = logger.New()
+	}
+	partitions := 1
+	if r.config != nil {
+		partitions = r.config.IncrementalStreamPartitions
+	}
+
+	// Scan for any files matching: resumeToken-<db>-<coll>-partition-*-of-*.json
+	dir := filepath.Dir(globalResumeTokenPath)
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("failed to read checkpoint directory %s: %w", dir, err)
+	}
+
+	diskCheckpoints := ScanPartitionCheckpoints(files, globalResumeTokenPath)
+	historicalTotal, existingPaths, usingCurrentPartitionFormat := ResolveActiveCheckpoints(diskCheckpoints)
+
+	if historicalTotal > 0 {
+		if historicalTotal != partitions || usingCurrentPartitionFormat {
+			// --- PARTITION TRANSITION OR FORMAT UPGRADE PATH ---
+			r.log.Infof("[Startup] Partition scaling/upgrade transition detected: historical partitions = %d, configured partitions = %d. Safe watermark resolution active.", historicalTotal, partitions)
+
+			var minToken interface{}
+			var minTime time.Time
+			var minFile string
+
+			// Assert that all historical checkpoints are present to prevent silent data loss
+			for i := 0; i < historicalTotal; i++ {
+				oldPath, exists := existingPaths[i]
+				if !exists {
+					// CRITICAL SAFETY EXCEPTION: Abort immediately if any historical checkpoint is missing
+					return fmt.Errorf("safety violation: historical partition checkpoint file for partition %d of %d is missing on disk. Recovery aborted to prevent silent data loss. Please restore the file or start fresh", i+1, historicalTotal)
+				}
+
+				r.log.Infof("[Startup] [Watermark Assessment] Loading historical checkpoint %d/%d: %s", i+1, historicalTotal, filepath.Base(oldPath))
+				token, err := LoadResumeToken(oldPath)
+				if err != nil || token == nil {
+					return fmt.Errorf("failed to load historical partition checkpoint %s: %w", oldPath, err)
+				}
+
+				// Load JSON timestamp metadata
+				data, err := os.ReadFile(oldPath)
+				if err == nil {
+					var rt ResumeToken
+					if err := json.Unmarshal(data, &rt); err == nil {
+						eventTime := rt.Timestamp
+						if eventTime.IsZero() {
+							eventTime = time.Unix(0, 0) // Fallback for untimestamped tokens
+						}
+						if minTime.IsZero() || eventTime.Before(minTime) {
+							minTime = eventTime
+							minToken = token
+							minFile = oldPath
+						}
+					}
+				}
+			}
+
+			if minToken == nil {
+				return fmt.Errorf("safety violation: cannot transition partition count because no valid event timestamps were found in checkpoint files")
+			}
+
+			r.log.Infof("[Startup] [Watermark Resolution] Safe unified minimum watermark resolved from %s (timestamp: %s).", filepath.Base(minFile), minTime.UTC().Format(time.RFC3339))
+			r.log.Infof("[Startup] [Watermark Resolution] Initializing all %d new partition checkpoints with resolved watermark.", partitions)
+
+			// 1. Initialize all new partition checkpoints
+			for i := 0; i < partitions; i++ {
+				newPath := GetPartitionResumeTokenPath(globalResumeTokenPath, i, partitions)
+				if err := SaveResumeToken(newPath, minToken, minTime); err != nil {
+					return fmt.Errorf("[Partition %d] failed to save converted partition checkpoint: %w", i+1, err)
+				}
+				r.log.Infof("[Startup] [Watermark Resolution] Saved new partition checkpoint: %s", filepath.Base(newPath))
+			}
+
+			// 2. Clean up the historical partition checkpoints
+			r.log.Info("[Startup] [Watermark Resolution] Cleaning up stale historical partition checkpoints from disk.")
+			for _, oldPath := range existingPaths {
+				if err := DeleteResumeToken(oldPath); err != nil {
+					r.log.Warnf("Failed to clean up stale partition checkpoint %s: %v", oldPath, err)
+				} else {
+					r.log.Infof("[Startup] [Watermark Resolution] Deleted stale checkpoint: %s", filepath.Base(oldPath))
+				}
+			}
+
+			globalResumeToken = minToken
+		} else {
+			// --- NORMAL STARTUP / RESUME PATH ---
+			r.log.Infof("[Startup] Normal resume path active. Verifying all %d partition checkpoints are healthy on disk.", partitions)
+
+			// Ensure that all expected partition files exist and are valid
+			for i := 0; i < partitions; i++ {
+				oldPath, exists := existingPaths[i]
+				if !exists {
+					expectedPath := GetPartitionResumeTokenPath(globalResumeTokenPath, i, partitions)
+					// CRITICAL SAFETY EXCEPTION: Missing checkpoint detected on normal resume
+					return fmt.Errorf("safety violation: expected partition checkpoint file %s (partition %d of %d) is missing on disk. Fallback aborted to prevent data loss", filepath.Base(expectedPath), i+1, partitions)
+				}
+
+				token, err := LoadResumeToken(oldPath)
+				if err != nil || token == nil {
+					return fmt.Errorf("fatal: partition checkpoint file %s exists but is empty or unreadable: %v", oldPath, err)
+				}
+				r.log.Infof("[Startup] Verified healthy partition checkpoint %d/%d: %s", i+1, partitions, filepath.Base(oldPath))
+			}
+
+			// Populate globalResumeToken from the oldest partition file to satisfy safety invariants
+			var minToken interface{}
+			var minTime time.Time
+			for i := 0; i < partitions; i++ {
+				path := existingPaths[i]
+				token, _ := LoadResumeToken(path)
+				if token != nil {
+					data, err := os.ReadFile(path)
+					if err == nil {
+						var rt ResumeToken
+						if err := json.Unmarshal(data, &rt); err == nil {
+							eventTime := rt.Timestamp
+							if eventTime.IsZero() {
+								eventTime = time.Unix(0, 0)
+							}
+							if minTime.IsZero() || eventTime.Before(minTime) {
+								minTime = eventTime
+								minToken = token
+							}
+						}
+					}
+				}
+			}
+			if minToken != nil {
+				globalResumeToken = minToken
+			}
+		}
+	} else {
+		// --- CASE C: LEGACY NAMING (NON-PARTITIONED) UPGRADE ---
+		if globalResumeToken != nil {
+			r.log.Infof("[Startup] Legacy single change stream checkpoint detected: %s. Upgrading to partitioned change stream (%d partitions configured).", filepath.Base(globalResumeTokenPath), partitions)
+			for i := 0; i < partitions; i++ {
+				partitionPath := GetPartitionResumeTokenPath(globalResumeTokenPath, i, partitions)
+				if err := SaveResumeToken(partitionPath, globalResumeToken); err != nil {
+					return fmt.Errorf("[Partition %d] failed to initialize partition checkpoint: %w", i+1, err)
+				}
+				r.log.Infof("[Startup] Initialized partition checkpoint %d/%d: %s", i+1, partitions, filepath.Base(partitionPath))
+			}
+		}
+	}
+
 	// Abort if the initial migration state was completed with failures, or if DLQ has entries
 	if initialMigrationState != nil && initialMigrationState.Status == StatusCompletedWithFailures {
 		return fmt.Errorf("cannot start replication: initial migration completed with failures in a previous run")
@@ -74,11 +246,11 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 	}
 
 	// Enforce safety invariants between Initial Migration State and Resume Token Checkpoint
-	if cdcStartTime != nil && globalResumeToken != nil {
-		return fmt.Errorf("safety violation: a custom cdc-start-timestamp is specified, but a global resume token checkpoint already exists. Clean up checkpoint file or omit cdc-start-timestamp to resume from the last checkpoint")
+	if liveStartTime != nil && globalResumeToken != nil {
+		return fmt.Errorf("safety violation: a custom live-start-timestamp is specified, but a global resume token checkpoint already exists. Clean up checkpoint file or omit live-start-timestamp to resume from the last checkpoint")
 	}
 
-	if cdcStartTime == nil {
+	if liveStartTime == nil {
 		if initialMigrationState == nil {
 			if globalResumeToken != nil {
 				return fmt.Errorf("safety violation: initial migration state file does not exist, but a global resume token checkpoint exists. Clean up checkpoint file or ensure state is in sync before proceeding")
@@ -90,16 +262,18 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		}
 	}
 
-	var changeStream *mongo.ChangeStream
-	var err error
 	var needsInitialMigration bool
 
 	// We need to run initial migration if no state file exists OR if it is not marked completed
 	if initialMigrationState == nil || !initialMigrationState.IsCompleted() {
 		if liveOnly {
 			r.log.Info("Live-only mode enabled. Skipping initial migration phase.")
+			// Critical File-System State Checkpoint:
+			// If we cannot persist the StatusSkipped state to disk, we exit with a terminal error.
+			// Continuing silently would cause subsequent startup runs to attempt the backfill again,
+			// leading to massive duplicate processing or index-recreation errors.
 			if err := SaveInitialMigrationState(initialMigrationStatePath, StatusSkipped, 0); err != nil {
-				r.log.Errorf("Error saving initial migration state as skipped: %v", err)
+				return fmt.Errorf("failed to save initial migration state as skipped: %w", err)
 			}
 			needsInitialMigration = false
 			initialMigrationState = &InitialMigrationState{
@@ -110,11 +284,11 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		}
 	}
 
-	// If no resume token is available, and no custom cdcStartTime is specified, we need to capture the
+	// If no resume token is available, and no custom liveStartTime is specified, we need to capture the
 	// current cursor state of the database so that we have a valid checkpoint to resume replication from.
-	// Note: If cdcStartTime is provided, we don't capture a startup resume token, as the client-level
-	// change stream will be configured to start replication directly from the specified cdcStartTime.
-	if globalResumeToken == nil && cdcStartTime == nil {
+	// Note: If liveStartTime is provided, we don't capture a startup resume token, as the client-level
+	// change stream will be configured to start replication directly from the specified liveStartTime.
+	if globalResumeToken == nil && liveStartTime == nil {
 		if liveOnly {
 			r.log.Info("No global resume token found in live-only mode. Obtaining current resume token to start incremental replication.")
 		} else {
@@ -122,7 +296,7 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		}
 
 		// Create a change stream to get an initial resume token
-		initialChangeStream, err := r.sourceDB.CreateClientLevelChangeStream(ctx, nil, nil, 0)
+		initialChangeStream, err := r.sourceDB.CreateClientLevelChangeStream(ctx, nil, nil, 0, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create initial client-level change stream: %w", err)
 		}
@@ -134,15 +308,20 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		// Convert the BSON resume token to a map with _data field
 		var initialResumeTokenDoc bson.M
 		if err := bson.Unmarshal(initialResumeToken, &initialResumeTokenDoc); err != nil {
-			r.log.Errorf("Error unmarshaling initial resume token: %v", err)
+			return fmt.Errorf("failed to unmarshal initial resume token BSON: %w", err)
 		}
 		r.log.Infof("Converted initial resume token: %v", initialResumeTokenDoc)
 
-		// Save this initial resume token
-		if err := SaveResumeToken(globalResumeTokenPath, initialResumeTokenDoc); err != nil {
-			r.log.Errorf("Error saving initial global resume token: %v", err)
-		} else {
-			r.log.Info("Saved initial global resume token")
+		// Save this initial resume token to all configured partition checkpoint files.
+		// Critical Safety Checkpoint: If any file write fails (e.g. permissions, disk full), we abort immediately.
+		// Continuing silently would leave incremental replication without starting checkpoints, risking
+		// replication gaps or severe operational overhead on subsequent process restarts.
+		for i := 0; i < r.config.IncrementalStreamPartitions; i++ {
+			partitionPath := GetPartitionResumeTokenPath(globalResumeTokenPath, i, r.config.IncrementalStreamPartitions)
+			if err := SaveResumeToken(partitionPath, initialResumeTokenDoc); err != nil {
+				return fmt.Errorf("[Partition %d] failed to save initial partition resume token to %s: %w", i, partitionPath, err)
+			}
+			r.log.Infof("[Partition %d] Saved initial partition resume token successfully to %s", i, partitionPath)
 		}
 
 		// Close the initial change stream
@@ -150,19 +329,19 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 
 		// Use the converted resume token
 		globalResumeToken = initialResumeTokenDoc
-	} else if cdcStartTime != nil {
-		r.log.Infof("No resume token available. Starting replication from cdcStartTime: %s", time.Unix(int64(cdcStartTime.T), 0).UTC().Format(time.RFC3339))
+	} else if liveStartTime != nil {
+		r.log.Infof("No resume token available. Starting replication from liveStartTime: %s", time.Unix(int64(liveStartTime.T), 0).UTC().Format(time.RFC3339))
 	} else {
 		r.log.Info("Global resume token available. Starting incremental replication.")
 	}
 
 	// Perform initial migration if needed
 	if needsInitialMigration {
-		// Mark initial migration state as incomplete before starting
-		if err := SaveInitialMigrationState(initialMigrationStatePath, StatusInProgress, 0); err != nil {
-			r.log.Errorf("Error saving initial migration state as incomplete: %v", err)
+		if !r.DryRun {
+			if err := SaveInitialMigrationState(initialMigrationStatePath, StatusInProgress, 0); err != nil {
+				return fmt.Errorf("failed to save initial migration state as incomplete: %w", err)
+			}
 		}
-
 		initialMigrationStart := time.Now()
 		r.log.Info("Performing initial migration for all collections")
 
@@ -177,12 +356,9 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 
 			// Build collections list from collectionMap
 			var collections []config.CollectionConfig
-			for _, colls := range r.collectionMap {
-				for src, tgt := range colls {
-					collections = append(collections, config.CollectionConfig{
-						SourceCollection: src,
-						TargetCollection: tgt,
-					})
+			for _, colls := range r.collectionConfigs {
+				for _, collConfig := range colls {
+					collections = append(collections, collConfig)
 				}
 			}
 			if err := migrator.syncIndexes(ctx, r.sourceDB, r.targetDB, pair, collections); err != nil {
@@ -195,6 +371,12 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 				r.targetDB.WaitForIndexCreation()
 				migrator.logFailedIndexes(r.targetDB)
 				r.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration and change stream.")
+				r.log.Info("IndexOnly mode: all indexes synced successfully. Skipping data migration.")
+
+				// Determine if initial migration completed with failures (none in IndexOnly since no data migrated)
+				if err := SaveInitialMigrationState(initialMigrationStatePath, StatusCompleted, 0); err != nil {
+					r.log.Errorf("Error saving initial migration state as complete: %v", err)
+				}
 				return nil
 			}
 
@@ -207,8 +389,20 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 			r.log.Info("All indexes created. Proceeding with data migration.")
 		}
 
+		throttlerCtx, throttlerCancel := context.WithCancel(ctx)
+		defer throttlerCancel()
+
+		// Initialize the throttler for backfill traffic writes
+		burstSize := 2 * r.config.InitialWriteBatchSize
+		throttler := NewWriteThrottler(r.config.BackfillRampUp, burstSize)
+		if throttler != nil {
+			throttler.StartRampUp(throttlerCtx)
+			if r.backfillStatsManager != nil {
+				r.backfillStatsManager.SetThrottler(throttler)
+			}
+		}
+
 		// Use a semaphore to limit the number of concurrent collection migrations
-		// Use ConcurrentCollections for collection-level concurrency (separate from per-collection worker count)
 		concurrentCollections := r.config.ConcurrentCollections
 		if concurrentCollections <= 0 {
 			concurrentCollections = 4
@@ -223,394 +417,63 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		var completedCollections int64
 		var mu sync.Mutex // Mutex for thread-safe updates to statistics
 
-		// Pre-compute total collection count before launching goroutines
-		// so the progress log always shows the correct total
+		// Track critical errors
+		var criticalErr error
+		var errOnce sync.Once
+
 		totalCollections := 0
-		for _, colls := range r.collectionMap {
+		for _, colls := range r.collectionConfigs {
 			totalCollections += len(colls)
 		}
 
 		// Iterate through all collections in the map
-		for sourceDB, collections := range r.collectionMap {
-			for sourceCollection, targetCollection := range collections {
+		for sourceDB, collections := range r.collectionConfigs {
+			for sourceCollection, collConfig := range collections {
 				wg.Add(1)
-
-				// Acquire semaphore
 				semaphore <- struct{}{}
 
-				// Start migration in a goroutine
-				go func(sourceDB, sourceCollection, targetCollection string) {
+				go func(sourceDB, sourceCollection string, collConfig config.CollectionConfig) {
 					defer wg.Done()
-					defer func() { <-semaphore }() // Release semaphore when done
+					defer func() { <-semaphore }()
 
-					r.log.Infof("Starting initial migration for %s.%s to %s", sourceDB, sourceCollection, targetCollection)
+					r.log.Infof("Starting initial migration for %s.%s to %s", sourceDB, sourceCollection, collConfig.TargetCollection)
 
-					// Get source and target collections
-					sourceDBCollection := r.sourceDB.GetCollection(sourceCollection)
-					targetDBCollection := r.targetDB.GetCollection(targetCollection)
+					opts := MigrateOptions{
+						DLQ:                  r.dlq,
+						StatsManager:         r.incrementalStatsManager,
+						BackfillStatsManager: r.backfillStatsManager,
+						UpsertMode:           true, // resilient mode always performs upserts on duplicates
+						Throttler:            throttler,
+					}
 
-					// Count documents
-					count, err := sourceDBCollection.EstimatedDocumentCount(ctx)
+					succeeded, failed, err := migrator.migrateCollection(ctx, r.sourceDB, r.targetDB, collConfig, opts)
 					if err != nil {
-						r.log.Errorf("Error counting documents in %s.%s: %v", sourceDB, sourceCollection, err)
-						return
-					}
-
-					r.log.Infof("Found %d documents to migrate in %s.%s", count, sourceDB, sourceCollection)
-
-					// Skip if no documents
-					if count == 0 {
-						r.log.Infof("No documents to migrate for %s.%s", sourceDB, sourceCollection)
-						return
-					}
-
-					// Set up batch processing using configuration parameters
-					readBatchSize := r.config.InitialReadBatchSize
-					writeBatchSize := r.config.InitialWriteBatchSize
-
-					r.log.Infof("Using read batch size: %d, write batch size: %d for %s.%s",
-						readBatchSize, writeBatchSize, sourceDB, sourceCollection)
-
-					cursor, err := sourceDBCollection.Find(ctx, bson.D{}, options.Find().SetBatchSize(int32(readBatchSize)))
-					if err != nil {
-						r.log.Errorf("Error creating cursor for %s.%s: %v", sourceDB, sourceCollection, err)
-						return
-					}
-					defer cursor.Close(ctx)
-
-					// Set up parallel batch processing
-					var workerWg sync.WaitGroup
-					channelBufferSize := r.config.InitialChannelBufferSize
-					batchChan := make(chan []interface{}, channelBufferSize) // Buffer for batches
-					errorChan := make(chan error, 1)                         // Channel for errors
-					doneChan := make(chan struct{})                          // Channel to signal completion
-
-					// Track progress metrics:
-					// - successCount: documents successfully written to target database
-					// - failedCount: documents that failed target writes and were routed to the DLQ
-					// - migratedCount: total documents processed from source cursor (successCount + failedCount)
-					var successCount int64
-					var failedCount int64
-					var migratedCount int64
-					var lastLoggedPercentage int = -1 // Start at -1 to ensure 0% is logged
-					var workerMu sync.Mutex           // Mutex for thread-safe updates to successCount, failedCount, migratedCount, and lastLoggedPercentage
-
-					// Create retry manager for initial migration batch processing
-					retryManager := NewRetryManagerFromConfig(r.config, r.log)
-
-					// Start worker pool for parallel batch processing
-					workerCount := r.config.InitialMigrationWorkers
-					r.log.Infof("Starting %d workers for parallel document batch processing for %s.%s",
-						workerCount, sourceDB, sourceCollection)
-
-					for i := 0; i < workerCount; i++ {
-						workerWg.Add(1)
-						go func(workerID int) {
-							defer workerWg.Done()
-
-							for batch := range batchChan {
-								// Transform __*__ field names to _*_ for Firestore compatibility
-								transformedBatch, err := TransformBatch(batch, r.log, sourceDB, sourceCollection)
-								if err != nil {
-									r.log.Errorf("Field name transformation failed for batch in %s.%s: %v", sourceDB, sourceCollection, err)
-									for _, doc := range batch {
-										docID := extractDocID(doc)
-										if r.dlq != nil {
-											r.dlq.WriteFailed(sourceDB, sourceCollection, docID, err, "initial", "insert", doc)
-										}
-									}
-									// Phase 1 (Pre-Database failure): Update metrics early since the entire batch
-									// is aborted here and will skip the post-database metrics block below.
-									workerMu.Lock()
-									failedCount += int64(len(batch))
-									migratedCount += int64(len(batch))
-									workerMu.Unlock()
-									continue
-								}
-								batch = transformedBatch
-
-								var batchFailed int64
-
-								// Process batch
-								if _, err := targetDBCollection.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false)); err != nil {
-									// Handle bulk write errors
-									bulkWriteException, ok := err.(mongo.BulkWriteException)
-									if ok {
-										r.log.Debugf("Bulk insert partially failed for %s.%s: %d failed",
-											sourceDB, sourceCollection, len(bulkWriteException.WriteErrors))
-
-										// Process individual errors
-										for _, writeErr := range bulkWriteException.WriteErrors {
-											// Extract document ID for logging
-											var errDocID interface{}
-											if writeErr.Index < len(batch) {
-												switch d := batch[writeErr.Index].(type) {
-												case bson.D:
-													for _, elem := range d {
-														if elem.Key == "_id" {
-															errDocID = elem.Value
-															break
-														}
-													}
-												case bson.M:
-													errDocID = d["_id"]
-												}
-											}
-
-											r.log.Debugf("[%s.%s] Insert error at index %d, _id=%v: %v", sourceDB, sourceCollection, writeErr.Index, errDocID, writeErr.Message)
-
-											// Check if it's a duplicate key error (code 11000)
-											if writeErr.Code == 11000 && writeErr.Index < len(batch) {
-												// Skip duplicate key errors as they likely mean the document already exists
-												r.log.Debugf("[%s.%s] Skipping duplicate document _id=%v at index %d", sourceDB, sourceCollection, errDocID, writeErr.Index)
-											} else if writeErr.Index < len(batch) {
-												// For non-duplicate key errors, retry with upsert
-												doc := batch[writeErr.Index]
-												var id interface{}
-
-												// Extract ID from document
-												switch d := doc.(type) {
-												case bson.D:
-													for _, elem := range d {
-														if elem.Key == "_id" {
-															id = elem.Value
-															break
-														}
-													}
-												case bson.M:
-													id = d["_id"]
-												}
-
-												if id != nil {
-													filter := bson.M{"_id": id}
-													if _, err := targetDBCollection.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); err != nil {
-														r.log.Errorf("[%s.%s] Retry upsert failed for document _id=%v: %v", sourceDB, sourceCollection, id, err)
-														// Increment batch failures because even individual fallback retry upsert failed
-														batchFailed++
-														if r.dlq != nil {
-															r.dlq.WriteFailed(sourceDB, sourceCollection, id, err, "initial", "insert", doc)
-														}
-													}
-												} else {
-													// Increment batch failures because we cannot retry upsert without a valid _id
-													batchFailed++
-												}
-											}
-										}
-									} else {
-										// Handle non-bulk write errors (e.g. network partition or context timeout)
-										if err == context.Canceled {
-											r.log.Debugf("[%s.%s] Bulk insert canceled due to context cancellation", sourceDB, sourceCollection)
-											batchFailed = int64(len(batch))
-										} else {
-											r.log.Errorf("[%s.%s] InsertMany total failure: %v", sourceDB, sourceCollection, err)
-
-											// For transient errors, retry the bulk operation with backoff before falling back
-											bulkRetrySucceeded := false
-											errType := retryManager.ClassifyError(err)
-											if errType == ErrorTypeConnection || errType == ErrorTypeContention {
-												r.log.Infof("[%s.%s] Transient error detected. Retrying bulk insert with backoff...", sourceDB, sourceCollection)
-												retryErr := retryManager.RetryWithBackoff(ctx, func() error {
-													_, retryInsertErr := targetDBCollection.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false))
-													return retryInsertErr
-												})
-												if retryErr == nil {
-													r.log.Infof("[%s.%s] Bulk insert succeeded after retry", sourceDB, sourceCollection)
-													bulkRetrySucceeded = true
-												} else {
-													r.log.Warnf("[%s.%s] Bulk insert still failed after retries: %v. Falling back to individual operations.", sourceDB, sourceCollection, retryErr)
-												}
-											}
-
-											if !bulkRetrySucceeded {
-												// Fall back to individual insert → upsert → DLQ for each document
-												r.log.Warnf("[%s.%s] Falling back to individual insert/upsert for %d documents", sourceDB, sourceCollection, len(batch))
-												for _, doc := range batch {
-													docID := extractDocID(doc)
-
-													// Try individual insert first
-													if _, insertErr := targetDBCollection.InsertOne(ctx, doc); insertErr != nil {
-														// If insert fails, try upsert with ReplaceOne
-														if docID != nil {
-															filter := bson.M{"_id": docID}
-															if _, upsertErr := targetDBCollection.ReplaceOne(ctx, filter, doc, options.Replace().SetUpsert(true)); upsertErr != nil {
-																if upsertErr == context.Canceled {
-																	r.log.Debugf("[%s.%s] Upsert for document _id=%v canceled due to context cancellation", sourceDB, sourceCollection, docID)
-																} else {
-																	r.log.Errorf("[%s.%s] Fallback upsert failed for document _id=%v: %v", sourceDB, sourceCollection, docID, upsertErr)
-																	batchFailed++
-																	if r.dlq != nil {
-																		r.dlq.WriteFailed(sourceDB, sourceCollection, docID, upsertErr, "initial", "insert", doc)
-																	}
-																}
-															} else {
-																r.log.Debugf("[%s.%s] Successfully upserted document _id=%v after total failure fallback", sourceDB, sourceCollection, docID)
-															}
-														} else {
-															// No _id available, cannot upsert
-															batchFailed++
-															if r.dlq != nil {
-																r.dlq.WriteFailed(sourceDB, sourceCollection, docID, insertErr, "initial", "insert", doc)
-															}
-														}
-													}
-													// else: individual insert succeeded, no action needed
-												}
-											}
-										}
-									}
-								}
-
-								// Phase 2 (Post-Database write execution): Distribute metrics dynamically
-								// based on successful writes and database retry failures within this batch.
-								workerMu.Lock()
-								successCount += int64(len(batch)) - batchFailed
-								failedCount += batchFailed
-								migratedCount += int64(len(batch))
-								currentCount := migratedCount // Copy for logging outside the lock
-								currentSuccess := successCount
-								currentFailed := failedCount
-
-								// Calculate current percentage (0-10 for 0%-100%)
-								currentPercentage := int(float64(currentCount) / float64(count) * 10)
-
-								// Only log when crossing a 10% threshold at the collection level
-								if currentPercentage > lastLoggedPercentage {
-									r.log.Infof("Collection %s.%s progress: %d/%d documents (%.0f%%) - Successful: %d, Failed: %d",
-										sourceDB, sourceCollection, currentCount, count, float64(currentPercentage)*10, currentSuccess, currentFailed)
-									lastLoggedPercentage = currentPercentage
-								}
-								workerMu.Unlock()
-							}
-						}(i)
-					}
-
-					// Start a goroutine to close channels when all batches are processed
-					go func() {
-						workerWg.Wait()
-						close(doneChan)
-					}()
-
-					// Process documents and create batches
-					var batch []interface{}
-					var batchCount int
-
-					for {
-						// Check for errors from workers
-						select {
-						case err := <-errorChan:
-							cursor.Close(ctx)
-							close(batchChan)
-							r.log.Errorf("Error during migration of %s.%s: %v", sourceDB, sourceCollection, err)
-							return
-						default:
-							// No errors, continue processing
-						}
-
-						// Get next document
-						if !cursor.Next(ctx) {
-							break
-						}
-
-						// Decode document
-						var doc bson.D
-						if err := cursor.Decode(&doc); err != nil {
-							r.log.Errorf("Error decoding document from %s.%s: %v", sourceDB, sourceCollection, err)
-							continue
-						}
-
-						// Add to batch
-						batch = append(batch, doc)
-						batchCount++
-
-						// Send batch if it reaches the write batch size
-						if batchCount >= writeBatchSize {
-							select {
-							case batchChan <- batch:
-								// Batch sent to worker
-							case err := <-errorChan:
-								// Error from a worker
-								cursor.Close(ctx)
-								close(batchChan)
-								r.log.Errorf("Error during migration of %s.%s: %v", sourceDB, sourceCollection, err)
-								return
-							case <-ctx.Done():
-								// Context cancelled
-								cursor.Close(ctx)
-								close(batchChan)
-								r.log.Info("Migration interrupted due to context cancellation")
-								return
-							}
-
-							// Reset batch
-							batch = nil
-							batchCount = 0
-						}
-					}
-
-					// Check for cursor errors
-					if err := cursor.Err(); err != nil {
-						close(batchChan)
-						r.log.Errorf("Cursor error for %s.%s: %v", sourceDB, sourceCollection, err)
-						return
-					}
-
-					// Process any remaining documents
-					if len(batch) > 0 {
-						select {
-						case batchChan <- batch:
-							// Final batch sent to worker
-						case err := <-errorChan:
-							// Error from a worker
-							close(batchChan)
-							r.log.Errorf("Error during migration of %s.%s: %v", sourceDB, sourceCollection, err)
-							return
-						case <-ctx.Done():
-							// Context cancelled
-							close(batchChan)
-							r.log.Info("Migration interrupted due to context cancellation")
-							return
-						}
-					}
-
-					// Close batch channel to signal workers to exit
-					close(batchChan)
-
-					// Wait for all workers to finish or for an error
-					select {
-					case <-doneChan:
-						// All workers finished successfully
-					case err := <-errorChan:
-						// Error from a worker
-						r.log.Errorf("Error during migration of %s.%s: %v", sourceDB, sourceCollection, err)
-						return
-					case <-ctx.Done():
-						// Context cancelled
-						r.log.Info("Migration interrupted due to context cancellation")
-						return
-					}
-
-					if failedCount > 0 {
-						r.log.Warnf("Migration for %s.%s completed with %d failures! Successful: %d, Failed: %d, Total: %d",
-							sourceDB, sourceCollection, failedCount, successCount, failedCount, migratedCount)
-					} else {
-						r.log.Infof("Migration for %s.%s completed successfully! Total documents: %d",
-							sourceDB, sourceCollection, migratedCount)
+						errOnce.Do(func() {
+							criticalErr = fmt.Errorf("critical error during migration of collection %s.%s: %w", sourceDB, sourceCollection, err)
+						})
 					}
 
 					// Update overall statistics and log overall progress
 					mu.Lock()
-					totalMigratedCount += migratedCount
-					totalFailedCount += failedCount
+					totalMigratedCount += succeeded + failed
+					totalFailedCount += failed
 					completedCollections++
 					r.log.Infof("Overall progress: %d/%d collections completed", completedCollections, totalCollections)
 					mu.Unlock()
-				}(sourceDB, sourceCollection, targetCollection)
+				}(sourceDB, sourceCollection, collConfig)
 			}
 		}
 
 		// Wait for all collection migrations to complete
 		wg.Wait()
+		if r.backfillStatsManager != nil {
+			r.backfillStatsManager.ReportStats(true)
+			r.backfillStatsManager.Stop()
+		}
+
+		if criticalErr != nil {
+			return criticalErr
+		}
 
 		initialMigrationDuration := time.Since(initialMigrationStart)
 		var failurePercentage float64
@@ -644,9 +507,10 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 			}
 		}
 
-		// Mark initial migration state as complete
-		if err := SaveInitialMigrationState(initialMigrationStatePath, status, totalFailedCount); err != nil {
-			r.log.Errorf("Error saving initial migration state as complete: %v", err)
+		if !r.DryRun {
+			if err := SaveInitialMigrationState(initialMigrationStatePath, status, totalFailedCount); err != nil {
+				return fmt.Errorf("failed to save initial migration state as complete: %w", err)
+			}
 		}
 
 		if status == StatusCompletedWithFailures {
@@ -662,6 +526,7 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		if !needsInitialMigration && (pair.Target.SyncAllIndexes || len(pair.Target.Indexes) > 0) {
 			// Resume token exists, so initial migration was skipped — sync indexes now
 			r.log.Info("IndexOnly mode: resume token exists, performing index sync directly")
+			// Build collections list from collectionConfigs
 
 			// Configure index build concurrency before launching any async builds
 			if migrator.config.IndexConcurrency > 0 {
@@ -669,12 +534,9 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 			}
 
 			var collections []config.CollectionConfig
-			for _, colls := range r.collectionMap {
-				for src, tgt := range colls {
-					collections = append(collections, config.CollectionConfig{
-						SourceCollection: src,
-						TargetCollection: tgt,
-					})
+			for _, colls := range r.collectionConfigs {
+				for _, collConfig := range colls {
+					collections = append(collections, collConfig)
 				}
 			}
 			if err := migrator.syncIndexes(ctx, r.sourceDB, r.targetDB, pair, collections); err != nil {
@@ -688,23 +550,76 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		return nil
 	}
 
-	// Create client-level change stream with the resume token and batch size
-	r.log.Info("Starting client-level change stream for all databases and collections")
-	changeStream, err = r.sourceDB.CreateClientLevelChangeStream(
-		ctx,
-		globalResumeToken,
-		cdcStartTime,
-		r.config.IncrementalReadBatchSize,
-	)
-	if err != nil {
-		// Check if the error is due to the resume token being too old
-		if strings.Contains(err.Error(), "ChangeStreamHistoryLost") ||
-			strings.Contains(err.Error(), "Resume of change stream was not possible") {
-			r.log.Warn("Resume token is too old and no longer in the oplog. Deleting resume token and starting fresh.")
+	// Load partition-level resume tokens from their independent files.
+	// Suffix path names are generated using partition indices (e.g. resumeToken-pair0-0.json, resumeToken-pair0-1.json).
+	var partitionTokens []interface{}
+	for i := 0; i < r.config.IncrementalStreamPartitions; i++ {
+		partitionPath := GetPartitionResumeTokenPath(globalResumeTokenPath, i, r.config.IncrementalStreamPartitions)
+		token, err := LoadResumeToken(partitionPath)
+		if err != nil || token == nil {
+			// If a token is missing/nil here (despite our check), it's a fatal failure in partitioned mode.
+			if r.config.IncrementalStreamPartitions > 1 {
+				return fmt.Errorf("fatal: partition checkpoint file %s exists but is empty or unreadable: %v", partitionPath, err)
+			}
+			// Fallback is only allowed in legacy single-stream mode
+			r.log.Warnf("[Partition %d] No valid partition checkpoint found at %s (falling back to global checkpoint: %v, token: %v)", i, partitionPath, err, token)
+			token = globalResumeToken
+		}
+		partitionTokens = append(partitionTokens, token)
+	}
 
-			// Delete the resume token file
+	var changeStreams []*mongo.ChangeStream
+	var openError error
+
+	// Open the partitioned change streams in parallel. Each change stream aggregates with a
+	// server-side BSON aggregation pipeline stage filtering for its corresponding deterministic partition index.
+	r.log.Infof("Starting %d client-level change streams for all databases and collections", r.config.IncrementalStreamPartitions)
+	for i := 0; i < r.config.IncrementalStreamPartitions; i++ {
+		var token interface{}
+		if len(partitionTokens) > i {
+			token = partitionTokens[i]
+		}
+
+		// Build a zero-JS, loopless FNV-inspired BSON aggregation pipeline stage for this partition index
+		pipeline := BuildPartitionPipeline(i, r.config.IncrementalStreamPartitions)
+		r.log.Infof("[Partition %d/%d] Creating client-level change stream (ResumeToken: %v)", i+1, r.config.IncrementalStreamPartitions, token != nil)
+
+		stream, err := r.sourceDB.CreateClientLevelChangeStream(
+			ctx,
+			token,
+			liveStartTime,
+			r.config.IncrementalReadBatchSize,
+			pipeline,
+		)
+		if err != nil {
+			openError = err
+			break
+		}
+		changeStreams = append(changeStreams, stream)
+	}
+
+	if openError != nil {
+		// Close any successfully opened change streams first before fallback
+		for _, stream := range changeStreams {
+			if stream != nil {
+				stream.Close(ctx)
+			}
+		}
+
+		// Check if the error is due to the resume token being too old
+		if strings.Contains(openError.Error(), "ChangeStreamHistoryLost") ||
+			strings.Contains(openError.Error(), "Resume of change stream was not possible") {
+			r.log.Warn("Resume token is too old and no longer in the oplog. Deleting resume token files and starting fresh.")
+
+			// Delete all partition and global resume token files
+			for p := 0; p < r.config.IncrementalStreamPartitions; p++ {
+				path := GetPartitionResumeTokenPath(globalResumeTokenPath, p, r.config.IncrementalStreamPartitions)
+				if err := DeleteResumeToken(path); err != nil {
+					r.log.Errorf("Error deleting partition resume token file %s: %v", path, err)
+				}
+			}
 			if err := DeleteResumeToken(globalResumeTokenPath); err != nil {
-				r.log.Errorf("Error deleting resume token file: %v", err)
+				r.log.Errorf("Error deleting global resume token file: %v", err)
 			}
 
 			// Delete the initial migration state file
@@ -717,9 +632,16 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 			return r.StartReplication(ctx, nil, globalResumeTokenPath, nil, initialMigrationStatePath, pair, liveOnly, nil, migrator)
 		}
 
-		return fmt.Errorf("failed to create client-level change stream: %w", err)
+		return fmt.Errorf("failed to create client-level change stream partition: %w", openError)
 	}
-	defer changeStream.Close(ctx)
+
+	defer func() {
+		for _, stream := range changeStreams {
+			if stream != nil {
+				stream.Close(ctx)
+			}
+		}
+	}()
 
 	// Create event distributor for parallel processing
 	r.log.Infof("Starting parallel change stream processing with %d workers", r.config.IncrementalWorkerCount)
@@ -727,8 +649,8 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		ctx,
 		r.sourceDB,
 		r.targetDB,
-		r.collectionMap,
-		changeStream,
+		r.collectionConfigs,
+		changeStreams,
 		r.log,
 		globalResumeTokenPath,
 		time.Duration(r.config.CheckpointIntervalMinutes)*time.Minute,
@@ -739,7 +661,9 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		time.Duration(r.config.FlushIntervalMs)*time.Millisecond,
 		r.config,
 		r.dlq,
+		r.incrementalStatsManager,
 	)
+	distributor.DryRun = r.DryRun
 
 	// Start event distribution
 	err = distributor.Start()

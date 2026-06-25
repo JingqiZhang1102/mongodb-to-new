@@ -10,6 +10,7 @@ import (
 	"github.com/gsbingo17/mongodb-migration/pkg/logger"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/event"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -33,7 +34,7 @@ type MongoDB struct {
 }
 
 // NewMongoDB creates a new MongoDB connection with pool size and idle timeouts configured dynamically
-func NewMongoDB(connectionString, databaseName string, minPoolSize, maxPoolSize uint64, maxConnIdleTime time.Duration, log *logger.Logger) (*MongoDB, error) {
+func NewMongoDB(connectionString, databaseName string, minPoolSize, maxPoolSize uint64, maxConnIdleTime time.Duration, poolMonitor *event.PoolMonitor, log *logger.Logger) (*MongoDB, error) {
 	// Set client options
 	clientOptions := options.Client().
 		ApplyURI(connectionString).
@@ -44,6 +45,10 @@ func NewMongoDB(connectionString, databaseName string, minPoolSize, maxPoolSize 
 
 	if maxConnIdleTime > 0 {
 		clientOptions.SetMaxConnIdleTime(maxConnIdleTime)
+	}
+
+	if poolMonitor != nil {
+		clientOptions.SetPoolMonitor(poolMonitor)
 	}
 
 	// Connect to MongoDB
@@ -171,9 +176,10 @@ func (m *MongoDB) CreateChangeStream(ctx context.Context, collectionName string,
 // It accepts both a resumeToken and a cdcStartTime:
 // - If resumeToken is provided, it takes precedence and instructs the driver to resume from a specific checkpoint.
 // - If resumeToken is nil but cdcStartTime is specified, it configures SetStartAtOperationTime to begin reading changes from that exact historical moment.
-func (m *MongoDB) CreateClientLevelChangeStream(ctx context.Context, resumeToken interface{}, cdcStartTime *primitive.Timestamp, batchSize int) (*mongo.ChangeStream, error) {
-	// Set pipeline for full document lookup on updates
-	pipeline := mongo.Pipeline{}
+func (m *MongoDB) CreateClientLevelChangeStream(ctx context.Context, resumeToken interface{}, cdcStartTime *primitive.Timestamp, batchSize int, pipeline mongo.Pipeline) (*mongo.ChangeStream, error) {
+	if pipeline == nil {
+		pipeline = mongo.Pipeline{}
+	}
 
 	// Set options
 	opts := options.ChangeStream().SetFullDocument(options.UpdateLookup)
@@ -417,9 +423,15 @@ func (m *MongoDB) createIndexOnCollection(ctx context.Context, collection *mongo
 
 	indexModel.Options = opts
 
+	m.log.Infof("[async] Sending index creation request for '%s' on collection '%s' to Firestore...", indexName, collectionName)
+	startTime := time.Now()
 	_, err := collection.Indexes().CreateOne(ctx, indexModel)
 	if err != nil {
+		m.log.Infof("[async] Received ERROR response for index '%s' on collection '%s' after %v: %v", 
+			indexName, collectionName, time.Since(startTime).Round(time.Second), err)
 		return fmt.Errorf("failed to create index '%s' on collection %s: %w", indexName, collectionName, err)
 	}
+	m.log.Infof("[async] Received SUCCESS response for index '%s' on collection '%s' after %v", 
+		indexName, collectionName, time.Since(startTime).Round(time.Second))
 	return nil
 }

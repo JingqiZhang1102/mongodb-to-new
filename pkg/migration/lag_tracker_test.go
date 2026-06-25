@@ -5,66 +5,81 @@ import (
 	"time"
 )
 
-func TestLagTrackerAccumulation(t *testing.T) {
+func TestLagTrackerAccumulationAndFlush(t *testing.T) {
 	tracker := NewLagTracker()
 
-	// Test single record using RecordLags
 	now := time.Now()
-	tracker.RecordLags([]WriteOperation{
-		{EventTime: now.Add(-500 * time.Millisecond)},
-	}, now)
 
-	if tracker.count != 1 {
-		t.Errorf("expected count 1, got %d", tracker.count)
-	}
-	if tracker.totalLag != 500*time.Millisecond {
-		t.Errorf("expected totalLag 500ms, got %v", tracker.totalLag)
-	}
-
-	// Test batch record
-	ops := []WriteOperation{
-		{EventTime: now.Add(-100 * time.Millisecond)},
-		{EventTime: now.Add(-200 * time.Millisecond)},
-		{EventTime: time.Time{}}, // should be ignored
+	// op1: Succeeded after retry (SuccessAfterRetry: true)
+	// EventTime = now - 500ms, ReadTime = now - 400ms, WorkerReceiveTime = now - 200ms, SuccessTime = now - 100ms
+	// readToEventTimeLag: 100ms
+	// workerReceivedToReadTimeLag: 200ms
+	// successWithRetryTimeToEventTime: 400ms
+	// successWithRetryLagToWorkerReceivedTime: 100ms
+	op1 := WriteOperation{
+		EventTime:         now.Add(-500 * time.Millisecond),
+		ReadTime:          now.Add(-400 * time.Millisecond),
+		WorkerReceiveTime: now.Add(-200 * time.Millisecond),
+		SuccessTime:       now.Add(-100 * time.Millisecond),
+		SuccessAfterRetry: true,
 	}
 
-	tracker.RecordLags(ops, now)
-
-	// Previous 1 event (500ms) + new 2 valid events (100ms + 200ms = 300ms)
-	// Total events = 3
-	// Total lag = 800ms
-	if tracker.count != 3 {
-		t.Errorf("expected count 3, got %d", tracker.count)
+	// op2: Ignored (no SuccessTime)
+	op2 := WriteOperation{
+		EventTime:         now.Add(-500 * time.Millisecond),
+		ReadTime:          now.Add(-400 * time.Millisecond),
+		WorkerReceiveTime: now.Add(-200 * time.Millisecond),
 	}
-	if tracker.totalLag != 800*time.Millisecond {
-		t.Errorf("expected totalLag 800ms, got %v", tracker.totalLag)
+
+	// op3: Succeeded on first attempt (SuccessAfterRetry: false)
+	// EventTime = now - 1000ms, ReadTime = now - 900ms, WorkerReceiveTime = now - 700ms, SuccessTime = now - 600ms
+	// readToEventTimeLag: 100ms
+	// workerReceivedToReadTimeLag: 200ms
+	// successTimeToWorkerReceivedLag: 100ms
+	// successTimeToEventTimeLag: 400ms
+	op3 := WriteOperation{
+		EventTime:         now.Add(-1000 * time.Millisecond),
+		ReadTime:          now.Add(-900 * time.Millisecond),
+		WorkerReceiveTime: now.Add(-700 * time.Millisecond),
+		SuccessTime:       now.Add(-600 * time.Millisecond),
+		SuccessAfterRetry: false,
 	}
-}
 
-func TestLagTrackerFlush(t *testing.T) {
-	tracker := NewLagTracker()
-
-	// Record some lag
-	now := time.Now()
-	tracker.RecordLags([]WriteOperation{
-		{EventTime: now.Add(-100 * time.Millisecond)},
-	}, now)
+	tracker.RecordLags([]WriteOperation{op1, op2, op3})
 
 	// Flush the metrics
-	total, count := tracker.Flush()
+	res := tracker.Flush()
 
-	if count != 1 {
-		t.Errorf("expected flushed count 1, got %d", count)
+	// readToEventTimeLag: (100ms + 100ms) / 2 = 100ms
+	if res.EventToReadLag != 100*time.Millisecond {
+		t.Errorf("expected EventToReadLag 100ms, got %v", res.EventToReadLag)
 	}
-	if total != 100*time.Millisecond {
-		t.Errorf("expected flushed totalLag 100ms, got %v", total)
+	// workerReceivedToReadTimeLag: (200ms + 200ms) / 2 = 200ms
+	if res.ReadToWorkerReceiveLag != 200*time.Millisecond {
+		t.Errorf("expected ReadToWorkerReceiveLag 200ms, got %v", res.ReadToWorkerReceiveLag)
+	}
+	
+	// successTimeToWorkerReceivedLag (from op3 only): 100ms
+	if res.ReceiveToApplyLag != 100*time.Millisecond {
+		t.Errorf("expected ReceiveToApplyLag 100ms, got %v", res.ReceiveToApplyLag)
+	}
+	// successTimeToEventTimeLag (from op3 only): 400ms
+	if res.EndToEndLag != 400*time.Millisecond {
+		t.Errorf("expected EndToEndLag 400ms, got %v", res.EndToEndLag)
+	}
+	
+	// successWithRetryTimeToEventTime (from op1 only): 400ms
+	if res.EndToEndWithRetryLag != 400*time.Millisecond {
+		t.Errorf("expected EndToEndWithRetryLag 400ms, got %v", res.EndToEndWithRetryLag)
+	}
+	// successWithRetryLagToWorkerReceivedTime (from op1 only): 100ms
+	if res.ReceiveToApplyWithRetryLag != 100*time.Millisecond {
+		t.Errorf("expected ReceiveToApplyWithRetryLag 100ms, got %v", res.ReceiveToApplyWithRetryLag)
 	}
 
-	// The counters should be reset to 0 after Flush
-	if tracker.count != 0 {
-		t.Errorf("expected count to reset to 0, got %d", tracker.count)
-	}
-	if tracker.totalLag != 0 {
-		t.Errorf("expected totalLag to reset to 0, got %v", tracker.totalLag)
+	// Verify counters reset after Flush
+	res2 := tracker.Flush()
+	if res2.EventToReadLag != 0 || res2.ReadToWorkerReceiveLag != 0 || res2.ReceiveToApplyLag != 0 || res2.EndToEndLag != 0 || res2.EndToEndWithRetryLag != 0 || res2.ReceiveToApplyWithRetryLag != 0 {
+		t.Errorf("expected flushed metrics to reset to 0, got %+v", res2)
 	}
 }

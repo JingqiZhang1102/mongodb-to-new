@@ -24,7 +24,8 @@ func main() {
 	mode := flag.String("mode", "migrate", "Operation mode: 'migrate', 'live', or 'live-only'")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	logFile := flag.String("log-file", "", "Path to log file (logs to both stdout and file when specified)")
-	cdcStartTimeStr := flag.String("cdc-start-timestamp", "", "Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)")
+	liveStartTimeStr := flag.String("live-start-timestamp", "", "Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)")
+	dryRun := flag.Bool("dry-run", false, "Dry run mode (skips writes, outputs partitioning recommendations on backfill)")
 	help := flag.Bool("help", false, "Display help information")
 	flag.Parse()
 
@@ -37,6 +38,9 @@ func main() {
 	// Create logger
 	log := logger.New()
 	log.SetLevel(*logLevel)
+
+	// Maximize open file descriptor resource limits (ulimit -n 65536)
+	maximizeOpenFileLimit(log)
 
 	// Set up log file if specified
 	if *logFile != "" {
@@ -54,32 +58,33 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
-
 	// Display and log the loaded configuration with sensitive values masked
 	log.Infof("Active Configuration:\n%s", getSanitizedConfigJSON(cfg))
 
 
 
+
 	// Validate mode
-	if *mode != "migrate" && *mode != "live" && *mode != "live-only" {
-		log.Fatalf("Invalid mode: %s. Please choose either 'migrate', 'live', or 'live-only'", *mode)
+	if *mode != "migrate" && *mode != "live" && *mode != "live-only" && *mode != "retry-dlq" {
+		log.Fatalf("Invalid mode: %s. Please choose either 'migrate', 'live', 'live-only', or 'retry-dlq'", *mode)
 	}
 
-	// Parse and validate cdc-start-timestamp option.
+
+	// Parse and validate -live-start-timestamp option.
 	// This flag specifies a custom historical starting point (Unix epoch seconds or RFC3339 date)
 	// from which the incremental change stream/oplog replication should begin.
 	// Note: This is only valid in "live-only" mode because standard migration modes always
 	// automatically capture the starting position prior to performing the initial copy phase.
-	var cdcStartTime *primitive.Timestamp
-	if *cdcStartTimeStr != "" {
+	var liveStartTime *primitive.Timestamp
+	if *liveStartTimeStr != "" {
 		if *mode != "live-only" {
-			log.Fatal("Error: -cdc-start-timestamp can only be specified when -mode is 'live-only'")
+			log.Fatal("Error: -live-start-timestamp can only be specified when -mode is 'live-only'")
 		}
-		ts, err := parseStartTimestamp(*cdcStartTimeStr)
+		ts, err := parseStartTimestamp(*liveStartTimeStr)
 		if err != nil {
-			log.Fatalf("Failed to parse -cdc-start-timestamp: %v", err)
+			log.Fatalf("Failed to parse -live-start-timestamp: %v", err)
 		}
-		cdcStartTime = ts
+		liveStartTime = ts
 	}
 
 	// Create context with cancellation
@@ -94,17 +99,19 @@ func main() {
 		log.Info("Received interrupt signal. Shutting down...")
 		cancel()
 		// Give some time for graceful shutdown
-		time.Sleep(2 * time.Second)
+
+		log.Infof("Waiting for 15 seconds for workers to finish...")
+		time.Sleep(15 * time.Second)
 		os.Exit(0)
 	}()
 
 	// Create migrator
 	migrator := migration.NewMigrator(cfg, log)
-	migrator.CdcStartTime = cdcStartTime
+	migrator.LiveStartTime = liveStartTime
+	migrator.DryRun = *dryRun
 
 	// Start migration/replication
 	startTime := time.Now()
-	log.Infof("Starting MongoDB to MongoDB %s process", *mode)
 
 	if err := migrator.Start(ctx, *mode); err != nil {
 		// Check if the error is due to context cancellation (Ctrl+C)
@@ -115,11 +122,11 @@ func main() {
 		}
 	}
 
-	// Log completion for migrate mode (live mode keeps running)
-	if *mode == "migrate" {
+	// Log completion for migrate and retry-dlq mode (live mode keeps running)
+	if *mode == "migrate" || *mode == "retry-dlq" {
 		duration := time.Since(startTime)
-		log.Infof("Migration completed in %.2f seconds", duration.Seconds())
-		os.Exit(0) // Explicitly exit after migration is complete
+		log.Infof("Process completed in %.2f seconds", duration.Seconds())
+		os.Exit(0) // Explicitly exit after completion
 	}
 }
 
@@ -132,7 +139,7 @@ func displayUsage() {
 	fmt.Println("  -config string")
 	fmt.Println("        Path to configuration file (default \"mongodb_replication_config.json\")")
 	fmt.Println("  -mode string")
-	fmt.Println("        Operation mode: 'migrate', 'live', or 'live-only' (default \"migrate\")")
+	fmt.Println("        Operation mode: 'migrate', 'live', 'live-only', or 'retry-dlq' (default \"migrate\")")
 	fmt.Println("        Modes:")
 	fmt.Println("          migrate:")
 	fmt.Println("            Perform a one-time full migration. Copies all data and indexes from")
@@ -145,25 +152,41 @@ func displayUsage() {
 	fmt.Println("            Perform real-time incremental replication only. Skips the initial data")
 	fmt.Println("            copy phase. Starts streaming real-time changes from the last saved resume token")
 	fmt.Println("            (or current moment if none exists), or from a custom position when")
-	fmt.Println("            -cdc-start-timestamp is specified.")
+	fmt.Println("            -live-start-timestamp is specified.")
+	fmt.Println("          retry-dlq:")
+	fmt.Println("            Reprocess the Dead Letter Queue (DLQ). Reads previous failed records from")
+	fmt.Println("            the DLQ files, retries writing them to the target, and writes any subsequent")
+	fmt.Println("            failures to new DLQ files.")
 	fmt.Println("  -log-level string")
 	fmt.Println("        Log level: debug, info, warn, error (default \"info\")")
 	fmt.Println("  -log-file string")
 	fmt.Println("        Path to log file (logs to both stdout and file when specified)")
-	fmt.Println("  -cdc-start-timestamp string")
+	fmt.Println("  -live-start-timestamp string")
 	fmt.Println("        Start timestamp for live-only replication (Unix epoch seconds or RFC3339 format)")
 	fmt.Println("        Debian command-line examples to get 'now':")
 	fmt.Printf("          * Unix epoch seconds:             date +%%s\n")
 	fmt.Println("          * RFC3339 format:                 date --rfc-3339=seconds   (or: date -Iseconds)")
+	fmt.Println("  -dry-run")
+	fmt.Println("        Dry run mode (skips writes).")
+	fmt.Println("        - In backfill modes ('migrate' or 'live' initial phase): connects to the source")
+	fmt.Println("          and target, runs target compatibility validations, samples source collections")
+	fmt.Println("          to output partition recommendations, and exits without reading full collections.")
+	fmt.Println("        - In incremental modes ('live-only' or 'live' incremental phase): connects to the")
+	fmt.Println("          source, starts the change stream/oplog readers to ingest live events, and prints")
+	fmt.Println("          real-time ingestion lag statistics while discarding writes. Useful to test read")
+	fmt.Println("          performance and change stream partitioning effectiveness.")
 	fmt.Println("  -help")
 	fmt.Println("        Display this help information")
 	fmt.Println("Examples:")
 	fmt.Println("  migrate -mode=live")
 	fmt.Println("  migrate -mode=live-only")
-	fmt.Println("  migrate -mode=live-only -cdc-start-timestamp=1716234000")
-	fmt.Println("  migrate -mode=live-only -cdc-start-timestamp=2026-05-20T21:00:00Z")
-	fmt.Println("  migrate -config=custom_config.json -mode=migrate -log-level=debug")
+	fmt.Println("  migrate -mode=live-only -dry-run")
+	fmt.Println("  migrate -mode=live-only -live-start-timestamp=1716234000")
+	fmt.Println("  migrate -mode=live-only -live-start-timestamp=2026-05-20T21:00:00Z")
+	fmt.Println("  migrate -mode=live-only -live-start-timestamp=2026-05-20T21:00:00Z -dry-run")
 	fmt.Println("  migrate -mode=live -log-file=migration.log")
+	fmt.Println("  migrate -mode=retry-dlq")
+	fmt.Println("  migrate -config=custom_config.json -mode=retry-dlq")
 }
 
 // parseStartTimestamp parses a user-provided timestamp string as either a raw Unix epoch
@@ -242,4 +265,30 @@ func getSanitizedConfigJSON(cfg *config.Config) string {
 		return fmt.Sprintf("error marshalling config: %v", err)
 	}
 	return string(data)
+}
+
+// maximizeOpenFileLimit programmatically adjusts the maximum open files resource limit (ulimit -n) to 65536.
+func maximizeOpenFileLimit(log *logger.Logger) {
+	var rLimit syscall.Rlimit
+	err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+	if err != nil {
+		log.Warnf("Failed to get current open file resource limit: %v", err)
+		return
+	}
+
+	targetLimit := uint64(65536)
+	if rLimit.Max < targetLimit {
+		log.Warnf("System hard limit for open file descriptors is %d, which is lower than requested 65536. Setting limit to system maximum.", rLimit.Max)
+		targetLimit = rLimit.Max
+	}
+
+	rLimit.Cur = targetLimit
+	rLimit.Max = targetLimit
+
+	err = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+	if err != nil {
+		log.Warnf("Failed to set open file resource limit (ulimit) to %d: %v", targetLimit, err)
+	} else {
+		log.Infof("Successfully adjusted open file descriptor resource limit (ulimit) to %d", targetLimit)
+	}
 }
