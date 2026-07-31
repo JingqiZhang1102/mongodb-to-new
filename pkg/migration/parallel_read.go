@@ -91,10 +91,10 @@ func (p *CollectionPartitioner) Partition(ctx context.Context) ([]bson.D, error)
 	case "numeric":
 		return p.createNumericPartitionsWithSampling(ctx, partitionCount)
 	case "mixed", "auto", "":
-		return p.createUniversalPartitions(ctx, partitionCount)
+		return p.createPartitionsGroupedByType(ctx, partitionCount)
 	default:
-		p.log.Warnf("Unrecognized partitioning strategy '%s', falling back to universal mixed mode partitioning", strategy)
-		return p.createUniversalPartitions(ctx, partitionCount)
+		p.log.Warnf("Unrecognized partitioning strategy '%s', falling back to grouped-by-type mixed mode partitioning", strategy)
+		return p.createPartitionsGroupedByType(ctx, partitionCount)
 	}
 }
 
@@ -627,10 +627,10 @@ func (p *CollectionPartitioner) RecommendIDPartitioning(ctx context.Context) (st
 	}
 }
 
-// createUniversalPartitions implements the Universal 3-Step Partitioning Pipeline
-// handling any number of BSON _id types using quantile sampling (>= 2,000 docs)
-// or uniform range fallback (< 2,000 docs), and merging slices via $or.
-func (p *CollectionPartitioner) createUniversalPartitions(ctx context.Context, partitionCount int) ([]bson.D, error) {
+// createPartitionsGroupedByType groups document IDs by BSON type, partitions each type
+// using quantile sampling (>= 2,000 docs) or uniform range fallback (< 2,000 docs),
+// and merges the filters for different types together via $or.
+func (p *CollectionPartitioner) createPartitionsGroupedByType(ctx context.Context, partitionCount int) ([]bson.D, error) {
 	typeCounts, err := p.discoverPresentBSONTypes(ctx)
 	if err != nil {
 		p.log.Warnf("Failed to discover BSON types for partitioning (%v), falling back to legacy sampling", err)

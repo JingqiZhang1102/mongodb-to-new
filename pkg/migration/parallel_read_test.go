@@ -129,7 +129,7 @@ func getBSONValue(filter bson.D, key, op string) (interface{}, error) {
 	return nil, fmt.Errorf("key %q not found in filter", key)
 }
 
-func TestUniversalPartitioning_SingleType_ObjectId(t *testing.T) {
+func TestCreatePartitionsGroupedByType_SingleType_ObjectId(t *testing.T) {
 	numSplits := 4
 	sampledIDs := []interface{}{"oid1", "oid2", "oid3", "oid4", "oid5", "oid6", "oid7", "oid8"}
 	oidSlices := buildTypeScopedPartitionFilters(sampledIDs, numSplits, "objectId")
@@ -153,7 +153,7 @@ func TestUniversalPartitioning_SingleType_ObjectId(t *testing.T) {
 	}
 }
 
-func TestUniversalPartitioning_MixedTypes_SampleAndFallback(t *testing.T) {
+func TestCreatePartitionsGroupedByType_MixedTypes_SampleAndFallback(t *testing.T) {
 	numSplits := 4
 	// Simulate "objectId" (>= 2000 docs -> quantile slices)
 	sampledIDs := []interface{}{"oid1", "oid2", "oid3", "oid4", "oid5", "oid6", "oid7", "oid8"}
@@ -193,7 +193,7 @@ func TestUniversalPartitioning_MixedTypes_SampleAndFallback(t *testing.T) {
 	}
 }
 
-func TestUniversalPartitioning_AllUniformFallback(t *testing.T) {
+func TestCreatePartitionsGroupedByType_AllUniformFallback(t *testing.T) {
 	numSplits := 4
 	numSlices := createNumberUniformSlices(numSplits)
 	strSlices := createStringUniformSlices("string", numSplits)
