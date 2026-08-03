@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sort"
 	"strconv"
 	"time"
 
@@ -89,11 +90,11 @@ func (p *CollectionPartitioner) Partition(ctx context.Context) ([]bson.D, error)
 		return p.createObjectIDPartitionsWithSampling(ctx, partitionCount)
 	case "numeric":
 		return p.createNumericPartitionsWithSampling(ctx, partitionCount)
-	case "mixed":
-		return p.createPartitionsWithSampling(ctx, partitionCount)
+	case "mixed", "auto", "":
+		return p.createPartitionsGroupedByType(ctx, partitionCount)
 	default:
-		p.log.Warnf("Unrecognized partitioning strategy '%s', falling back to mixed mode partitioning", strategy)
-		return p.createPartitionsWithSampling(ctx, partitionCount)
+		p.log.Warnf("Unrecognized partitioning strategy '%s', falling back to grouped-by-type mixed mode partitioning", strategy)
+		return p.createPartitionsGroupedByType(ctx, partitionCount)
 	}
 }
 
@@ -625,3 +626,370 @@ func (p *CollectionPartitioner) RecommendIDPartitioning(ctx context.Context) (st
 		return "mixed", nil
 	}
 }
+
+// createPartitionsGroupedByType groups document IDs by BSON type, partitions each type
+// using quantile sampling (>= 2,000 docs) or uniform range fallback (< 2,000 docs),
+// and merges the filters for different types together via $or.
+func (p *CollectionPartitioner) createPartitionsGroupedByType(ctx context.Context, partitionCount int) ([]bson.D, error) {
+	typeCounts, err := p.discoverPresentBSONTypes(ctx)
+	if err != nil {
+		p.log.Warnf("Failed to discover BSON types for partitioning (%v), falling back to legacy sampling", err)
+		return p.createPartitionsWithSampling(ctx, partitionCount)
+	}
+
+	if len(typeCounts) == 0 {
+		return []bson.D{{}}, nil
+	}
+
+	slicesPerType := make(map[string][]bson.D)
+	for tName, cnt := range typeCounts {
+		var slices []bson.D
+		var err error
+		if cnt >= 2000 {
+			slices, err = p.createQuantileSlicesForType(ctx, tName, partitionCount)
+			if err != nil || len(slices) != partitionCount {
+				p.log.Warnf("Quantile sampling failed for BSON type '%s' (err: %v), falling back to uniform slicing", tName, err)
+				slices, _ = p.createUniformSlicesForType(ctx, tName, partitionCount, cnt)
+			}
+		} else {
+			slices, _ = p.createUniformSlicesForType(ctx, tName, partitionCount, cnt)
+		}
+		if len(slices) == partitionCount {
+			slicesPerType[tName] = slices
+		}
+	}
+
+	if len(slicesPerType) == 0 {
+		return []bson.D{{}}, nil
+	}
+
+	return mergeTypeSlices(slicesPerType, partitionCount), nil
+}
+
+// discoverPresentBSONTypes aggregates document counts per BSON type of the _id field.
+func (p *CollectionPartitioner) discoverPresentBSONTypes(ctx context.Context) (map[string]int64, error) {
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: bson.D{{Key: "$type", Value: "$_id"}}},
+			{Key: "count", Value: bson.D{{Key: "$sum", Value: 1}}},
+		}}},
+	}
+
+	discoverCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+
+	cursor, err := p.sourceCollection.Aggregate(discoverCtx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("failed to aggregate BSON types: %w", err)
+	}
+	defer cursor.Close(discoverCtx)
+
+	typeCounts := make(map[string]int64)
+	for cursor.Next(discoverCtx) {
+		var res struct {
+			Type  string `bson:"_id"`
+			Count int64  `bson:"count"`
+		}
+		if err := cursor.Decode(&res); err != nil {
+			return nil, fmt.Errorf("failed to decode type discovery group: %w", err)
+		}
+
+		typeName := res.Type
+		switch typeName {
+		case "int", "long", "double", "decimal":
+			typeName = "number"
+		}
+		typeCounts[typeName] += res.Count
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("cursor error during type discovery: %w", err)
+	}
+
+	return typeCounts, nil
+}
+
+// createQuantileSlicesForType samples documents of a specific BSON type to extract numSplits quantile slices.
+func (p *CollectionPartitioner) createQuantileSlicesForType(ctx context.Context, typeName string, numSplits int) ([]bson.D, error) {
+	sampleSize := max(1000, 64*numSplits)
+	p.log.Infof("Type-scoped sampling %d documents for BSON type '%s' into %d slices", sampleSize, typeName, numSplits)
+
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$match", Value: bson.D{{Key: "_id", Value: bson.D{{Key: "$type", Value: typeName}}}}}},
+		bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: sampleSize}}}},
+		bson.D{{Key: "$project", Value: bson.D{{Key: "_id", Value: 1}}}},
+		bson.D{{Key: "$sort", Value: bson.D{{Key: "_id", Value: 1}}}},
+	}
+
+	sampleCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+
+	cursor, err := p.sourceCollection.Aggregate(sampleCtx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sample for type %s: %w", typeName, err)
+	}
+	defer cursor.Close(sampleCtx)
+
+	type idDoc struct {
+		ID interface{} `bson:"_id"`
+	}
+
+	var sampledIDs []interface{}
+	for cursor.Next(sampleCtx) {
+		var doc idDoc
+		if err := cursor.Decode(&doc); err != nil {
+			return nil, fmt.Errorf("failed to decode sampled document for type %s: %w", typeName, err)
+		}
+		if doc.ID != nil {
+			sampledIDs = append(sampledIDs, doc.ID)
+		}
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("cursor error during type-scoped sampling: %w", err)
+	}
+
+	if len(sampledIDs) > 0 {
+		uniqueIDs := sampledIDs[:1]
+		for _, id := range sampledIDs[1:] {
+			if !reflect.DeepEqual(id, uniqueIDs[len(uniqueIDs)-1]) {
+				uniqueIDs = append(uniqueIDs, id)
+			}
+		}
+		sampledIDs = uniqueIDs
+	}
+
+	if len(sampledIDs) < numSplits {
+		return nil, fmt.Errorf("not enough unique samples (%d) for %d slices of type %s", len(sampledIDs), numSplits, typeName)
+	}
+
+	return buildTypeScopedPartitionFilters(sampledIDs, numSplits, typeName), nil
+}
+
+// buildTypeScopedPartitionFilters builds numSplits range queries guarded by $type: typeName.
+func buildTypeScopedPartitionFilters(sampledIDs []interface{}, numSplits int, typeName string) []bson.D {
+	partitions := make([]bson.D, 0, numSplits)
+	if numSplits <= 0 {
+		return partitions
+	}
+	if numSplits == 1 {
+		return []bson.D{{{Key: "_id", Value: bson.D{{Key: "$type", Value: typeName}}}}}
+	}
+
+	step := len(sampledIDs) / numSplits
+
+	for i := 0; i < numSplits; i++ {
+		if i == 0 {
+			endID := sampledIDs[step]
+			partitions = append(partitions, bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$type", Value: typeName},
+					{Key: "$lt", Value: endID},
+				}},
+			})
+			continue
+		}
+
+		startID := sampledIDs[i*step]
+
+		if i == numSplits-1 {
+			partitions = append(partitions, bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$type", Value: typeName},
+					{Key: "$gte", Value: startID},
+				}},
+			})
+			continue
+		}
+
+		endID := sampledIDs[(i+1)*step]
+		partitions = append(partitions, bson.D{
+			{Key: "_id", Value: bson.D{
+				{Key: "$type", Value: typeName},
+				{Key: "$gte", Value: startID},
+				{Key: "$lt", Value: endID},
+			}},
+		})
+	}
+
+	return partitions
+}
+
+// createUniformSlicesForType generates deterministic uniform slices without sampling for small-count types (< 2,000 docs).
+func (p *CollectionPartitioner) createUniformSlicesForType(ctx context.Context, typeName string, numSplits int, count int64) ([]bson.D, error) {
+	if numSplits <= 1 {
+		return []bson.D{{{Key: "_id", Value: bson.D{{Key: "$type", Value: typeName}}}}}, nil
+	}
+
+	switch typeName {
+	case "number":
+		return createNumberUniformSlices(numSplits), nil
+	case "objectId":
+		slices, err := p.createObjectIdUniformSlices(ctx, numSplits)
+		if err != nil {
+			return createStringUniformSlices("objectId", numSplits), nil
+		}
+		return slices, nil
+	default:
+		return createStringUniformSlices(typeName, numSplits), nil
+	}
+}
+
+func createNumberUniformSlices(numSplits int) []bson.D {
+	slices := make([]bson.D, numSplits)
+	for i := 0; i < numSplits; i++ {
+		slices[i] = bson.D{
+			{Key: "_id", Value: bson.D{
+				{Key: "$type", Value: "number"},
+				{Key: "$mod", Value: bson.A{numSplits, i}},
+			}},
+		}
+	}
+	return slices
+}
+
+func createStringUniformSlices(typeName string, numSplits int) []bson.D {
+	slices := make([]bson.D, numSplits)
+	step := 256 / numSplits
+	if step < 1 {
+		step = 1
+	}
+
+	for i := 0; i < numSplits; i++ {
+		if i == 0 {
+			endPrefix := fmt.Sprintf("%02x", step)
+			slices[i] = bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$type", Value: typeName},
+					{Key: "$lt", Value: endPrefix},
+				}},
+			}
+		} else if i == numSplits-1 {
+			startPrefix := fmt.Sprintf("%02x", i*step)
+			slices[i] = bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$type", Value: typeName},
+					{Key: "$gte", Value: startPrefix},
+				}},
+			}
+		} else {
+			startPrefix := fmt.Sprintf("%02x", i*step)
+			endPrefix := fmt.Sprintf("%02x", (i+1)*step)
+			slices[i] = bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$type", Value: typeName},
+					{Key: "$gte", Value: startPrefix},
+					{Key: "$lt", Value: endPrefix},
+				}},
+			}
+		}
+	}
+	return slices
+}
+
+func (p *CollectionPartitioner) createObjectIdUniformSlices(ctx context.Context, numSplits int) ([]bson.D, error) {
+	var minDoc, maxDoc bson.M
+	err := p.sourceCollection.FindOne(ctx, bson.D{}, options.FindOne().SetSort(bson.D{{Key: "_id", Value: 1}})).Decode(&minDoc)
+	if err != nil {
+		return nil, err
+	}
+	err = p.sourceCollection.FindOne(ctx, bson.D{}, options.FindOne().SetSort(bson.D{{Key: "_id", Value: -1}})).Decode(&maxDoc)
+	if err != nil {
+		return nil, err
+	}
+
+	minID, ok1 := minDoc["_id"].(primitive.ObjectID)
+	maxID, ok2 := maxDoc["_id"].(primitive.ObjectID)
+	if !ok1 || !ok2 || minID == maxID {
+		return nil, fmt.Errorf("invalid or identical min/max ObjectID")
+	}
+
+	minTime := minID.Timestamp()
+	maxTime := maxID.Timestamp()
+	timeRange := maxTime.Sub(minTime)
+	partitionDuration := timeRange / time.Duration(numSplits)
+
+	slices := make([]bson.D, 0, numSplits)
+	for i := 0; i < numSplits; i++ {
+		startTime := minTime.Add(partitionDuration * time.Duration(i))
+		startID := primitive.NewObjectIDFromTimestamp(startTime)
+
+		var endTime time.Time
+		if i == numSplits-1 {
+			endTime = maxTime.Add(time.Second)
+		} else {
+			endTime = minTime.Add(partitionDuration * time.Duration(i+1))
+		}
+		endID := primitive.NewObjectIDFromTimestamp(endTime)
+
+		if i == 0 {
+			slices = append(slices, bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$type", Value: "objectId"},
+					{Key: "$lt", Value: endID},
+				}},
+			})
+		} else if i == numSplits-1 {
+			slices = append(slices, bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$type", Value: "objectId"},
+					{Key: "$gte", Value: startID},
+				}},
+			})
+		} else {
+			slices = append(slices, bson.D{
+				{Key: "_id", Value: bson.D{
+					{Key: "$type", Value: "objectId"},
+					{Key: "$gte", Value: startID},
+					{Key: "$lt", Value: endID},
+				}},
+			})
+		}
+	}
+	return slices, nil
+}
+
+// mergeTypeSlices combines the i-th slice of every BSON type into an $or query for partition i.
+// If only one BSON type exists, the $or wrapper is omitted.
+func mergeTypeSlices(slicesPerType map[string][]bson.D, numSplits int) []bson.D {
+	var types []string
+	for t := range slicesPerType {
+		types = append(types, t)
+	}
+	sort.Strings(types)
+
+	result := make([]bson.D, numSplits)
+	for i := 0; i < numSplits; i++ {
+		if len(types) == 1 {
+			t := types[0]
+			if i < len(slicesPerType[t]) {
+				result[i] = slicesPerType[t][i]
+			} else {
+				result[i] = bson.D{}
+			}
+			continue
+		}
+
+		var orClauses []bson.D
+		for _, t := range types {
+			slices := slicesPerType[t]
+			if i < len(slices) && len(slices[i]) > 0 {
+				orClauses = append(orClauses, slices[i])
+			}
+		}
+
+		if len(orClauses) == 1 {
+			result[i] = orClauses[0]
+		} else if len(orClauses) > 1 {
+			orArray := make(bson.A, len(orClauses))
+			for idx, clause := range orClauses {
+				orArray[idx] = clause
+			}
+			result[i] = bson.D{{Key: "$or", Value: orArray}}
+		} else {
+			result[i] = bson.D{}
+		}
+	}
+	return result
+}
+
