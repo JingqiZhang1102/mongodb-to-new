@@ -13,27 +13,40 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 )
 
+// BSONType represents a canonical MongoDB BSON type name used for _id partitioning and filtering.
+type BSONType string
+
+const (
+	BSONTypeNumber    BSONType = "number"    // Encompasses int32, int64, double, decimal128
+	BSONTypeObjectID  BSONType = "objectId"  // 12-byte BSON ObjectId
+	BSONTypeString    BSONType = "string"    // UTF-8 string
+	BSONTypeBinary    BSONType = "binData"   // Binary data / UUID
+	BSONTypeDate      BSONType = "date"      // UTC DateTime
+	BSONTypeTimestamp BSONType = "timestamp" // BSON Timestamp
+	BSONTypeBool      BSONType = "bool"      // Boolean
+)
+
 // TypeRangeBoundary represents the range boundaries and progress bookmark for a specific BSON _id type.
-// In the first partition, there is no lower bound, so RangeStartID is nil.
-// In the last partition, there is no upper bound, so RangeEndID is nil.
-// If a partition is initialized but has not yet migrated any documents before interruption,
-// SavedLastID will be nil.
+// Bounds semantics:
+//   - RangeStartID: Lower boundary for the partition (inclusive: $gte). Nil for the first partition (unbounded start).
+//   - RangeEndID: Upper boundary for the partition (exclusive: $lt). Nil for the last partition (unbounded end).
+//   - SavedLastID: The progress bookmark for this type. The document with this ID has been migrated, but to keep the logic easy, we use the same semantics as the partition boundaries (inclusive resume: $gte). Nil if no documents have been migrated yet.
 type TypeRangeBoundary struct {
-	BSONType     string `bson:"bsonType" json:"bsonType"`
-	RangeStartID any    `bson:"rangeStartId,omitempty" json:"rangeStartId,omitempty"`
-	RangeEndID   any    `bson:"rangeEndId,omitempty" json:"rangeEndId,omitempty"`
-	SavedLastID  any    `bson:"savedLastId,omitempty" json:"savedLastId,omitempty"`
+	BSONType     BSONType `bson:"bsonType" json:"bsonType"`
+	RangeStartID any      `bson:"rangeStartId,omitempty" json:"rangeStartId,omitempty"`
+	RangeEndID   any      `bson:"rangeEndId,omitempty" json:"rangeEndId,omitempty"`
+	SavedLastID  any      `bson:"savedLastId,omitempty" json:"savedLastId,omitempty"`
 }
 
 // PartitionCheckpoint represents the checkpoint state for a single reader partition.
 type PartitionCheckpoint struct {
-	Database                string                        `bson:"database" json:"database"`
-	Collection              string                        `bson:"collection" json:"collection"`
-	PartitionIndex          int                           `bson:"partitionIndex" json:"partitionIndex"`
-	TotalSplits             int                           `bson:"totalSplits" json:"totalSplits"`
-	TypeProgress            map[string]*TypeRangeBoundary `bson:"typeProgress" json:"typeProgress"`
-	ApproximateDocsMigrated int64                         `bson:"approximateDocsMigrated" json:"approximateDocsMigrated"`
-	UpdatedAt               time.Time                     `bson:"updatedAt" json:"updatedAt"`
+	Database                string                          `bson:"database" json:"database"`
+	Collection              string                          `bson:"collection" json:"collection"`
+	PartitionIndex          int                             `bson:"partitionIndex" json:"partitionIndex"`
+	TotalSplits             int                             `bson:"totalSplits" json:"totalSplits"`
+	TypeProgress            map[BSONType]*TypeRangeBoundary `bson:"typeProgress" json:"typeProgress"`
+	ApproximateDocsMigrated int64                           `bson:"approximateDocsMigrated" json:"approximateDocsMigrated"`
+	UpdatedAt               time.Time                       `bson:"updatedAt" json:"updatedAt"`
 }
 
 // getCollectionPartitionPrefix returns the standard filename prefix for a given database and collection partition checkpoint.

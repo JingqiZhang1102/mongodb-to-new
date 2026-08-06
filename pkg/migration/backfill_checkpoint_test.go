@@ -42,21 +42,21 @@ func TestBackfillCheckpoint_SaveAndLoad(t *testing.T) {
 		TotalSplits:             totalSplits,
 		ApproximateDocsMigrated: 45000,
 		UpdatedAt:               expectedTime,
-		TypeProgress: map[string]*TypeRangeBoundary{
-			"number": {
-				BSONType:     "number",
+		TypeProgress: map[BSONType]*TypeRangeBoundary{
+			BSONTypeNumber: {
+				BSONType:     BSONTypeNumber,
 				RangeStartID: int64(100),
 				RangeEndID:   int64(1000),
 				SavedLastID:  int64(500),
 			},
-			"objectId": {
-				BSONType:     "objectId",
+			BSONTypeObjectID: {
+				BSONType:     BSONTypeObjectID,
 				RangeStartID: oidStart,
 				RangeEndID:   oidEnd,
 				SavedLastID:  oidSaved,
 			},
-			"string": {
-				BSONType:     "string",
+			BSONTypeString: {
+				BSONType:     BSONTypeString,
 				RangeStartID: "prefix_000",
 				RangeEndID:   "prefix_999",
 				SavedLastID:  "prefix_500",
@@ -96,21 +96,17 @@ func TestBackfillCheckpoint_ExtendedJSONTypeFidelity(t *testing.T) {
 		Collection:     "typecoll",
 		PartitionIndex: 0,
 		TotalSplits:    1,
-		TypeProgress: map[string]*TypeRangeBoundary{
-			"objectId": {
-				BSONType:    "objectId",
+		TypeProgress: map[BSONType]*TypeRangeBoundary{
+			BSONTypeObjectID: {
+				BSONType:    BSONTypeObjectID,
 				SavedLastID: oid,
 			},
-			"int64": {
-				BSONType:    "number",
+			BSONTypeNumber: {
+				BSONType:    BSONTypeNumber,
 				SavedLastID: int64Val,
 			},
-			"int32": {
-				BSONType:    "number",
-				SavedLastID: int32Val,
-			},
-			"string": {
-				BSONType:    "string",
+			BSONTypeString: {
+				BSONType:    BSONTypeString,
 				SavedLastID: "sample-string-id",
 			},
 		},
@@ -126,39 +122,47 @@ func TestBackfillCheckpoint_ExtendedJSONTypeFidelity(t *testing.T) {
 	}
 
 	// Verify ObjectID type preservation
-	loadedOID, ok := loaded.TypeProgress["objectId"].SavedLastID.(primitive.ObjectID)
+	loadedOID, ok := loaded.TypeProgress[BSONTypeObjectID].SavedLastID.(primitive.ObjectID)
 	if !ok {
-		t.Fatalf("expected SavedLastID to be primitive.ObjectID, got %T (%v)", loaded.TypeProgress["objectId"].SavedLastID, loaded.TypeProgress["objectId"].SavedLastID)
+		t.Fatalf("expected SavedLastID to be primitive.ObjectID, got %T (%v)", loaded.TypeProgress[BSONTypeObjectID].SavedLastID, loaded.TypeProgress[BSONTypeObjectID].SavedLastID)
 	}
 	if loadedOID != oid {
 		t.Errorf("expected ObjectID %v, got %v", oid, loadedOID)
 	}
 
 	// Verify Int64 type preservation
-	loadedInt64, ok := loaded.TypeProgress["int64"].SavedLastID.(int64)
+	loadedInt64, ok := loaded.TypeProgress[BSONTypeNumber].SavedLastID.(int64)
 	if !ok {
-		t.Fatalf("expected SavedLastID to be int64, got %T (%v)", loaded.TypeProgress["int64"].SavedLastID, loaded.TypeProgress["int64"].SavedLastID)
+		t.Fatalf("expected SavedLastID to be int64, got %T (%v)", loaded.TypeProgress[BSONTypeNumber].SavedLastID, loaded.TypeProgress[BSONTypeNumber].SavedLastID)
 	}
 	if loadedInt64 != int64Val {
 		t.Errorf("expected int64 %d, got %d", int64Val, loadedInt64)
 	}
 
-	// Verify Int32 type preservation
-	loadedInt32, ok := loaded.TypeProgress["int32"].SavedLastID.(int32)
-	if !ok {
-		t.Fatalf("expected SavedLastID to be int32, got %T (%v)", loaded.TypeProgress["int32"].SavedLastID, loaded.TypeProgress["int32"].SavedLastID)
-	}
-	if loadedInt32 != int32Val {
-		t.Errorf("expected int32 %d, got %d", int32Val, loadedInt32)
-	}
-
 	// Verify String type preservation
-	loadedStr, ok := loaded.TypeProgress["string"].SavedLastID.(string)
+	loadedStr, ok := loaded.TypeProgress[BSONTypeString].SavedLastID.(string)
 	if !ok {
-		t.Fatalf("expected SavedLastID to be string, got %T (%v)", loaded.TypeProgress["string"].SavedLastID, loaded.TypeProgress["string"].SavedLastID)
+		t.Fatalf("expected SavedLastID to be string, got %T (%v)", loaded.TypeProgress[BSONTypeString].SavedLastID, loaded.TypeProgress[BSONTypeString].SavedLastID)
 	}
 	if loadedStr != "sample-string-id" {
 		t.Errorf("expected string %q, got %q", "sample-string-id", loadedStr)
+	}
+
+	// Also verify int32 within number
+	cp.TypeProgress[BSONTypeNumber].SavedLastID = int32Val
+	if err := SavePartitionCheckpoint(filePath, cp); err != nil {
+		t.Fatalf("failed to save checkpoint with int32: %v", err)
+	}
+	loadedInt32CP, err := LoadPartitionCheckpoint(filePath)
+	if err != nil {
+		t.Fatalf("failed to load checkpoint: %v", err)
+	}
+	loadedInt32, ok := loadedInt32CP.TypeProgress[BSONTypeNumber].SavedLastID.(int32)
+	if !ok {
+		t.Fatalf("expected SavedLastID to be int32, got %T (%v)", loadedInt32CP.TypeProgress[BSONTypeNumber].SavedLastID, loadedInt32CP.TypeProgress[BSONTypeNumber].SavedLastID)
+	}
+	if loadedInt32 != int32Val {
+		t.Errorf("expected int32 %d, got %d", int32Val, loadedInt32)
 	}
 }
 
