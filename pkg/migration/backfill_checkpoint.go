@@ -172,3 +172,32 @@ func DeletePartitionCheckpoints(dir, db, collection string) error {
 	}
 	return nil
 }
+
+// GetBSONType maps a runtime BSON _id value to its canonical BSONType using the official MongoDB driver's bson.MarshalValue.
+func GetBSONType(val any) BSONType {
+	if val == nil {
+		return ""
+	}
+	t, _, err := bson.MarshalValue(val)
+	if err != nil {
+		return BSONTypeString
+	}
+	switch t {
+	case bson.TypeObjectID:
+		return BSONTypeObjectID
+	case bson.TypeString:
+		return BSONTypeString
+	case bson.TypeDouble, bson.TypeInt32, bson.TypeInt64, bson.TypeDecimal128:
+		return BSONTypeNumber
+	case bson.TypeDateTime:
+		return BSONTypeDate
+	case bson.TypeTimestamp:
+		return BSONTypeTimestamp
+	case bson.TypeBinary:
+		return BSONTypeBinary
+	case bson.TypeBoolean:
+		return BSONTypeBool
+	default:
+		return BSONTypeString
+	}
+}
