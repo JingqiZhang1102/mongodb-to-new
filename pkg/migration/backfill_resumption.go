@@ -230,6 +230,17 @@ func ExtractGlobalMinSafeIDs(checkpoints []*PartitionCheckpoint) (map[BSONType]a
 				continue
 			}
 
+			// If this partition has completed this type range, ignore it from global min finding
+			if boundary.SavedLastID != nil && boundary.RangeEndID != nil {
+				cmp, err := CompareBSONValues(boundary.SavedLastID, boundary.RangeEndID)
+				if err != nil {
+					return nil, fmt.Errorf("failed to compare IDs for type %s in partition %d: %w", typeName, i, err)
+				}
+				if cmp >= 0 {
+					continue
+				}
+			}
+
 			start := boundary.SavedLastID
 			if start == nil {
 				start = boundary.RangeStartID

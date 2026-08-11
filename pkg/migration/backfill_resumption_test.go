@@ -568,6 +568,46 @@ func TestBackfillResumption_ExtractGlobalMinSafeIDs(t *testing.T) {
 		}
 	})
 
+	t.Run("MixedTypesWithPartialProgress", func(t *testing.T) {
+		cps := []*PartitionCheckpoint{
+			{
+				PartitionIndex: 0,
+				TotalSplits:    2,
+				TypeProgress: map[BSONType]*TypeRangeBoundary{
+					BSONTypeNumber:   {BSONType: BSONTypeNumber, RangeEndID: int64(100), SavedLastID: int64(100)}, // Completed
+					BSONTypeString:   {BSONType: BSONTypeString, RangeEndID: "z", SavedLastID: "a"},               // Partially completed
+					BSONTypeObjectID: {BSONType: BSONTypeObjectID, RangeEndID: oid2},                              // Unstarted
+				},
+			},
+			{
+				PartitionIndex: 1,
+				TotalSplits:    2,
+				TypeProgress: map[BSONType]*TypeRangeBoundary{
+					BSONTypeNumber:   {BSONType: BSONTypeNumber, RangeStartID: int64(100), SavedLastID: int64(150)},
+					BSONTypeString:   {BSONType: BSONTypeString, RangeStartID: "z", SavedLastID: "m"},
+					BSONTypeObjectID: {BSONType: BSONTypeObjectID, RangeStartID: oid2, SavedLastID: oid3},
+				},
+			},
+		}
+
+		globalMins, err := ExtractGlobalMinSafeIDs(cps)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Number global min is 150 (partition 0 completed up to 100 and is ignored; active partition 1 reached 150)
+		if globalMins[BSONTypeNumber] != int64(150) {
+			t.Errorf("expected GlobalMin Number 150, got %v", globalMins[BSONTypeNumber])
+		}
+		// String global min is "a" (partition 0 is currently at "a")
+		if globalMins[BSONTypeString] != "a" {
+			t.Errorf("expected GlobalMin String 'a', got %v", globalMins[BSONTypeString])
+		}
+		// ObjectID global min is nil (partition 0 has not started objectIds, so scan from beginning of objectIds)
+		if globalMins[BSONTypeObjectID] != nil {
+			t.Errorf("expected GlobalMin ObjectID nil (unbounded start), got %v", globalMins[BSONTypeObjectID])
+		}
+	})
+
 	t.Run("EmptyCheckpointsReturnsError", func(t *testing.T) {
 		_, err := ExtractGlobalMinSafeIDs(nil)
 		if err == nil {
@@ -647,6 +687,63 @@ func TestBackfillResumption_DetermineBackfillResumptionPlan(t *testing.T) {
 		}
 	})
 
+	t.Run("MatchingPartitionsSubsetCompleted", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		totalSplits := 2
+		oid1, _ := primitive.ObjectIDFromHex("60a000000000000000000010")
+		oid2, _ := primitive.ObjectIDFromHex("60a000000000000000000050")
+
+		// Partition 0 is 100% COMPLETED: SavedLastID reached RangeEndID (oid2)
+		cp0 := &PartitionCheckpoint{
+			Database:                db,
+			Collection:              coll,
+			PartitionIndex:          0,
+			TotalSplits:             totalSplits,
+			ApproximateDocsMigrated: 1000,
+			TypeProgress: map[BSONType]*TypeRangeBoundary{
+				BSONTypeObjectID: {BSONType: BSONTypeObjectID, RangeEndID: oid2, SavedLastID: oid2},
+			},
+		}
+		// Partition 1 is partially completed
+		cp1 := &PartitionCheckpoint{
+			Database:                db,
+			Collection:              coll,
+			PartitionIndex:          1,
+			TotalSplits:             totalSplits,
+			ApproximateDocsMigrated: 500,
+			TypeProgress: map[BSONType]*TypeRangeBoundary{
+				BSONTypeObjectID: {BSONType: BSONTypeObjectID, RangeStartID: oid2, SavedLastID: oid1},
+			},
+		}
+
+		_ = SavePartitionCheckpoint(GetPartitionCheckpointPath(tmpDir, db, coll, 0, totalSplits), cp0)
+		_ = SavePartitionCheckpoint(GetPartitionCheckpointPath(tmpDir, db, coll, 1, totalSplits), cp1)
+
+		plan, err := DetermineBackfillResumptionPlan(tmpDir, db, coll, 2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if plan.Mode != ResumptionModeDirect {
+			t.Errorf("expected ResumptionModeDirect, got %v", plan.Mode)
+		}
+		if plan.TotalDocsMigrated() != 1500 {
+			t.Errorf("expected TotalDocsMigrated 1500, got %d", plan.TotalDocsMigrated())
+		}
+		// Partition 0 filter must match 0 documents because it is completed
+		expectedFilter0 := bson.D{{Key: "_id", Value: bson.D{{Key: "$exists", Value: false}}}}
+		if diff := cmp.Diff(expectedFilter0, plan.PartitionFilters[0]); diff != "" {
+			t.Errorf("partition 0 completed filter mismatch (-want +got):\n%s", diff)
+		}
+		// Partition 1 filter must resume with $gte: oid1
+		expectedFilter1 := bson.D{{Key: "_id", Value: bson.D{
+			{Key: "$type", Value: "objectId"},
+			{Key: "$gte", Value: oid1},
+		}}}
+		if diff := cmp.Diff(expectedFilter1, plan.PartitionFilters[1]); diff != "" {
+			t.Errorf("partition 1 filter mismatch (-want +got):\n%s", diff)
+		}
+	})
+
 	t.Run("ReconfiguredPartitionCountResamplesWithGlobalMin", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		historicalSplits := 2
@@ -693,6 +790,63 @@ func TestBackfillResumption_DetermineBackfillResumptionPlan(t *testing.T) {
 		}
 		if plan.GlobalMinSafeIDs[BSONTypeObjectID] != oid1 {
 			t.Errorf("expected GlobalMinSafeID %v, got %v", oid1, plan.GlobalMinSafeIDs[BSONTypeObjectID])
+		}
+	})
+
+	t.Run("ReconfiguredPartitionCountMixedTypes", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		historicalSplits := 2
+		oid1, _ := primitive.ObjectIDFromHex("60a000000000000000000010")
+		oid2, _ := primitive.ObjectIDFromHex("60a000000000000000000050")
+		oid3, _ := primitive.ObjectIDFromHex("60a000000000000000000090")
+
+		cp0 := &PartitionCheckpoint{
+			Database:                db,
+			Collection:              coll,
+			PartitionIndex:          0,
+			TotalSplits:             historicalSplits,
+			ApproximateDocsMigrated: 1200,
+			TypeProgress: map[BSONType]*TypeRangeBoundary{
+				BSONTypeNumber:   {BSONType: BSONTypeNumber, RangeEndID: int64(500), SavedLastID: int64(250)},
+				BSONTypeObjectID: {BSONType: BSONTypeObjectID, RangeEndID: oid2, SavedLastID: oid1},
+				BSONTypeString:   {BSONType: BSONTypeString, RangeEndID: "m", SavedLastID: "d"},
+			},
+		}
+		cp1 := &PartitionCheckpoint{
+			Database:                db,
+			Collection:              coll,
+			PartitionIndex:          1,
+			TotalSplits:             historicalSplits,
+			ApproximateDocsMigrated: 1800,
+			TypeProgress: map[BSONType]*TypeRangeBoundary{
+				BSONTypeNumber:   {BSONType: BSONTypeNumber, RangeStartID: int64(500), SavedLastID: int64(750)},
+				BSONTypeObjectID: {BSONType: BSONTypeObjectID, RangeStartID: oid2, SavedLastID: oid3},
+				BSONTypeString:   {BSONType: BSONTypeString, RangeStartID: "m", SavedLastID: "t"},
+			},
+		}
+
+		_ = SavePartitionCheckpoint(GetPartitionCheckpointPath(tmpDir, db, coll, 0, historicalSplits), cp0)
+		_ = SavePartitionCheckpoint(GetPartitionCheckpointPath(tmpDir, db, coll, 1, historicalSplits), cp1)
+
+		// Reconfigured to 4 splits
+		plan, err := DetermineBackfillResumptionPlan(tmpDir, db, coll, 4)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if plan.Mode != ResumptionModeResampleWithGlobalMin {
+			t.Errorf("expected ResumptionModeResampleWithGlobalMin, got %v", plan.Mode)
+		}
+		if plan.TotalDocsMigrated() != 3000 {
+			t.Errorf("expected TotalDocsMigrated 3000, got %d", plan.TotalDocsMigrated())
+		}
+		if plan.GlobalMinSafeIDs[BSONTypeNumber] != int64(250) {
+			t.Errorf("expected GlobalMin Number 250, got %v", plan.GlobalMinSafeIDs[BSONTypeNumber])
+		}
+		if plan.GlobalMinSafeIDs[BSONTypeObjectID] != oid1 {
+			t.Errorf("expected GlobalMin ObjectID %v, got %v", oid1, plan.GlobalMinSafeIDs[BSONTypeObjectID])
+		}
+		if plan.GlobalMinSafeIDs[BSONTypeString] != "d" {
+			t.Errorf("expected GlobalMin String 'd', got %v", plan.GlobalMinSafeIDs[BSONTypeString])
 		}
 	})
 
