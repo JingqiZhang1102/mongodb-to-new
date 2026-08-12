@@ -357,3 +357,89 @@ func TestMigrator_SequentialResumption_MixedTypeFilterWithUnreachedTypes(t *test
 		t.Fatalf("expected 4 clauses in $or filter, got %d", len(orVal))
 	}
 }
+
+func TestMigrator_SequentialResumption_CorruptedCheckpointFallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbName := "test_db"
+	collName := "corrupted_coll"
+
+	// Write invalid JSON bytes to simulate a corrupted or half-written checkpoint file
+	checkpointPath := GetPartitionCheckpointPath(tmpDir, dbName, collName, 0, 1)
+	if err := os.WriteFile(checkpointPath, []byte("{\"database\": \"test_db\", \"collection\": broken json..."), 0644); err != nil {
+		t.Fatalf("failed to write corrupted checkpoint: %v", err)
+	}
+
+	plan, err := DetermineBackfillResumptionPlan(tmpDir, dbName, collName, 1)
+	if err != nil {
+		t.Fatalf("unexpected error determining plan: %v", err)
+	}
+
+	if plan.Mode != ResumptionModeFresh {
+		t.Errorf("expected fallback to ResumptionModeFresh for corrupted checkpoint, got %v", plan.Mode)
+	}
+	if plan.TotalDocsMigrated() != 0 {
+		t.Errorf("expected 0 docs migrated for fallback, got %d", plan.TotalDocsMigrated())
+	}
+}
+
+func TestMigrator_SequentialResumption_TrackerPeriodicFlush(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbName := "prod_orders_db"
+	collName := "orders"
+	checkpointPath := GetPartitionCheckpointPath(tmpDir, dbName, collName, 0, 1)
+
+	initialCP := &PartitionCheckpoint{
+		Database:                dbName,
+		Collection:              collName,
+		PartitionIndex:          0,
+		TotalSplits:             1,
+		ApproximateDocsMigrated: 0,
+		TypeProgress:            make(map[BSONType]*TypeRangeBoundary),
+		UpdatedAt:               time.Now().UTC(),
+	}
+
+	log := logger.New()
+	// Set saveThreshold to 2 to test automatic threshold-triggered flushes
+	tracker := NewBackfillPartitionTracker(log, initialCP, checkpointPath, 1*time.Hour, 2)
+
+	oid1 := primitive.NewObjectID()
+	oid2 := primitive.NewObjectID()
+
+	batch1 := []interface{}{
+		bson.D{{Key: "_id", Value: oid1}, {Key: "amount", Value: 99.99}},
+	}
+	batch2 := []interface{}{
+		bson.D{{Key: "_id", Value: oid2}, {Key: "amount", Value: 149.50}},
+	}
+
+	seq1 := tracker.RegisterBatch(batch1)
+	seq2 := tracker.RegisterBatch(batch2)
+
+	// Ack batch 1 (count = 1 < threshold 2) -> should NOT trigger disk flush yet
+	tracker.AckBatch(seq1, 1)
+	loaded, err := LoadPartitionCheckpoint(checkpointPath)
+	if err != nil {
+		t.Fatalf("unexpected error checking checkpoint: %v", err)
+	}
+	if loaded != nil {
+		t.Errorf("expected no checkpoint file before threshold reached, got %+v", loaded)
+	}
+
+	// Ack batch 2 (count = 2 == threshold 2) -> triggers automatic disk flush
+	tracker.AckBatch(seq2, 1)
+	loaded, err = LoadPartitionCheckpoint(checkpointPath)
+	if err != nil {
+		t.Fatalf("unexpected error checking checkpoint: %v", err)
+	}
+	if loaded == nil {
+		t.Fatalf("expected checkpoint file to be created after reaching saveThreshold")
+	}
+	if loaded.ApproximateDocsMigrated != 2 {
+		t.Errorf("expected 2 docs migrated, got %d", loaded.ApproximateDocsMigrated)
+	}
+	if loaded.TypeProgress[BSONTypeObjectID] == nil || loaded.TypeProgress[BSONTypeObjectID].SavedLastID != oid2 {
+		t.Errorf("expected SavedLastID %v, got %v", oid2, loaded.TypeProgress[BSONTypeObjectID])
+	}
+
+	tracker.Close()
+}
