@@ -247,23 +247,24 @@ func TestMigrator_SequentialResumption_CleanupOnCompletion(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbName := "test_db"
 	collName := "test_coll"
+	checkpointPath := GetPartitionCheckpointPath(tmpDir, dbName, collName, 0, 1)
 
-	cp := &PartitionCheckpoint{
+	initialCP := &PartitionCheckpoint{
 		Database:                dbName,
 		Collection:              collName,
 		PartitionIndex:          0,
 		TotalSplits:             1,
-		ApproximateDocsMigrated: 20000,
-		TypeProgress: map[BSONType]*TypeRangeBoundary{
-			BSONTypeString: {BSONType: BSONTypeString, SavedLastID: "user_9999"},
-		},
-		UpdatedAt: time.Now().UTC(),
+		ApproximateDocsMigrated: 0,
+		TypeProgress:            make(map[BSONType]*TypeRangeBoundary),
+		UpdatedAt:               time.Now().UTC(),
 	}
 
-	checkpointPath := GetPartitionCheckpointPath(tmpDir, dbName, collName, 0, 1)
-	if err := SavePartitionCheckpoint(checkpointPath, cp); err != nil {
-		t.Fatalf("failed to save checkpoint: %v", err)
+	tracker := NewBackfillPartitionTracker(logger.New(), initialCP, checkpointPath, 5*time.Minute, 1)
+	batch := []interface{}{
+		bson.D{{Key: "_id", Value: "user_9999"}},
 	}
+	seq := tracker.RegisterBatch(batch)
+	tracker.AckBatch(seq, 1) // flushes to disk because saveThreshold = 1
 
 	// Create a leftover .tmp file to test cleanup
 	tmpFile := filepath.Join(tmpDir, "backfillCheckpoint-test_db-test_coll-partition-0-of-1.json.tmp")
@@ -273,12 +274,17 @@ func TestMigrator_SequentialResumption_CleanupOnCompletion(t *testing.T) {
 		t.Fatalf("checkpoint file should exist before cleanup")
 	}
 
+	// Simulate migrateCollection finishing: MarkCompleted followed by DeletePartitionCheckpoints
+	tracker.MarkCompleted()
 	if err := DeletePartitionCheckpoints(tmpDir, dbName, collName); err != nil {
 		t.Fatalf("failed to delete partition checkpoints: %v", err)
 	}
 
+	// Simulate deferred tracker.Close() running on function exit
+	tracker.Close()
+
 	if _, err := os.Stat(checkpointPath); !os.IsNotExist(err) {
-		t.Fatalf("checkpoint file should have been deleted")
+		t.Fatalf("checkpoint file should have remained deleted and not resurrected by Close()")
 	}
 	if _, err := os.Stat(tmpFile); !os.IsNotExist(err) {
 		t.Fatalf("temporary checkpoint file should have been deleted")
