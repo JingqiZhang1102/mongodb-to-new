@@ -57,7 +57,6 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 		return fmt.Errorf("invalid mode: %s, must be 'migrate', 'live', 'live-only', or 'retry-dlq'", mode)
 	}
 
-
 	m.log.Infof("Starting MongoDB to MongoDB %s process", mode)
 
 	if m.DryRun {
@@ -684,13 +683,27 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 
 	m.log.Infof("Using read batch size: %d, write batch size: %d", readBatchSize, writeBatchSize)
 
+	// In sequential backfill mode, the collection is treated as a single partition (0 of 1)
+	const partitionIndex = 0
+	const totalSplits = 1
+
 	// Evaluate backfill resumption plan for sequential migration (partition count: 1)
 	checkpointDir := m.getCheckpointDir()
-	plan, err := DetermineBackfillResumptionPlan(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, 1)
+	plan, err := DetermineBackfillResumptionPlan(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, totalSplits)
 
 	var resumeFilter bson.D
 	var previouslyMigratedDocs int64
-	var checkpoint *PartitionCheckpoint
+
+	// Initialize default fresh checkpoint state
+	checkpoint := &PartitionCheckpoint{
+		Database:                sourceDB.GetDatabaseName(),
+		Collection:              collConfig.SourceCollection,
+		PartitionIndex:          partitionIndex,
+		TotalSplits:             totalSplits,
+		ApproximateDocsMigrated: 0,
+		TypeProgress:            make(map[BSONType]*TypeRangeBoundary),
+		UpdatedAt:               time.Now().UTC(),
+	}
 
 	if err != nil {
 		m.log.Warnf("[%s.%s] Error determining backfill resumption plan: %v. Starting fresh.", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
@@ -699,38 +712,22 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 
 	switch plan.Mode {
 	case ResumptionModeDirect:
-		resumeFilter = plan.PartitionFilters[0]
-		previouslyMigratedDocs = plan.TotalDocsMigrated()
-		checkpointPath := GetPartitionCheckpointPath(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, 0, 1)
+		checkpointPath := GetPartitionCheckpointPath(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex, totalSplits)
 		loadedCP, loadErr := LoadPartitionCheckpoint(checkpointPath)
 		if loadErr != nil || loadedCP == nil {
-			m.log.Warnf("[%s.%s] Failed to reload checkpoint from %s: %v. Using constructed checkpoint.", sourceDB.GetDatabaseName(), collConfig.SourceCollection, checkpointPath, loadErr)
-			checkpoint = &PartitionCheckpoint{
-				Database:                sourceDB.GetDatabaseName(),
-				Collection:              collConfig.SourceCollection,
-				PartitionIndex:          0,
-				TotalSplits:             1,
-				ApproximateDocsMigrated: previouslyMigratedDocs,
-				TypeProgress:            make(map[BSONType]*TypeRangeBoundary),
-				UpdatedAt:               time.Now().UTC(),
-			}
+			m.log.Warnf("[%s.%s] Failed to reload checkpoint from %s: %v. Falling back to fresh start.", sourceDB.GetDatabaseName(), collConfig.SourceCollection, checkpointPath, loadErr)
+			plan.Mode = ResumptionModeFresh
 		} else {
 			checkpoint = loadedCP
+			resumeFilter = plan.PartitionFilters[partitionIndex]
+			previouslyMigratedDocs = plan.TotalDocsMigrated()
+			m.log.Infof("[%s.%s] Resuming sequential initial backfill from checkpoint: ~%d docs previously migrated (filter: %+v)",
+				sourceDB.GetDatabaseName(), collConfig.SourceCollection, previouslyMigratedDocs, resumeFilter)
 		}
-		m.log.Infof("[%s.%s] Resuming sequential initial backfill from checkpoint: ~%d docs previously migrated (filter: %+v)",
-			sourceDB.GetDatabaseName(), collConfig.SourceCollection, previouslyMigratedDocs, resumeFilter)
 
 	case ResumptionModeResampleWithGlobalMin:
 		previouslyMigratedDocs = plan.TotalDocsMigrated()
-		checkpoint = &PartitionCheckpoint{
-			Database:                sourceDB.GetDatabaseName(),
-			Collection:              collConfig.SourceCollection,
-			PartitionIndex:          0,
-			TotalSplits:             1,
-			ApproximateDocsMigrated: previouslyMigratedDocs,
-			TypeProgress:            make(map[BSONType]*TypeRangeBoundary),
-			UpdatedAt:               time.Now().UTC(),
-		}
+		checkpoint.ApproximateDocsMigrated = previouslyMigratedDocs
 		for bType, minID := range plan.GlobalMinSafeIDs {
 			checkpoint.TypeProgress[bType] = &TypeRangeBoundary{
 				BSONType:    bType,
@@ -739,40 +736,23 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		}
 		filter, filterErr := BuildPartitionFilterFromCheckpoint(checkpoint)
 		if filterErr != nil {
-			m.log.Warnf("[%s.%s] Failed to build filter from global min checkpoint: %v. Starting fresh.", sourceDB.GetDatabaseName(), collConfig.SourceCollection, filterErr)
-			resumeFilter = nil
+			m.log.Warnf("[%s.%s] Failed to build filter from global min checkpoint: %v. Falling back to fresh start.", sourceDB.GetDatabaseName(), collConfig.SourceCollection, filterErr)
+			plan.Mode = ResumptionModeFresh
+			checkpoint.ApproximateDocsMigrated = 0
+			checkpoint.TypeProgress = make(map[BSONType]*TypeRangeBoundary)
+			previouslyMigratedDocs = 0
 		} else {
 			resumeFilter = filter
+			m.log.Infof("[%s.%s] Resuming sequential initial backfill with global min safe IDs across historical partitions: ~%d docs previously migrated (filter: %+v)",
+				sourceDB.GetDatabaseName(), collConfig.SourceCollection, previouslyMigratedDocs, resumeFilter)
 		}
-		m.log.Infof("[%s.%s] Resuming sequential initial backfill with global min safe IDs across historical partitions: ~%d docs previously migrated (filter: %+v)",
-			sourceDB.GetDatabaseName(), collConfig.SourceCollection, previouslyMigratedDocs, resumeFilter)
+	}
 
-	case ResumptionModeFresh:
-		previouslyMigratedDocs = 0
-		checkpoint = &PartitionCheckpoint{
-			Database:                sourceDB.GetDatabaseName(),
-			Collection:              collConfig.SourceCollection,
-			PartitionIndex:          0,
-			TotalSplits:             1,
-			ApproximateDocsMigrated: 0,
-			TypeProgress:            make(map[BSONType]*TypeRangeBoundary),
-			UpdatedAt:               time.Now().UTC(),
-		}
-		types, discErr := m.discoverPresentBSONTypes(ctx, sourceCollection)
-		if discErr != nil {
-			m.log.Warnf("[%s.%s] Failed to discover BSON types for initial backfill: %v", sourceDB.GetDatabaseName(), collConfig.SourceCollection, discErr)
-		} else {
-			for _, t := range types {
-				checkpoint.TypeProgress[t] = &TypeRangeBoundary{BSONType: t}
-			}
-		}
+	if plan.Mode == ResumptionModeFresh {
 		m.log.Infof("[%s.%s] Starting fresh sequential initial backfill", sourceDB.GetDatabaseName(), collConfig.SourceCollection)
 	}
 
-	checkpointPath := GetPartitionCheckpointPath(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, 0, 1)
-	if m.DryRun {
-		checkpointPath = ""
-	}
+	checkpointPath := GetPartitionCheckpointPath(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex, totalSplits)
 	checkpointInterval := time.Duration(m.config.CheckpointIntervalMinutes) * time.Minute
 	saveThreshold := m.config.SaveThreshold
 
@@ -1033,54 +1013,10 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	}
 
 	// Always clean up backfill checkpoints when the full collection scan completes. If failedCount > 0, the failed documents will be found in the DLQ, and they should be handled explicitly and separately by users.
-	if !m.DryRun {
-		if err := DeletePartitionCheckpoints(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection); err != nil {
-			m.log.Warnf("[%s.%s] Failed to delete checkpoint files on completion: %v", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
-		}
+	if err := DeletePartitionCheckpoints(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection); err != nil {
+		m.log.Warnf("[%s.%s] Failed to delete checkpoint files on completion: %v", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
 	}
 	return successCount, failedCount, nil
-}
-
-// discoverPresentBSONTypes returns the unique BSON types of the _id field present in the collection.
-func (m *Migrator) discoverPresentBSONTypes(ctx context.Context, collection *mongo.Collection) ([]BSONType, error) {
-	pipeline := mongo.Pipeline{
-		bson.D{{Key: "$group", Value: bson.D{
-			{Key: "_id", Value: bson.D{{Key: "$type", Value: "$_id"}}},
-		}}},
-	}
-
-	discoverCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
-	defer cancel()
-
-	cursor, err := collection.Aggregate(discoverCtx, pipeline)
-	if err != nil {
-		return nil, fmt.Errorf("failed to discover BSON types: %w", err)
-	}
-	defer cursor.Close(discoverCtx)
-
-	seen := make(map[BSONType]bool)
-	var types []BSONType
-	for cursor.Next(discoverCtx) {
-		var res struct {
-			Type string `bson:"_id"`
-		}
-		if err := cursor.Decode(&res); err != nil {
-			return nil, fmt.Errorf("failed to decode BSON type: %w", err)
-		}
-
-		typeName := res.Type
-		switch typeName {
-		case "int", "long", "double", "decimal":
-			typeName = "number"
-		}
-		bType := BSONType(typeName)
-		if !seen[bType] {
-			seen[bType] = true
-			types = append(types, bType)
-		}
-	}
-
-	return types, cursor.Err()
 }
 
 // processBatch processes a batch of documents
