@@ -24,11 +24,20 @@ import (
 
 // Migrator handles the migration and replication process
 type Migrator struct {
-	config       *config.Config
-	log          *logger.Logger
+	config        *config.Config
+	log           *logger.Logger
 	LiveStartTime *primitive.Timestamp
-	DryRun       bool
-	isLive       bool
+	DryRun        bool
+	isLive        bool
+	CheckpointDir string
+}
+
+// getCheckpointDir returns the configured checkpoint directory, defaulting to current directory if unset.
+func (m *Migrator) getCheckpointDir() string {
+	if m.CheckpointDir != "" {
+		return m.CheckpointDir
+	}
+	return "."
 }
 
 // NewMigrator creates a new migrator
@@ -675,6 +684,102 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 
 	m.log.Infof("Using read batch size: %d, write batch size: %d", readBatchSize, writeBatchSize)
 
+	// Evaluate backfill resumption plan for sequential migration (partition count: 1)
+	checkpointDir := m.getCheckpointDir()
+	plan, err := DetermineBackfillResumptionPlan(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, 1)
+
+	var resumeFilter bson.D
+	var previouslyMigratedDocs int64
+	var checkpoint *PartitionCheckpoint
+
+	if err != nil {
+		m.log.Warnf("[%s.%s] Error determining backfill resumption plan: %v. Starting fresh.", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
+		plan = &BackfillResumptionPlan{Mode: ResumptionModeFresh}
+	}
+
+	switch plan.Mode {
+	case ResumptionModeDirect:
+		resumeFilter = plan.PartitionFilters[0]
+		previouslyMigratedDocs = plan.TotalDocsMigrated()
+		checkpointPath := GetPartitionCheckpointPath(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, 0, 1)
+		loadedCP, loadErr := LoadPartitionCheckpoint(checkpointPath)
+		if loadErr != nil || loadedCP == nil {
+			m.log.Warnf("[%s.%s] Failed to reload checkpoint from %s: %v. Using constructed checkpoint.", sourceDB.GetDatabaseName(), collConfig.SourceCollection, checkpointPath, loadErr)
+			checkpoint = &PartitionCheckpoint{
+				Database:                sourceDB.GetDatabaseName(),
+				Collection:              collConfig.SourceCollection,
+				PartitionIndex:          0,
+				TotalSplits:             1,
+				ApproximateDocsMigrated: previouslyMigratedDocs,
+				TypeProgress:            make(map[BSONType]*TypeRangeBoundary),
+				UpdatedAt:               time.Now().UTC(),
+			}
+		} else {
+			checkpoint = loadedCP
+		}
+		m.log.Infof("[%s.%s] Resuming sequential initial backfill from checkpoint: ~%d docs previously migrated (filter: %+v)",
+			sourceDB.GetDatabaseName(), collConfig.SourceCollection, previouslyMigratedDocs, resumeFilter)
+
+	case ResumptionModeResampleWithGlobalMin:
+		previouslyMigratedDocs = plan.TotalDocsMigrated()
+		checkpoint = &PartitionCheckpoint{
+			Database:                sourceDB.GetDatabaseName(),
+			Collection:              collConfig.SourceCollection,
+			PartitionIndex:          0,
+			TotalSplits:             1,
+			ApproximateDocsMigrated: previouslyMigratedDocs,
+			TypeProgress:            make(map[BSONType]*TypeRangeBoundary),
+			UpdatedAt:               time.Now().UTC(),
+		}
+		for bType, minID := range plan.GlobalMinSafeIDs {
+			checkpoint.TypeProgress[bType] = &TypeRangeBoundary{
+				BSONType:    bType,
+				SavedLastID: minID,
+			}
+		}
+		filter, filterErr := BuildPartitionFilterFromCheckpoint(checkpoint)
+		if filterErr != nil {
+			m.log.Warnf("[%s.%s] Failed to build filter from global min checkpoint: %v. Starting fresh.", sourceDB.GetDatabaseName(), collConfig.SourceCollection, filterErr)
+			resumeFilter = nil
+		} else {
+			resumeFilter = filter
+		}
+		m.log.Infof("[%s.%s] Resuming sequential initial backfill with global min safe IDs across historical partitions: ~%d docs previously migrated (filter: %+v)",
+			sourceDB.GetDatabaseName(), collConfig.SourceCollection, previouslyMigratedDocs, resumeFilter)
+
+	case ResumptionModeFresh:
+		previouslyMigratedDocs = 0
+		checkpoint = &PartitionCheckpoint{
+			Database:                sourceDB.GetDatabaseName(),
+			Collection:              collConfig.SourceCollection,
+			PartitionIndex:          0,
+			TotalSplits:             1,
+			ApproximateDocsMigrated: 0,
+			TypeProgress:            make(map[BSONType]*TypeRangeBoundary),
+			UpdatedAt:               time.Now().UTC(),
+		}
+		types, discErr := m.discoverPresentBSONTypes(ctx, sourceCollection)
+		if discErr != nil {
+			m.log.Warnf("[%s.%s] Failed to discover BSON types for initial backfill: %v", sourceDB.GetDatabaseName(), collConfig.SourceCollection, discErr)
+		} else {
+			for _, t := range types {
+				checkpoint.TypeProgress[t] = &TypeRangeBoundary{BSONType: t}
+			}
+		}
+		m.log.Infof("[%s.%s] Starting fresh sequential initial backfill", sourceDB.GetDatabaseName(), collConfig.SourceCollection)
+	}
+
+	checkpointPath := GetPartitionCheckpointPath(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, 0, 1)
+	if m.DryRun {
+		checkpointPath = ""
+	}
+	checkpointInterval := time.Duration(m.config.CheckpointIntervalMinutes) * time.Minute
+	saveThreshold := m.config.SaveThreshold
+
+	tracker := NewBackfillPartitionTracker(m.log, checkpoint, checkpointPath, checkpointInterval, saveThreshold)
+	tracker.Start(ctx)
+	defer tracker.Close()
+
 	// Create retry manager for batch processing.
 	// [Safety Fix 8: Invalid ID Conversion] Firestore target APIs only support string, int64, or ObjectId document keys;
 	// arrays or nested subdocuments trigger terminal errors. Enabling ConvertInvalidIds
@@ -691,7 +796,11 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 
 	// [Safety Fix 1: MongoDB Cursor Timeout] SetNoCursorTimeout(true) is used to prevent the MongoDB read cursor from timing out (default 10 minutes)
 	// when upstream readers are throttled or paused by write rate-limiting/backpressure downstream.
-	cursor, err := sourceCollection.Find(ctx, bson.D{}, options.Find().SetBatchSize(int32(readBatchSize)).SetNoCursorTimeout(true))
+	findFilter := bson.D{}
+	if resumeFilter != nil {
+		findFilter = resumeFilter
+	}
+	cursor, err := sourceCollection.Find(ctx, findFilter, options.Find().SetBatchSize(int32(readBatchSize)).SetNoCursorTimeout(true))
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to create cursor: %w", err)
 	}
@@ -699,12 +808,17 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	// and connection starvation on the source MongoDB replica set.
 	defer cursor.Close(ctx)
 
+	type backfillBatchItem struct {
+		batch []interface{}
+		seq   uint64
+	}
+
 	// Set up parallel batch processing
 	var wg sync.WaitGroup
 	channelBufferSize := m.config.InitialChannelBufferSize
-	batchChan := make(chan []interface{}, channelBufferSize) // Buffer for batches
-	errorChan := make(chan error, 1)                         // Channel for errors
-	doneChan := make(chan struct{})                          // Channel to signal completion
+	batchChan := make(chan backfillBatchItem, channelBufferSize) // Buffer for batches
+	errorChan := make(chan error, 1)                             // Channel for errors
+	doneChan := make(chan struct{})                              // Channel to signal completion
 
 	// Track progress
 	var successCount int64
@@ -734,11 +848,11 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		go func(workerID int) {
 			defer wg.Done()
 
-			for batch := range batchChan {
+			for item := range batchChan {
 				if opts.BackfillStatsManager != nil {
-					opts.BackfillStatsManager.RecordWorkerReceived(int64(len(batch)))
+					opts.BackfillStatsManager.RecordWorkerReceived(int64(len(item.batch)))
 				}
-				succeeded, failed, err := m.writeBatch(ctx, targetCollection, batch, sourceDB.GetDatabaseName(), collConfig.SourceCollection, opts, retryManager, workerID, proactiveSkipEnabled)
+				succeeded, failed, err := m.writeBatch(ctx, targetCollection, item.batch, sourceDB.GetDatabaseName(), collConfig.SourceCollection, opts, retryManager, workerID, proactiveSkipEnabled)
 				if err != nil {
 					select {
 					case errorChan <- fmt.Errorf("worker %d failed to process batch: %w", workerID, err):
@@ -747,17 +861,23 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 					return
 				}
 
+				if ctx.Err() == nil {
+					tracker.AckBatch(item.seq, succeeded)
+				}
+
 				// Update progress
 				mu.Lock()
 				successCount += succeeded
 				failedCount += failed
-				migratedCount += int64(len(batch))
-				currentCount := migratedCount
+				migratedCount += int64(len(item.batch))
 				currentSuccess := successCount
 				currentFailed := failedCount
 
-				// Calculate current percentage (0-10 for 0%-100%)
-				currentPercentage := int(float64(currentCount) / float64(totalCount) * 10)
+				cumulativeCount := previouslyMigratedDocs + successCount + failedCount
+				if totalCount > 0 && cumulativeCount > totalCount {
+					cumulativeCount = totalCount
+				}
+				currentPercentage := int(float64(cumulativeCount) / float64(totalCount) * 10)
 
 				// Only log when crossing a 10% threshold at the collection level
 				// and update lastLoggedPercentage atomically to prevent multiple logs
@@ -771,11 +891,11 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 				// Log outside the mutex lock to reduce lock contention
 				if shouldLog {
 					if failedCount > 0 {
-						m.log.Infof("Collection %s progress: %d/%d documents (%.0f%%) - Successful: %d, Failed: %d",
-							collConfig.SourceCollection, currentCount, totalCount, float64(currentPercentage)*10, currentSuccess, currentFailed)
+						m.log.Infof("Collection %s progress: ~%d/%d documents (%.0f%%) [This run: %d successful, %d failed]",
+							collConfig.SourceCollection, cumulativeCount, totalCount, float64(currentPercentage)*10, currentSuccess, currentFailed)
 					} else {
-						m.log.Infof("Collection %s progress: %d/%d documents (%.0f%%)",
-							collConfig.SourceCollection, currentCount, totalCount, float64(currentPercentage)*10)
+						m.log.Infof("Collection %s progress: ~%d/%d documents (%.0f%%)",
+							collConfig.SourceCollection, cumulativeCount, totalCount, float64(currentPercentage)*10)
 					}
 				}
 			}
@@ -828,9 +948,11 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 
 		// Send batch if it reaches the write batch size
 		if batchCount >= writeBatchSize {
+			seq := tracker.RegisterBatch(batch)
+			item := backfillBatchItem{batch: batch, seq: seq}
 			sendStart := time.Now()
 			select {
-			case batchChan <- batch:
+			case batchChan <- item:
 				if opts.BackfillStatsManager != nil {
 					opts.BackfillStatsManager.RecordIngestQueueStall(time.Since(sendStart))
 				}
@@ -865,9 +987,11 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 
 	// Process any remaining documents
 	if len(batch) > 0 {
+		seq := tracker.RegisterBatch(batch)
+		item := backfillBatchItem{batch: batch, seq: seq}
 		sendStart := time.Now()
 		select {
-		case batchChan <- batch:
+		case batchChan <- item:
 			if opts.BackfillStatsManager != nil {
 				opts.BackfillStatsManager.RecordIngestQueueStall(time.Since(sendStart))
 			}
@@ -901,13 +1025,62 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	}
 
 	if failedCount > 0 {
-		m.log.Warnf("Migration for %s completed with %d failures! Successful: %d, Failed: %d, Total: %d",
+		m.log.Warnf("Migration for %s completed with %d failures! Successful: %d, Failed: %d, Total: %d (check DLQ for failed documents)",
 			collConfig.SourceCollection, failedCount, successCount, failedCount, migratedCount)
 	} else {
 		m.log.Infof("Migration for %s completed successfully! Total documents: %d",
 			collConfig.SourceCollection, migratedCount)
 	}
+
+	// Always clean up backfill checkpoints when the full collection scan completes. If failedCount > 0, the failed documents will be found in the DLQ, and they should be handled explicitly and separately by users.
+	if !m.DryRun {
+		if err := DeletePartitionCheckpoints(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection); err != nil {
+			m.log.Warnf("[%s.%s] Failed to delete checkpoint files on completion: %v", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
+		}
+	}
 	return successCount, failedCount, nil
+}
+
+// discoverPresentBSONTypes returns the unique BSON types of the _id field present in the collection.
+func (m *Migrator) discoverPresentBSONTypes(ctx context.Context, collection *mongo.Collection) ([]BSONType, error) {
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: bson.D{{Key: "$type", Value: "$_id"}}},
+		}}},
+	}
+
+	discoverCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+
+	cursor, err := collection.Aggregate(discoverCtx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("failed to discover BSON types: %w", err)
+	}
+	defer cursor.Close(discoverCtx)
+
+	seen := make(map[BSONType]bool)
+	var types []BSONType
+	for cursor.Next(discoverCtx) {
+		var res struct {
+			Type string `bson:"_id"`
+		}
+		if err := cursor.Decode(&res); err != nil {
+			return nil, fmt.Errorf("failed to decode BSON type: %w", err)
+		}
+
+		typeName := res.Type
+		switch typeName {
+		case "int", "long", "double", "decimal":
+			typeName = "number"
+		}
+		bType := BSONType(typeName)
+		if !seen[bType] {
+			seen[bType] = true
+			types = append(types, bType)
+		}
+	}
+
+	return types, cursor.Err()
 }
 
 // processBatch processes a batch of documents
