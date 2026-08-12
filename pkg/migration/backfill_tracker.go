@@ -31,6 +31,7 @@ type BackfillPartitionTracker struct {
 	saveThreshold      int
 	checkpointInterval time.Duration
 	lastSaveTime       time.Time
+	completed          bool
 }
 
 // NewBackfillPartitionTracker creates a new BackfillPartitionTracker.
@@ -70,7 +71,7 @@ func (t *BackfillPartitionTracker) Start(ctx context.Context) {
 			select {
 			case <-ticker.C:
 				t.mu.Lock()
-				if t.ackCountSinceSave > 0 {
+				if !t.completed && t.ackCountSinceSave > 0 {
 					t.saveCheckpointsLocked()
 				}
 				t.mu.Unlock()
@@ -121,15 +122,25 @@ func (t *BackfillPartitionTracker) AckBatch(seq uint64, succeededDocs int64) {
 		}
 	}
 
-	if t.ackCountSinceSave >= t.saveThreshold || time.Since(t.lastSaveTime) >= t.checkpointInterval {
+	if !t.completed && (t.ackCountSinceSave >= t.saveThreshold || time.Since(t.lastSaveTime) >= t.checkpointInterval) {
 		t.saveCheckpointsLocked()
 	}
+}
+
+// MarkCompleted marks the partition backfill as completed, disabling further checkpoint writes on shutdown.
+func (t *BackfillPartitionTracker) MarkCompleted() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.completed = true
 }
 
 // Close flushes all contiguous acknowledged batches to disk and logs any unacknowledged gaps.
 func (t *BackfillPartitionTracker) Close() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.completed {
+		return
+	}
 	t.saveCheckpointsLocked()
 
 	if len(t.pendingSeqs) > 0 {

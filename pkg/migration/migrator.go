@@ -1021,6 +1021,7 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	}
 
 	// Always clean up backfill checkpoints when the full collection scan completes. If failedCount > 0, the failed documents will be found in the DLQ, and they should be handled explicitly and separately by users.
+	tracker.MarkCompleted()
 	if err := DeletePartitionCheckpoints(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection); err != nil {
 		m.log.Warnf("[%s.%s] Failed to delete checkpoint files on completion: %v", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
 	}
