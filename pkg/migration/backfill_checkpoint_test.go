@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -344,6 +345,41 @@ func TestGetBSONType(t *testing.T) {
 			got := GetBSONType(tt.input)
 			if got != tt.expected {
 				t.Errorf("GetBSONType(%v) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDiscoverPresentBSONTypes_NilCollection(t *testing.T) {
+	_, err := DiscoverPresentBSONTypes(context.Background(), nil)
+	if err == nil {
+		t.Fatalf("expected error when discovering BSON types on nil collection, got nil")
+	}
+}
+
+func TestParseBSONType(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected BSONType
+	}{
+		{"int", BSONTypeNumber},
+		{"long", BSONTypeNumber},
+		{"double", BSONTypeNumber},
+		{"decimal", BSONTypeNumber},
+		{"objectId", BSONTypeObjectID},
+		{"string", BSONTypeString},
+		{"binData", BSONTypeBinary},
+		{"date", BSONTypeDate},
+		{"timestamp", BSONTypeTimestamp},
+		{"bool", BSONTypeBool},
+		{"custom_unknown", BSONType("custom_unknown")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := ParseBSONType(tt.input)
+			if got != tt.expected {
+				t.Errorf("ParseBSONType(%q) = %q, want %q", tt.input, got, tt.expected)
 			}
 		})
 	}

@@ -2,6 +2,7 @@ package migration
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
 )
 
 // BSONType represents a canonical MongoDB BSON type name used for _id partitioning and filtering.
@@ -173,6 +175,28 @@ func DeletePartitionCheckpoints(dir, db, collection string) error {
 	return nil
 }
 
+// ParseBSONType maps a MongoDB $type string name (e.g. "objectId", "int", "double") to its canonical BSONType.
+func ParseBSONType(typeName string) BSONType {
+	switch typeName {
+	case "int", "long", "double", "decimal":
+		return BSONTypeNumber
+	case "objectId":
+		return BSONTypeObjectID
+	case "string":
+		return BSONTypeString
+	case "binData":
+		return BSONTypeBinary
+	case "date":
+		return BSONTypeDate
+	case "timestamp":
+		return BSONTypeTimestamp
+	case "bool":
+		return BSONTypeBool
+	default:
+		return BSONType(typeName)
+	}
+}
+
 // GetBSONType maps a runtime BSON _id value to its canonical BSONType using the official MongoDB driver's bson.MarshalValue.
 func GetBSONType(val any) BSONType {
 	if val == nil {
@@ -200,4 +224,43 @@ func GetBSONType(val any) BSONType {
 	default:
 		return BSONTypeString
 	}
+}
+
+// DiscoverPresentBSONTypes returns the unique canonical BSONTypes of the _id field present in the collection.
+func DiscoverPresentBSONTypes(ctx context.Context, collection *mongo.Collection) ([]BSONType, error) {
+	if collection == nil {
+		return nil, fmt.Errorf("collection cannot be nil")
+	}
+
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: bson.D{{Key: "$type", Value: "$_id"}}},
+		}}},
+	}
+
+	discoverCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+
+	cursor, err := collection.Aggregate(discoverCtx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("failed to discover BSON types: %w", err)
+	}
+	defer cursor.Close(discoverCtx)
+
+	seen := make(map[BSONType]bool)
+	var types []BSONType
+	for cursor.Next(discoverCtx) {
+		var res struct {
+			Type string `bson:"_id"`
+		}
+		if err := cursor.Decode(&res); err != nil {
+			return nil, fmt.Errorf("failed to decode BSON type: %w", err)
+		}
+		if bType := ParseBSONType(res.Type); !seen[bType] {
+			seen[bType] = true
+			types = append(types, bType)
+		}
+	}
+
+	return types, cursor.Err()
 }

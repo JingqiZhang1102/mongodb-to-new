@@ -749,7 +749,15 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	}
 
 	if plan.Mode == ResumptionModeFresh {
-		m.log.Infof("[%s.%s] Starting fresh sequential initial backfill", sourceDB.GetDatabaseName(), collConfig.SourceCollection)
+		types, discErr := DiscoverPresentBSONTypes(ctx, sourceCollection)
+		if discErr != nil {
+			m.log.Warnf("[%s.%s] Failed to discover BSON types for initial backfill: %v", sourceDB.GetDatabaseName(), collConfig.SourceCollection, discErr)
+		} else {
+			for _, t := range types {
+				checkpoint.TypeProgress[t] = &TypeRangeBoundary{BSONType: t}
+			}
+		}
+		m.log.Infof("[%s.%s] Starting fresh sequential initial backfill (discovered types: %v)", sourceDB.GetDatabaseName(), collConfig.SourceCollection, types)
 	}
 
 	checkpointPath := GetPartitionCheckpointPath(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex, totalSplits)
