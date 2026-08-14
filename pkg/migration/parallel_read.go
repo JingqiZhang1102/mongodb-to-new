@@ -38,6 +38,32 @@ func NewCollectionPartitioner(sourceCollection *mongo.Collection,
 	}
 }
 
+// CalculatePartitionCount calculates the optimal partition count based on document count, min docs per partition, and max partitions.
+func CalculatePartitionCount(totalCount int64, minDocsPerPartition, maxPartitions int) int {
+	if minDocsPerPartition <= 0 {
+		minDocsPerPartition = 1
+	}
+	if maxPartitions <= 0 {
+		maxPartitions = 1
+	}
+	if totalCount < int64(minDocsPerPartition) {
+		return 1
+	}
+	partitionCount := int(totalCount) / minDocsPerPartition
+	if partitionCount > maxPartitions {
+		partitionCount = maxPartitions
+	}
+	if partitionCount < 1 {
+		partitionCount = 1
+	}
+	return partitionCount
+}
+
+// CalculatePartitionCount calculates the optimal partition count for the partitioner's configured settings.
+func (p *CollectionPartitioner) CalculatePartitionCount(count int64) int {
+	return CalculatePartitionCount(count, p.minDocsPerPartition, p.maxPartitions)
+}
+
 // Partition creates partitions for a collection
 func (p *CollectionPartitioner) Partition(ctx context.Context) ([]bson.D, error) {
 	// Count documents to determine if partitioning is needed
@@ -50,21 +76,8 @@ func (p *CollectionPartitioner) Partition(ctx context.Context) ([]bson.D, error)
 		return nil, fmt.Errorf("failed to count documents: %w", err)
 	}
 
-	// If collection is small, return a single partition
-	if count < int64(p.minDocsPerPartition) {
-		p.log.Infof("Collection has only %d documents, using a single partition", count)
-		return []bson.D{{}}, nil
-	}
-
 	// Calculate optimal partition count
-	partitionCount := int(count) / p.minDocsPerPartition
-	if partitionCount > p.maxPartitions {
-		partitionCount = p.maxPartitions
-	}
-	if partitionCount < 1 {
-		partitionCount = 1
-	}
-
+	partitionCount := p.CalculatePartitionCount(count)
 	p.log.Infof("Partitioning collection with %d documents into %d partitions", count, partitionCount)
 
 	// If only one partition, return a single empty filter
