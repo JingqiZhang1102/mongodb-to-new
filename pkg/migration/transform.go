@@ -49,6 +49,19 @@ func extractDocID(doc interface{}) interface{} {
 	return nil
 }
 
+// toComparableIDKey converts any MongoDB _id (including primitive.Binary, primitive.ObjectID, etc.)
+// into a type-prefixed comparable string suitable for use as a Go map key without type collisions.
+func toComparableIDKey(id interface{}) string {
+	if id == nil {
+		return "<nil>"
+	}
+	t, data, err := bson.MarshalValue(id)
+	if err != nil {
+		return fmt.Sprintf("%T:%v", id, id)
+	}
+	return fmt.Sprintf("%d:%s", t, string(data))
+}
+
 // Transform recursively walks a document and applies Firestore-compatible transformations:
 //   - Removes empty field names
 //   - Stringifies nested objects that contain field names exceeding maxFieldNameLength
