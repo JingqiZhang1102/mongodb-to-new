@@ -753,6 +753,14 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 		}
 	}
 
+	if plan.Mode != ResumptionModeDirect {
+		// Clean up any stale or corrupted checkpoint files from disk for non-direct runs
+		if err := DeletePartitionCheckpoints(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection); err != nil {
+			m.log.Warnf("[%s.%s] Failed to delete stale/corrupted checkpoint files: %v",
+				sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
+		}
+	}
+
 	if plan.Mode == ResumptionModeFresh {
 		types, discErr := DiscoverPresentBSONTypes(ctx, sourceCollection)
 		if discErr != nil {
@@ -1196,10 +1204,20 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 			m.log.Infof("[%s.%s] Resuming parallel initial backfill directly with %d partitions: ~%d docs previously migrated",
 				sourceDB.GetDatabaseName(), collConfig.SourceCollection, len(partitions), previouslyMigratedDocs)
 		}
+	}
 
-	case ResumptionModeResampleWithGlobalMin:
+	if plan.Mode != ResumptionModeDirect {
+		// Clean up any stale or corrupted checkpoint files from disk for non-direct runs
+		if err := DeletePartitionCheckpoints(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection); err != nil {
+			m.log.Warnf("[%s.%s] Failed to delete stale/corrupted checkpoint files: %v",
+				sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
+		}
+	}
+
+	if plan.Mode == ResumptionModeResampleWithGlobalMin {
 		// Complete historical checkpoints present but partition count changed: fresh sampling and clamp lower bound with global min IDs.
 		previouslyMigratedDocs = plan.TotalDocsMigrated()
+
 		partitioner := NewCollectionPartitioner(
 			sourceCollection,
 			m.log,
