@@ -1687,13 +1687,13 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 				projectionOpts := options.Find().SetProjection(bson.M{"_id": 1})
 				cursor, findErr := targetCol.Find(findCtx, filter, projectionOpts)
 				if findErr == nil {
-					existingKeys := make(map[interface{}]bool)
+					existingKeys := make(map[string]bool)
 					for cursor.Next(findCtx) {
 						var res struct {
 							ID interface{} `bson:"_id"`
 						}
 						if err := cursor.Decode(&res); err == nil && res.ID != nil {
-							existingKeys[res.ID] = true
+							existingKeys[toComparableIDKey(res.ID)] = true
 						}
 					}
 					cursor.Close(findCtx)
@@ -1712,7 +1712,7 @@ func (m *Migrator) writeBatch(ctx context.Context, targetCol *mongo.Collection, 
 						var skippedCount int64
 						for idx, doc := range batch {
 							id := extractDocID(doc)
-							if existingKeys[id] {
+							if existingKeys[toComparableIDKey(id)] {
 								skippedCount++
 							} else {
 								filteredBatch = append(filteredBatch, doc)

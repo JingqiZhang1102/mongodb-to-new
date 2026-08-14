@@ -873,4 +873,50 @@ func BenchmarkTransformLongNestedKeyDoc(b *testing.B) {
 	}
 }
 
+func TestToComparableIDKey(t *testing.T) {
+	// 1. Ensure primitive.Binary (UUID) is hashable and does not panic in a map
+	binID := primitive.Binary{Subtype: 4, Data: []byte("12345678-1234-1234-1234-123456789abc")}
+	binKey := toComparableIDKey(binID)
+	if binKey == "" {
+		t.Fatalf("expected non-empty key for primitive.Binary")
+	}
+
+	m := make(map[string]bool)
+	m[binKey] = true
+	if !m[binKey] {
+		t.Fatalf("expected binKey to be present in map")
+	}
+
+	// 2. Ensure different BSON types with identical scalar values produce distinct keys (zero collisions)
+	strID := "100"
+	int32ID := int32(100)
+	int64ID := int64(100)
+	doubleID := float64(100.0)
+	oid := primitive.NewObjectID()
+
+	strKey := toComparableIDKey(strID)
+	int32Key := toComparableIDKey(int32ID)
+	int64Key := toComparableIDKey(int64ID)
+	doubleKey := toComparableIDKey(doubleID)
+	oidKey := toComparableIDKey(oid)
+
+	keys := map[string]string{
+		"string":   strKey,
+		"int32":    int32Key,
+		"int64":    int64Key,
+		"double":   doubleKey,
+		"objectID": oidKey,
+		"binary":   binKey,
+	}
+
+	seen := make(map[string]string)
+	for typeName, key := range keys {
+		if origType, exists := seen[key]; exists {
+			t.Fatalf("collision detected between type %s and %s: key=%s", typeName, origType, key)
+		}
+		seen[key] = typeName
+	}
+}
+
+
 
