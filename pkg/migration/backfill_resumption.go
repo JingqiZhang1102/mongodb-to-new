@@ -341,7 +341,13 @@ func ExtractTypeRangeBoundariesFromFilter(filter bson.D) map[BSONType]*TypeRange
 // clampBoundary clamps a TypeRangeBoundary to a global min safe ID.
 // If the boundary is completely below the min safe ID, returns nil.
 func clampBoundary(b *TypeRangeBoundary, minSafeID any) *TypeRangeBoundary {
+	if b == nil {
+		return nil
+	}
 	if minSafeID == nil {
+		return b
+	}
+	if b.BSONType != "" && GetBSONType(minSafeID) != "" && b.BSONType != GetBSONType(minSafeID) {
 		return b
 	}
 	if b.RangeEndID != nil {
