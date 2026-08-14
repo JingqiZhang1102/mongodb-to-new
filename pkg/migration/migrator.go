@@ -625,6 +625,11 @@ type MigrateOptions struct {
 	Throttler            *WriteThrottler          // Write throttler for initial backfill QPS ramp-up
 }
 
+type backfillBatchItem struct {
+	batch []interface{}
+	seq   uint64
+}
+
 // migrateCollection performs a one-time migration of a collection with parallel batch processing
 func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db.MongoDB, collConfig config.CollectionConfig, opts MigrateOptions) (int64, int64, error) {
 	// Get source and target collections
@@ -795,11 +800,6 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	// [Safety Fix 5: Memory Leak on Server] Ensure cursor is closed upon termination to prevent active server-side cursor leaks
 	// and connection starvation on the source MongoDB replica set.
 	defer cursor.Close(ctx)
-
-	type backfillBatchItem struct {
-		batch []interface{}
-		seq   uint64
-	}
 
 	// Set up parallel batch processing
 	var wg sync.WaitGroup
@@ -1155,23 +1155,141 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 	sourceCollection := sourceDB.GetCollection(collConfig.SourceCollection)
 	targetCollection := targetDB.GetCollection(collConfig.TargetCollection)
 
-	// Create partitioner
-	partitioner := NewCollectionPartitioner(
-		sourceCollection,
-		m.log,
-		m.config.MaxReadPartitions,
-		m.config.MinDocsPerPartition,
-		m.config.SampleSize,
-		m.config.IDTypeForPartition,
-	)
+	checkpointDir := m.getCheckpointDir()
 
-	// Create partitions
-	partitions, err := partitioner.Partition(ctx)
+	// Calculate optimal partition count
+	expectedPartitions := CalculatePartitionCount(totalCount, m.config.MinDocsPerPartition, m.config.MaxReadPartitions)
+
+	// Evaluate backfill resumption plan for parallel migration
+	plan, err := DetermineBackfillResumptionPlan(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, expectedPartitions)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to create partitions: %w", err)
+		m.log.Warnf("[%s.%s] Error determining backfill resumption plan: %v. Starting fresh.", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
+		plan = &BackfillResumptionPlan{Mode: ResumptionModeFresh}
 	}
 
-	m.log.Infof("Created %d partitions for collection %s", len(partitions), collConfig.SourceCollection)
+	var partitions []bson.D
+	var partitionCheckpoints []*PartitionCheckpoint
+	var previouslyMigratedDocs int64
+
+	switch plan.Mode {
+	case ResumptionModeDirect:
+		// Verify and reload all partition checkpoints from disk before updating partition state
+		allLoaded := true
+		loadedCheckpoints := make([]*PartitionCheckpoint, len(plan.PartitionFilters))
+		for i := range plan.PartitionFilters {
+			cpPath := GetPartitionCheckpointPath(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, i, len(plan.PartitionFilters))
+			cp, loadErr := LoadPartitionCheckpoint(cpPath)
+			if loadErr != nil || cp == nil {
+				m.log.Warnf("[%s.%s] Failed to reload partition %d checkpoint from %s: %v. Falling back to fresh start.",
+					sourceDB.GetDatabaseName(), collConfig.SourceCollection, i, cpPath, loadErr)
+				allLoaded = false
+				plan.Mode = ResumptionModeFresh
+				break
+			}
+			loadedCheckpoints[i] = cp
+		}
+
+		if allLoaded {
+			partitions = plan.PartitionFilters
+			partitionCheckpoints = loadedCheckpoints
+			previouslyMigratedDocs = plan.TotalDocsMigrated()
+			m.log.Infof("[%s.%s] Resuming parallel initial backfill directly with %d partitions: ~%d docs previously migrated",
+				sourceDB.GetDatabaseName(), collConfig.SourceCollection, len(partitions), previouslyMigratedDocs)
+		}
+
+	case ResumptionModeResampleWithGlobalMin:
+		// Complete historical checkpoints present but partition count changed: fresh sampling and clamp lower bound with global min IDs.
+		previouslyMigratedDocs = plan.TotalDocsMigrated()
+		partitioner := NewCollectionPartitioner(
+			sourceCollection,
+			m.log,
+			m.config.MaxReadPartitions,
+			m.config.MinDocsPerPartition,
+			m.config.SampleSize,
+			m.config.IDTypeForPartition,
+		)
+		var partErr error
+		rawPartitions, partErr := partitioner.Partition(ctx)
+		if partErr != nil {
+			return 0, 0, fmt.Errorf("failed to create partitions: %w", partErr)
+		}
+
+		// Clamp every partition lower bound to global min safe IDs and skip completed slices
+		partitions = ClampPartitionsWithGlobalMinSafeIDs(rawPartitions, plan.GlobalMinSafeIDs)
+
+		partitionCheckpoints = make([]*PartitionCheckpoint, len(partitions))
+		for i := range partitions {
+			typeProgress := ExtractTypeRangeBoundariesFromFilter(rawPartitions[i])
+			if IsFilterSkipped(partitions[i]) {
+				for _, boundary := range typeProgress {
+					boundary.SavedLastID = boundary.RangeEndID
+					if boundary.SavedLastID == nil {
+						boundary.SavedLastID = plan.GlobalMinSafeIDs[boundary.BSONType]
+					}
+				}
+			}
+
+			cp := &PartitionCheckpoint{
+				Database:                sourceDB.GetDatabaseName(),
+				Collection:              collConfig.SourceCollection,
+				PartitionIndex:          i,
+				TotalSplits:             len(partitions),
+				ApproximateDocsMigrated: 0,
+				TypeProgress:            typeProgress,
+				UpdatedAt:               time.Now().UTC(),
+			}
+			if i == 0 {
+				cp.ApproximateDocsMigrated = previouslyMigratedDocs
+			}
+			partitionCheckpoints[i] = cp
+		}
+		m.log.Infof("[%s.%s] Resuming parallel initial backfill with fresh sampling across %d partitions (clamped with global min safe IDs): ~%d docs previously migrated",
+			sourceDB.GetDatabaseName(), collConfig.SourceCollection, len(partitions), previouslyMigratedDocs)
+	}
+
+	if plan.Mode == ResumptionModeFresh {
+		partitioner := NewCollectionPartitioner(
+			sourceCollection,
+			m.log,
+			m.config.MaxReadPartitions,
+			m.config.MinDocsPerPartition,
+			m.config.SampleSize,
+			m.config.IDTypeForPartition,
+		)
+		var partErr error
+		partitions, partErr = partitioner.Partition(ctx)
+		if partErr != nil {
+			return 0, 0, fmt.Errorf("failed to create partitions: %w", partErr)
+		}
+
+		types, discErr := DiscoverPresentBSONTypes(ctx, sourceCollection)
+		if discErr != nil {
+			m.log.Warnf("[%s.%s] Failed to discover BSON types for parallel backfill: %v", sourceDB.GetDatabaseName(), collConfig.SourceCollection, discErr)
+		}
+
+		partitionCheckpoints = make([]*PartitionCheckpoint, len(partitions))
+		for i := range partitions {
+			typeProgress := ExtractTypeRangeBoundariesFromFilter(partitions[i])
+			for _, t := range types {
+				if typeProgress[t] == nil {
+					typeProgress[t] = &TypeRangeBoundary{BSONType: t}
+				}
+			}
+
+			cp := &PartitionCheckpoint{
+				Database:                sourceDB.GetDatabaseName(),
+				Collection:              collConfig.SourceCollection,
+				PartitionIndex:          i,
+				TotalSplits:             len(partitions),
+				ApproximateDocsMigrated: 0,
+				TypeProgress:            typeProgress,
+				UpdatedAt:               time.Now().UTC(),
+			}
+			partitionCheckpoints[i] = cp
+		}
+		previouslyMigratedDocs = 0
+		m.log.Infof("Created %d partitions for fresh parallel backfill of collection %s (discovered types: %v)", len(partitions), collConfig.SourceCollection, types)
+	}
 
 	// Create retry manager for batch processing
 	retryManager := NewRetryManager(
@@ -1183,6 +1301,9 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 		m.config.RetryConfig.ConvertInvalidIds,
 		m.log,
 	)
+
+	checkpointInterval := time.Duration(m.config.CheckpointIntervalMinutes) * time.Minute
+	saveThreshold := m.config.SaveThreshold
 
 	// Process partitions in parallel
 	var wg sync.WaitGroup
@@ -1208,17 +1329,22 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 			select {
 			case <-ticker.C:
 				mu.Lock()
-				currentCount := migratedCount
-				currentPercentage := int(float64(currentCount) / float64(totalCount) * 10)
+				currentSuccess := successCount
+				currentFailed := failedCount
+				cumulativeCount := previouslyMigratedDocs + migratedCount
+				if totalCount > 0 && cumulativeCount > totalCount {
+					cumulativeCount = totalCount
+				}
+				currentPercentage := int(float64(cumulativeCount) / float64(totalCount) * 10)
 
 				// Only log when crossing a 10% threshold
 				if currentPercentage > lastLoggedPercentage {
 					if failedCount > 0 {
-						m.log.Infof("Collection %s progress: %d/%d documents (%.0f%%) - Successful: %d, Failed: %d",
-							collConfig.SourceCollection, currentCount, totalCount, float64(currentPercentage)*10, successCount, failedCount)
+						m.log.Infof("Collection %s progress: ~%d/%d documents (%.0f%%) [This run: %d successful, %d failed]",
+							collConfig.SourceCollection, cumulativeCount, totalCount, float64(currentPercentage)*10, currentSuccess, currentFailed)
 					} else {
-						m.log.Infof("Collection %s progress: %d/%d documents (%.0f%%)",
-							collConfig.SourceCollection, currentCount, totalCount, float64(currentPercentage)*10)
+						m.log.Infof("Collection %s progress: ~%d/%d documents (%.0f%%)",
+							collConfig.SourceCollection, cumulativeCount, totalCount, float64(currentPercentage)*10)
 					}
 					lastLoggedPercentage = currentPercentage
 				}
@@ -1228,9 +1354,12 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 			case <-doneChan:
 				// Log final progress
 				mu.Lock()
-				currentCount := migratedCount
-				m.log.Infof("Collection %s completed: %d/%d documents (100%%)",
-					collConfig.SourceCollection, currentCount, totalCount)
+				cumulativeCount := previouslyMigratedDocs + migratedCount
+				if totalCount > 0 && cumulativeCount > totalCount {
+					cumulativeCount = totalCount
+				}
+				m.log.Infof("Collection %s completed: ~%d/%d documents (100%%)",
+					collConfig.SourceCollection, cumulativeCount, totalCount)
 				mu.Unlock()
 				return
 			}
@@ -1241,10 +1370,15 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 	for i, partition := range partitions {
 		wg.Add(1)
 
-		go func(partitionIndex int, filter bson.D) {
+		go func(partitionIndex int, filter bson.D, checkpoint *PartitionCheckpoint) {
 			defer wg.Done()
 
 			m.log.Debugf("Starting partition %d with filter: %v", partitionIndex, filter)
+
+			checkpointPath := GetPartitionCheckpointPath(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection, partitionIndex, len(partitions))
+			tracker := NewBackfillPartitionTracker(m.log, checkpoint, checkpointPath, checkpointInterval, saveThreshold)
+			tracker.Start(ctx)
+			defer tracker.Close()
 
 			// [Safety Fix 1: MongoDB Cursor Timeout] SetNoCursorTimeout(true) is used to prevent the partitioned MongoDB read cursor from timing out
 			// when downstream write rate-limiting/backpressure pauses readers.
@@ -1258,9 +1392,9 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 
 			// Set up parallel batch processing within this partition
 			var partitionWg sync.WaitGroup
-			partitionBatchChan := make(chan []interface{}, m.config.InitialChannelBufferSize) // Buffer for batches
-			partitionErrorChan := make(chan error, 1)                                         // Channel for errors
-			partitionDoneChan := make(chan struct{})                                          // Channel to signal completion
+			partitionBatchChan := make(chan backfillBatchItem, m.config.InitialChannelBufferSize) // Buffer for batches
+			partitionErrorChan := make(chan error, 1)                                             // Channel for errors
+			partitionDoneChan := make(chan struct{})                                              // Channel to signal completion
 
 			// Track progress for this partition
 			var partitionMigratedCount int64
@@ -1281,12 +1415,12 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 				go func(workerID int) {
 					defer partitionWg.Done()
 
-					for batch := range partitionBatchChan {
+					for item := range partitionBatchChan {
 						if opts.BackfillStatsManager != nil {
-							opts.BackfillStatsManager.RecordWorkerReceived(int64(len(batch)))
+							opts.BackfillStatsManager.RecordWorkerReceived(int64(len(item.batch)))
 						}
 						globalWorkerID := partitionIndex*100 + workerID
-						succeeded, failed, err := m.writeBatch(ctx, targetCollection, batch, sourceDB.GetDatabaseName(), collConfig.SourceCollection, opts, retryManager, globalWorkerID, proactiveSkipEnabled)
+						succeeded, failed, err := m.writeBatch(ctx, targetCollection, item.batch, sourceDB.GetDatabaseName(), collConfig.SourceCollection, opts, retryManager, globalWorkerID, proactiveSkipEnabled)
 						if err != nil {
 							select {
 							case partitionErrorChan <- fmt.Errorf("worker %d in partition %d failed: %w", workerID, partitionIndex, err):
@@ -1295,16 +1429,20 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 							return
 						}
 
+						if ctx.Err() == nil {
+							tracker.AckBatch(item.seq, succeeded)
+						}
+
 						// Update progress
 						partitionMu.Lock()
-						partitionMigratedCount += int64(len(batch))
+						partitionMigratedCount += int64(len(item.batch))
 						partitionMu.Unlock()
 
 						// Update overall progress counter
 						mu.Lock()
 						successCount += succeeded
 						failedCount += failed
-						migratedCount += int64(len(batch))
+						migratedCount += int64(len(item.batch))
 						mu.Unlock()
 					}
 				}(w)
@@ -1357,9 +1495,11 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 				batchCount++
 
 				if batchCount >= m.config.InitialWriteBatchSize {
+					seq := tracker.RegisterBatch(batch)
+					item := backfillBatchItem{batch: batch, seq: seq}
 					sendStart := time.Now()
 					select {
-					case partitionBatchChan <- batch:
+					case partitionBatchChan <- item:
 						if opts.BackfillStatsManager != nil {
 							opts.BackfillStatsManager.RecordIngestQueueStall(time.Since(sendStart))
 						}
@@ -1393,9 +1533,11 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 
 			// Process any remaining documents
 			if len(batch) > 0 {
+				seq := tracker.RegisterBatch(batch)
+				item := backfillBatchItem{batch: batch, seq: seq}
 				sendStart := time.Now()
 				select {
-				case partitionBatchChan <- batch:
+				case partitionBatchChan <- item:
 					if opts.BackfillStatsManager != nil {
 						opts.BackfillStatsManager.RecordIngestQueueStall(time.Since(sendStart))
 					}
@@ -1430,10 +1572,13 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 				return
 			}
 
+			// Mark partition backfill completed in tracker
+			tracker.MarkCompleted()
+
 			// Log partition completion at debug level only
 			m.log.Debugf("Partition %d completed: %d documents",
 				partitionIndex, partitionMigratedCount)
-		}(i, partition)
+		}(i, partition, partitionCheckpoints[i])
 	}
 
 	// Wait for all partitions to complete or for an error
@@ -1457,6 +1602,12 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 		m.log.Infof("Parallel migration for %s completed successfully! Total documents: %d",
 			collConfig.SourceCollection, migratedCount)
 	}
+
+	// Always clean up backfill checkpoints when the full collection scan completes.
+	if err := DeletePartitionCheckpoints(checkpointDir, sourceDB.GetDatabaseName(), collConfig.SourceCollection); err != nil {
+		m.log.Warnf("[%s.%s] Failed to delete checkpoint files on completion: %v", sourceDB.GetDatabaseName(), collConfig.SourceCollection, err)
+	}
+
 	return successCount, failedCount, nil
 }
 
