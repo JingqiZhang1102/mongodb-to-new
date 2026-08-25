@@ -295,40 +295,11 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 			r.log.Info("No global resume token found. Creating a new one and will perform initial migration.")
 		}
 
-		// Create a change stream to get an initial resume token
-		initialChangeStream, err := r.sourceDB.CreateClientLevelChangeStream(ctx, nil, nil, 0, nil)
+		tokenDoc, err := CaptureAndSaveInitialResumeToken(ctx, r.sourceDB, r.config.IncrementalStreamPartitions, globalResumeTokenPath, r.log)
 		if err != nil {
-			return fmt.Errorf("failed to create initial client-level change stream: %w", err)
+			return err
 		}
-
-		// Get the initial resume token
-		initialResumeToken := initialChangeStream.ResumeToken()
-		r.log.Infof("Obtained initial resume token: %v", initialResumeToken)
-
-		// Convert the BSON resume token to a map with _data field
-		var initialResumeTokenDoc bson.M
-		if err := bson.Unmarshal(initialResumeToken, &initialResumeTokenDoc); err != nil {
-			return fmt.Errorf("failed to unmarshal initial resume token BSON: %w", err)
-		}
-		r.log.Infof("Converted initial resume token: %v", initialResumeTokenDoc)
-
-		// Save this initial resume token to all configured partition checkpoint files.
-		// Critical Safety Checkpoint: If any file write fails (e.g. permissions, disk full), we abort immediately.
-		// Continuing silently would leave incremental replication without starting checkpoints, risking
-		// replication gaps or severe operational overhead on subsequent process restarts.
-		for i := 0; i < r.config.IncrementalStreamPartitions; i++ {
-			partitionPath := GetPartitionResumeTokenPath(globalResumeTokenPath, i, r.config.IncrementalStreamPartitions)
-			if err := SaveResumeToken(partitionPath, initialResumeTokenDoc); err != nil {
-				return fmt.Errorf("[Partition %d] failed to save initial partition resume token to %s: %w", i, partitionPath, err)
-			}
-			r.log.Infof("[Partition %d] Saved initial partition resume token successfully to %s", i, partitionPath)
-		}
-
-		// Close the initial change stream
-		initialChangeStream.Close(ctx)
-
-		// Use the converted resume token
-		globalResumeToken = initialResumeTokenDoc
+		globalResumeToken = tokenDoc
 	} else if liveStartTime != nil {
 		r.log.Infof("No resume token available. Starting replication from liveStartTime: %s", time.Unix(int64(liveStartTime.T), 0).UTC().Format(time.RFC3339))
 	} else {
@@ -673,4 +644,50 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 		return nil
 	}
 	return err
+}
+
+// CaptureAndSaveInitialResumeToken opens a temporary client-level change stream on sourceDB,
+// extracts the initial resume token from the cursor, unmarshals it to bson.M, and saves it
+// to all partition checkpoint files corresponding to globalResumeTokenPath.
+// If partitions == 1, it also writes the legacy globalResumeTokenPath.
+func CaptureAndSaveInitialResumeToken(ctx context.Context, sourceDB *db.MongoDB, partitions int, globalResumeTokenPath string, log *logger.Logger) (bson.M, error) {
+	if partitions <= 0 {
+		partitions = 1
+	}
+
+	log.Info("Creating client-level change stream to capture initial resume token...")
+	initialChangeStream, err := sourceDB.CreateClientLevelChangeStream(ctx, nil, nil, 0, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create initial client-level change stream: %w", err)
+	}
+	defer initialChangeStream.Close(ctx)
+
+	initialResumeToken := initialChangeStream.ResumeToken()
+	if len(initialResumeToken) == 0 {
+		return nil, fmt.Errorf("captured empty resume token from change stream")
+	}
+	log.Infof("Obtained initial resume token: %v", initialResumeToken)
+
+	var initialResumeTokenDoc bson.M
+	if err := bson.Unmarshal(initialResumeToken, &initialResumeTokenDoc); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal initial resume token BSON: %w", err)
+	}
+	log.Infof("Converted initial resume token: %v", initialResumeTokenDoc)
+
+	for i := 0; i < partitions; i++ {
+		partitionPath := GetPartitionResumeTokenPath(globalResumeTokenPath, i, partitions)
+		if err := SaveResumeToken(partitionPath, initialResumeTokenDoc); err != nil {
+			return nil, fmt.Errorf("[Partition %d] failed to save initial partition resume token to %s: %w", i+1, partitionPath, err)
+		}
+		log.Infof("[Partition %d/%d] Saved initial partition resume token to: %s", i+1, partitions, partitionPath)
+	}
+
+	if partitions == 1 {
+		if err := SaveResumeToken(globalResumeTokenPath, initialResumeTokenDoc); err != nil {
+			return nil, fmt.Errorf("failed to save global resume token checkpoint to %s: %w", globalResumeTokenPath, err)
+		}
+		log.Infof("Saved global resume token checkpoint to: %s", globalResumeTokenPath)
+	}
+
+	return initialResumeTokenDoc, nil
 }

@@ -79,3 +79,36 @@ func TestParseLiveStartTime(t *testing.T) {
 		})
 	}
 }
+
+func TestIsValidMode(t *testing.T) {
+	validModes := []string{
+		"migrate",
+		"live",
+		"live-only",
+		"retry-dlq",
+		"capture-resume-token",
+	}
+
+	for _, mode := range validModes {
+		if !isValidMode(mode) {
+			t.Errorf("expected mode %q to be valid, but got false", mode)
+		}
+	}
+
+	invalidModes := []string{
+		"",
+		"invalid",
+		"capture-token",
+		"capture",
+		"token",
+		"backfill",
+		"all",
+	}
+
+	for _, mode := range invalidModes {
+		if isValidMode(mode) {
+			t.Errorf("expected mode %q to be invalid, but got true", mode)
+		}
+	}
+}
+

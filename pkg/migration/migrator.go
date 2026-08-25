@@ -53,11 +53,22 @@ func (m *Migrator) Start(ctx context.Context, mode string) error {
 	m.isLive = (mode == "live" || mode == "live-only")
 
 	// Validate mode
-	if mode != "migrate" && mode != "live" && mode != "live-only" && mode != "retry-dlq" {
-		return fmt.Errorf("invalid mode: %s, must be 'migrate', 'live', 'live-only', or 'retry-dlq'", mode)
+	if mode != "migrate" && mode != "live" && mode != "live-only" && mode != "retry-dlq" && mode != "capture-resume-token" {
+		return fmt.Errorf("invalid mode: %s, must be 'migrate', 'live', 'live-only', 'retry-dlq', or 'capture-resume-token'", mode)
 	}
 
 	m.log.Infof("Starting MongoDB to MongoDB %s process", mode)
+
+	if mode == "capture-resume-token" {
+		for i, pair := range m.config.DatabasePairs {
+			m.log.Infof("Capturing resume token for database pair %d/%d (%s)", i+1, len(m.config.DatabasePairs), pair.Source.Database)
+			if err := m.captureResumeToken(ctx, pair, i); err != nil {
+				return fmt.Errorf("error capturing resume token for database pair %d: %w", i+1, err)
+			}
+		}
+		m.log.Info("Resume token capture completed successfully")
+		return nil
+	}
 
 	if m.DryRun {
 		m.log.Info("[Dry Run] Running target compatibility check reports before starting migration")
@@ -157,6 +168,59 @@ func (m *Migrator) getInitialMigrationStatePath(pairIndex int) string {
 		return "initialMigrationState-global.json"
 	}
 	return fmt.Sprintf("initialMigrationState-pair%d.json", pairIndex)
+}
+
+// captureResumeToken connects to the source database, captures the current Change Stream resume token,
+// writes it to all configured partition checkpoint files, sets the initial migration state to skipped,
+// and returns immediately without running backfill or worker processes.
+func (m *Migrator) captureResumeToken(ctx context.Context, pair config.DatabasePair, pairIndex int) error {
+	m.log.Infof("Connecting to source MongoDB at %s", pair.Source.ConnectionString)
+	sourceDB, err := db.NewMongoDB(pair.Source.ConnectionString, pair.Source.Database, 1, 10, 0, nil, m.log)
+	if err != nil {
+		return fmt.Errorf("failed to connect to source MongoDB: %w", err)
+	}
+	defer sourceDB.Close(ctx)
+
+	partitions := m.config.IncrementalStreamPartitions
+	if partitions <= 0 {
+		partitions = 1
+	}
+
+	if m.DryRun {
+		m.log.Info("[Dry Run] Testing client-level change stream creation on source MongoDB...")
+		changeStream, err := sourceDB.CreateClientLevelChangeStream(ctx, nil, nil, 0, nil)
+		if err != nil {
+			return fmt.Errorf("[Dry Run] failed to create client-level change stream on source MongoDB: %w", err)
+		}
+		defer changeStream.Close(ctx)
+
+		initialResumeToken := changeStream.ResumeToken()
+		if len(initialResumeToken) == 0 {
+			return fmt.Errorf("[Dry Run] captured empty resume token from change stream")
+		}
+
+		var initialResumeTokenDoc bson.M
+		if err := bson.Unmarshal(initialResumeToken, &initialResumeTokenDoc); err != nil {
+			return fmt.Errorf("[Dry Run] failed to unmarshal resume token BSON: %w", err)
+		}
+
+		m.log.Infof("[Dry Run] Successfully verified change stream connectivity and captured resume token: %v", initialResumeTokenDoc)
+		m.log.Infof("[Dry Run] Skipping file writes (would save to %d partition checkpoint files and mark initialMigrationState as %s)", partitions, StatusSkipped)
+		return nil
+	}
+
+	globalResumeTokenPath := m.getCheckpointPath("resumeToken", pairIndex)
+	if _, err := CaptureAndSaveInitialResumeToken(ctx, sourceDB, partitions, globalResumeTokenPath, m.log); err != nil {
+		return err
+	}
+
+	initialMigrationStatePath := m.getInitialMigrationStatePath(pairIndex)
+	if err := SaveInitialMigrationState(initialMigrationStatePath, StatusSkipped, 0); err != nil {
+		return fmt.Errorf("failed to save initial migration state to %s: %w", initialMigrationStatePath, err)
+	}
+	m.log.Infof("Saved initial migration state (%s) to: %s", StatusSkipped, initialMigrationStatePath)
+
+	return nil
 }
 
 // processDatabasePair processes a single database pair

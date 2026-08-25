@@ -487,7 +487,7 @@ When no `collections` are specified (as above), the tool will automatically dete
 
 2. Live Mode:
 
-   To set up live replication using MongoDB change streams:
+   To set up live replication using MongoDB change streams (runs initial data migration and then transitions to continuous replication):
 
    ```bash
    ./migrate -mode=live
@@ -495,7 +495,41 @@ When no `collections` are specified (as above), the tool will automatically dete
 
    The application will continuously listen for changes in the specified MongoDB collections and replicate them to the target MongoDB.
 
-3. Dry Run and Compatibility Reports:
+3. Live-Only Mode:
+
+   To perform real-time incremental replication only, skipping the initial data copy phase:
+
+   ```bash
+   ./migrate -mode=live-only
+   ```
+
+   You can also specify a custom historical starting point:
+   ```bash
+   ./migrate -mode=live-only -live-start-timestamp=2026-05-20T21:00:00Z
+   ```
+
+4. Capture Resume Token Mode:
+
+   To pre-capture the current MongoDB Change Stream resume token at time $T_0$ before launching an external or decoupled backfill (e.g. `mongodump`/`mongorestore`):
+
+   ```bash
+   ./migrate -mode=capture-resume-token
+   ```
+
+   This connects to the source MongoDB, extracts the present resume token, writes checkpoint files (`resumeToken-*.json` and `initialMigrationState-*.json`), and exits immediately with code `0`. Once the external backfill finishes, you can start live CDC seamlessly with:
+   ```bash
+   ./migrate -mode=live-only
+   ```
+
+5. Retry DLQ Mode:
+
+   To reprocess records from Dead Letter Queue (DLQ) files:
+
+   ```bash
+   ./migrate -mode=retry-dlq
+   ```
+
+6. Dry Run and Compatibility Reports:
 
    To dry run a migration (which runs connectivity and compatibility validation, checks target database support for various datatypes/key limits, and samples source collections to output partitioning recommendations):
 
@@ -509,7 +543,7 @@ When no `collections` are specified (as above), the tool will automatically dete
    - **In Incremental Modes (`-mode=live-only` or `live` streaming phase):** It starts change stream/oplog replication threads, pulls events from source database partitions, and outputs real-time ingestion lag stats. However, it discards events before formatting/sending writes to the target. This is useful for safely measuring network pre-fetching performance and verifying that the configured sharded change stream partitioning (`incrementalStreamPartitions`) functions correctly on active production setups.
    - **Safety:** No write operations or state checkpoints are committed to either source or target systems.
 
-4. Additional Options:
+7. Additional Options:
 
    ```bash
    ./migrate -help
@@ -522,7 +556,7 @@ When no `collections` are specified (as above), the tool will automatically dete
       -config string
             Path to configuration file (default "mongodb_replication_config.json")
       -mode string
-            Operation mode: 'migrate', 'live', or 'live-only' (default "migrate")
+            Operation mode: 'migrate', 'live', 'live-only', 'retry-dlq', or 'capture-resume-token' (default "migrate")
       -log-level string
             Log level: debug, info, warn, error (default "info")
       -log-file string

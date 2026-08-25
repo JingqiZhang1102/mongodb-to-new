@@ -65,8 +65,8 @@ func main() {
 
 
 	// Validate mode
-	if *mode != "migrate" && *mode != "live" && *mode != "live-only" && *mode != "retry-dlq" {
-		log.Fatalf("Invalid mode: %s. Please choose either 'migrate', 'live', 'live-only', or 'retry-dlq'", *mode)
+	if !isValidMode(*mode) {
+		log.Fatalf("Invalid mode: %s. Please choose either 'migrate', 'live', 'live-only', 'retry-dlq', or 'capture-resume-token'", *mode)
 	}
 
 
@@ -122,8 +122,8 @@ func main() {
 		}
 	}
 
-	// Log completion for migrate and retry-dlq mode (live mode keeps running)
-	if *mode == "migrate" || *mode == "retry-dlq" {
+	// Log completion for non-continuous modes (live mode keeps running)
+	if *mode == "migrate" || *mode == "retry-dlq" || *mode == "capture-resume-token" {
 		duration := time.Since(startTime)
 		log.Infof("Process completed in %.2f seconds", duration.Seconds())
 		os.Exit(0) // Explicitly exit after completion
@@ -139,7 +139,7 @@ func displayUsage() {
 	fmt.Println("  -config string")
 	fmt.Println("        Path to configuration file (default \"mongodb_replication_config.json\")")
 	fmt.Println("  -mode string")
-	fmt.Println("        Operation mode: 'migrate', 'live', 'live-only', or 'retry-dlq' (default \"migrate\")")
+	fmt.Println("        Operation mode: 'migrate', 'live', 'live-only', 'retry-dlq', or 'capture-resume-token' (default \"migrate\")")
 	fmt.Println("        Modes:")
 	fmt.Println("          migrate:")
 	fmt.Println("            Perform a one-time full migration. Copies all data and indexes from")
@@ -157,6 +157,11 @@ func displayUsage() {
 	fmt.Println("            Reprocess the Dead Letter Queue (DLQ). Reads previous failed records from")
 	fmt.Println("            the DLQ files, retries writing them to the target, and writes any subsequent")
 	fmt.Println("            failures to new DLQ files.")
+	fmt.Println("          capture-resume-token:")
+	fmt.Println("            Connect to the source MongoDB cluster, capture the current Change Stream")
+	fmt.Println("            resume token at the present moment, save it to disk checkpoint files,")
+	fmt.Println("            and exit immediately. Used to establish the CDC starting point before")
+	fmt.Println("            starting an external or decoupled backfill.")
 	fmt.Println("  -log-level string")
 	fmt.Println("        Log level: debug, info, warn, error (default \"info\")")
 	fmt.Println("  -log-file string")
@@ -180,13 +185,20 @@ func displayUsage() {
 	fmt.Println("Examples:")
 	fmt.Println("  migrate -mode=live")
 	fmt.Println("  migrate -mode=live-only")
+	fmt.Println("  migrate -mode=capture-resume-token")
 	fmt.Println("  migrate -mode=live-only -dry-run")
 	fmt.Println("  migrate -mode=live-only -live-start-timestamp=1716234000")
 	fmt.Println("  migrate -mode=live-only -live-start-timestamp=2026-05-20T21:00:00Z")
 	fmt.Println("  migrate -mode=live-only -live-start-timestamp=2026-05-20T21:00:00Z -dry-run")
 	fmt.Println("  migrate -mode=live -log-file=migration.log")
 	fmt.Println("  migrate -mode=retry-dlq")
+	fmt.Println("  migrate -config=custom_config.json -mode=capture-resume-token")
 	fmt.Println("  migrate -config=custom_config.json -mode=retry-dlq")
+}
+
+// isValidMode returns whether the given mode string is a recognized operation mode.
+func isValidMode(mode string) bool {
+	return mode == "migrate" || mode == "live" || mode == "live-only" || mode == "retry-dlq" || mode == "capture-resume-token"
 }
 
 // parseStartTimestamp parses a user-provided timestamp string as either a raw Unix epoch

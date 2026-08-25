@@ -444,3 +444,50 @@ func TestScanAndResolveCheckpoints(t *testing.T) {
 		})
 	}
 }
+
+func TestCaptureTokenCheckpointPersistence(t *testing.T) {
+	tmpDir := t.TempDir()
+	globalPath := filepath.Join(tmpDir, "resumeToken-global.json")
+
+	tokenDoc := map[string]interface{}{
+		"_data": "captured_token_payload_abc123",
+	}
+
+	partitions := 4
+	for i := 0; i < partitions; i++ {
+		partPath := GetPartitionResumeTokenPath(globalPath, i, partitions)
+		if err := SaveResumeToken(partPath, tokenDoc); err != nil {
+			t.Fatalf("failed to save captured partition token %d: %v", i, err)
+		}
+	}
+
+	// Verify all partition files exist and can be loaded
+	for i := 0; i < partitions; i++ {
+		partPath := GetPartitionResumeTokenPath(globalPath, i, partitions)
+		loaded, err := LoadResumeToken(partPath)
+		if err != nil {
+			t.Fatalf("failed to load captured partition token %d: %v", i, err)
+		}
+		m, ok := loaded.(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected map token, got %T", loaded)
+		}
+		if m["_data"] != "captured_token_payload_abc123" {
+			t.Errorf("expected _data to match, got %v", m["_data"])
+		}
+	}
+
+	// Verify state file creation
+	statePath := filepath.Join(tmpDir, "initialMigrationState-global.json")
+	if err := SaveInitialMigrationState(statePath, StatusSkipped, 0); err != nil {
+		t.Fatalf("failed to save initial migration state: %v", err)
+	}
+	state, err := LoadInitialMigrationState(statePath)
+	if err != nil {
+		t.Fatalf("failed to load state: %v", err)
+	}
+	if state == nil || state.Status != StatusSkipped {
+		t.Errorf("expected state status %q, got %v", StatusSkipped, state)
+	}
+}
+
