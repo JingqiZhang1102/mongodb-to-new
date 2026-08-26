@@ -788,7 +788,10 @@ func (m *Migrator) migrateCollection(ctx context.Context, sourceDB, targetDB *db
 	if resumeFilter != nil {
 		findFilter = resumeFilter
 	}
-	cursor, err := sourceCollection.Find(ctx, findFilter, options.Find().SetBatchSize(int32(readBatchSize)).SetNoCursorTimeout(true))
+	// [Backfill Resumption Safety] Sort by _id ascending to guarantee monotonic traversal order.
+	// The resumption filter uses $gte on the last checkpointed _id, so correct ordering is required
+	// to ensure no documents are skipped or duplicated upon resume.
+	cursor, err := sourceCollection.Find(ctx, findFilter, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}).SetBatchSize(int32(readBatchSize)).SetNoCursorTimeout(true))
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to create cursor: %w", err)
 	}

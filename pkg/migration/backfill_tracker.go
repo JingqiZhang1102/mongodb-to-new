@@ -93,7 +93,17 @@ func (t *BackfillPartitionTracker) RegisterBatch(batch []interface{}) uint64 {
 	maxIDs := make(map[BSONType]any)
 	for _, doc := range batch {
 		if docID := extractDocID(doc); docID != nil {
-			maxIDs[GetBSONType(docID)] = docID
+			bType := GetBSONType(docID)
+			existing, exists := maxIDs[bType]
+			if !exists {
+				maxIDs[bType] = docID
+			} else {
+				// Only overwrite if the new docID is greater than the current stored max.
+				// This ensures correctness regardless of document ordering within the batch.
+				if cmpResult, err := CompareBSONValues(docID, existing); err == nil && cmpResult > 0 {
+					maxIDs[bType] = docID
+				}
+			}
 		}
 	}
 
