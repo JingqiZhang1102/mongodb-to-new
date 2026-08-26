@@ -1401,9 +1401,10 @@ func (m *Migrator) migrateCollectionParallel(ctx context.Context, sourceDB, targ
 			tracker.Start(ctx)
 			defer tracker.Close()
 
-			// [Safety Fix 1: MongoDB Cursor Timeout] SetNoCursorTimeout(true) is used to prevent the partitioned MongoDB read cursor from timing out
-			// when downstream write rate-limiting/backpressure pauses readers.
-			cursor, err := sourceCollection.Find(ctx, filter, options.Find().SetBatchSize(int32(m.config.InitialReadBatchSize)).SetNoCursorTimeout(true))
+			// [Backfill Resumption Safety] Sort by _id ascending to guarantee monotonic traversal order within the partition.
+			// The resumption filter uses $gte on the last checkpointed _id, so correct ordering is required
+			// to ensure no documents are skipped or duplicated upon resume.
+			cursor, err := sourceCollection.Find(ctx, filter, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}).SetBatchSize(int32(m.config.InitialReadBatchSize)).SetNoCursorTimeout(true))
 			if err != nil {
 				errorChan <- fmt.Errorf("failed to create cursor for partition %d: %w", partitionIndex, err)
 				return

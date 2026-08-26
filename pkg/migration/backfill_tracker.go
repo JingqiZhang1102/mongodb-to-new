@@ -137,11 +137,12 @@ func (t *BackfillPartitionTracker) AckBatch(seq uint64, succeededDocs int64) {
 	}
 }
 
-// MarkCompleted marks the partition backfill as completed, disabling further checkpoint writes on shutdown.
+// MarkCompleted marks the partition backfill as completed, saving the final completed checkpoint to disk.
 func (t *BackfillPartitionTracker) MarkCompleted() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.completed = true
+	t.saveCheckpointsLocked()
 }
 
 // Close flushes all contiguous acknowledged batches to disk and logs any unacknowledged gaps.
@@ -187,10 +188,6 @@ func (t *BackfillPartitionTracker) saveCheckpointsLocked() {
 		}
 	}
 
-	if prunedCount == 0 {
-		return
-	}
-
 	candidate := cloneCheckpoint(t.checkpoint)
 	if candidate != nil {
 		if candidate.TypeProgress == nil {
@@ -219,7 +216,9 @@ func (t *BackfillPartitionTracker) saveCheckpointsLocked() {
 		delete(t.batches, t.pendingSeqs[i])
 	}
 	t.pendingSeqs = t.pendingSeqs[prunedCount:]
-	t.lastCheckpointSeq = newLastSeq
+	if prunedCount > 0 {
+		t.lastCheckpointSeq = newLastSeq
+	}
 	t.ackCountSinceSave = 0
 	t.lastSaveTime = time.Now()
 }

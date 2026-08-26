@@ -2,6 +2,7 @@ package migration
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"sync"
@@ -751,3 +752,49 @@ func TestExtractTypeRangeBoundariesFromFilter(t *testing.T) {
 	}
 }
 
+func TestBackfillPartitionTracker_MarkCompleted_CompletedPartitionSaved(t *testing.T) {
+	tmpDir := t.TempDir()
+	log := logger.New()
+
+	cpPath := filepath.Join(tmpDir, "backfillCheckpoint-testdb-testcoll-partition-0-of-4.json")
+	oidEnd, _ := primitive.ObjectIDFromHex("60a000000000000000000010")
+
+	// Partition 0 is skipped because it was already completed (SavedLastID == RangeEndID)
+	cp := &PartitionCheckpoint{
+		Database:                "testdb",
+		Collection:              "testcoll",
+		PartitionIndex:          0,
+		TotalSplits:             4,
+		ApproximateDocsMigrated: 0,
+		TypeProgress: map[BSONType]*TypeRangeBoundary{
+			BSONTypeObjectID: {
+				BSONType:    BSONTypeObjectID,
+				RangeEndID:  oidEnd,
+				SavedLastID: oidEnd,
+			},
+		},
+		UpdatedAt: time.Now().UTC(),
+	}
+
+	tracker := NewBackfillPartitionTracker(log, cp, cpPath, time.Minute, 100)
+	tracker.Start(context.Background())
+
+	// Simulate 0 batches read/acked, partition finishes immediately and calls MarkCompleted
+	tracker.MarkCompleted()
+	tracker.Close()
+
+	// Verify checkpoint file is physically written to disk
+	loadedCP, err := LoadPartitionCheckpoint(cpPath)
+	if err != nil {
+		t.Fatalf("expected checkpoint to be saved to disk, got err: %v", err)
+	}
+	if loadedCP == nil {
+		t.Fatalf("expected non-nil loaded checkpoint")
+	}
+	if loadedCP.PartitionIndex != 0 || loadedCP.TotalSplits != 4 {
+		t.Errorf("unexpected loaded checkpoint metadata: %+v", loadedCP)
+	}
+	if loadedCP.TypeProgress[BSONTypeObjectID].SavedLastID != oidEnd {
+		t.Errorf("expected SavedLastID to be %v, got %v", oidEnd, loadedCP.TypeProgress[BSONTypeObjectID].SavedLastID)
+	}
+}
