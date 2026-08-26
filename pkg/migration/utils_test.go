@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gsbingo17/mongodb-migration/pkg/config"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -77,16 +78,16 @@ func TestExtractEventTime(t *testing.T) {
 	}
 }
 
-// TestBuildPartitionPipelineRedundantStreamsCount verifies that when totalStreams <= 1, an empty pipeline is safely returned.
+// TestBuildPartitionPipelineRedundantStreamsCount verifies that when totalStreams <= 1 and no filters are set, an empty pipeline is safely returned.
 func TestBuildPartitionPipelineRedundantStreamsCount(t *testing.T) {
 	// Act: build pipeline for single-stream partition index 0 of 1 total stream
-	p1 := BuildPartitionPipeline(0, 1)
+	p1 := BuildPartitionPipeline(0, 1, "", nil)
 	// Assert: pipeline must be completely empty
 	if len(p1) != 0 {
 		t.Errorf("BuildPartitionPipeline(0, 1) returned len %d, want empty", len(p1))
 	}
 	// Act 2: build pipeline for boundary stream count 0
-	p0 := BuildPartitionPipeline(0, 0)
+	p0 := BuildPartitionPipeline(0, 0, "", nil)
 	// Assert: pipeline must be completely empty
 	if len(p0) != 0 {
 		t.Errorf("BuildPartitionPipeline(0, 0) returned len %d, want empty", len(p0))
@@ -99,7 +100,7 @@ func TestBuildPartitionPipelineValidStructure(t *testing.T) {
 	streamIndex := 2
 	totalStreams := 4
 	// Act: build the partition aggregation query match stage
-	pipeline := BuildPartitionPipeline(streamIndex, totalStreams)
+	pipeline := BuildPartitionPipeline(streamIndex, totalStreams, "", nil)
 
 	// Assert 1: Must contain exactly one match stage
 	if len(pipeline) != 1 {
@@ -168,6 +169,86 @@ func TestBuildPartitionPipelineValidStructure(t *testing.T) {
 
 	if indexVal != streamIndex {
 		t.Errorf("Second operand value is %d, want streamIndex %d", indexVal, streamIndex)
+	}
+}
+
+// TestBuildPartitionPipelineWithNamespaceAndCollections verifies that namespace filtering and ID partitioning are composed correctly.
+func TestBuildPartitionPipelineWithNamespaceAndCollections(t *testing.T) {
+	sourceDB := "ecommerce"
+	collections := []config.CollectionConfig{
+		{SourceCollection: "orders", TargetCollection: "orders"},
+		{SourceCollection: "users", TargetCollection: "users"},
+	}
+
+	// Case 1: Partitioned stream (totalStreams = 4) -> 2 stages (match namespace + match partition hash)
+	pipeline := BuildPartitionPipeline(1, 4, sourceDB, collections)
+	if len(pipeline) != 2 {
+		t.Fatalf("Expected 2 stages for partitioned stream with collections, got %d", len(pipeline))
+	}
+
+	// Check stage 0 (namespace filtering)
+	var stage0 bson.M
+	b0, err := bson.Marshal(pipeline[0])
+	if err != nil {
+		t.Fatalf("Failed to marshal stage 0: %v", err)
+	}
+	if err := bson.Unmarshal(b0, &stage0); err != nil {
+		t.Fatalf("Failed to unmarshal stage 0: %v", err)
+	}
+
+	matchDoc0, ok := stage0["$match"].(bson.M)
+	if !ok {
+		t.Fatalf("Stage 0 is not a $match doc: %v", stage0)
+	}
+	if matchDoc0["ns.db"] != "ecommerce" {
+		t.Errorf("Expected ns.db 'ecommerce', got %v", matchDoc0["ns.db"])
+	}
+	collDoc, ok := matchDoc0["ns.coll"].(bson.M)
+	if !ok {
+		t.Fatalf("Expected ns.coll to be bson.M, got %T (%v)", matchDoc0["ns.coll"], matchDoc0["ns.coll"])
+	}
+	inList, ok := collDoc["$in"].(primitive.A)
+	if !ok {
+		t.Fatalf("Expected $in to be primitive.A, got %T", collDoc["$in"])
+	}
+	if len(inList) != 2 || inList[0] != "orders" || inList[1] != "users" {
+		t.Errorf("Unexpected $in list: %v", inList)
+	}
+
+	// Case 2: Single stream (totalStreams = 1) -> 1 stage (match namespace only, no partition hash)
+	singlePipeline := BuildPartitionPipeline(0, 1, sourceDB, collections)
+	if len(singlePipeline) != 1 {
+		t.Fatalf("Expected 1 stage for single stream with collections, got %d", len(singlePipeline))
+	}
+}
+
+// TestBuildPartitionPipelineDatabaseOnly verifies full database mode without collection restriction.
+func TestBuildPartitionPipelineDatabaseOnly(t *testing.T) {
+	sourceDB := "ecommerce"
+
+	pipeline := BuildPartitionPipeline(0, 1, sourceDB, nil)
+	if len(pipeline) != 1 {
+		t.Fatalf("Expected 1 stage, got %d", len(pipeline))
+	}
+
+	var stage bson.M
+	b, err := bson.Marshal(pipeline[0])
+	if err != nil {
+		t.Fatalf("Failed to marshal stage: %v", err)
+	}
+	if err := bson.Unmarshal(b, &stage); err != nil {
+		t.Fatalf("Failed to unmarshal stage: %v", err)
+	}
+
+	matchDoc, ok := stage["$match"].(bson.M)
+	if !ok {
+		t.Fatalf("Stage is not a $match doc: %v", stage)
+	}
+	if matchDoc["ns.db"] != "ecommerce" {
+		t.Errorf("Expected ns.db 'ecommerce', got %v", matchDoc["ns.db"])
+	}
+	if _, exists := matchDoc["ns.coll"]; exists {
+		t.Errorf("Expected no ns.coll in full database mode, but got %v", matchDoc["ns.coll"])
 	}
 }
 
@@ -241,7 +322,7 @@ func BenchmarkBuildPartitionPipelineFull(b *testing.B) {
 // BenchmarkBuildPartitionPipelineTrailing4 evaluates the Go-side CPU compile performance of the highly optimized flat loopless FNV-inspired BSON partition pipeline builder.
 func BenchmarkBuildPartitionPipelineTrailing4(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		_ = BuildPartitionPipeline(i%4, 4)
+		_ = BuildPartitionPipeline(i%4, 4, "testdb", nil)
 	}
 }
 

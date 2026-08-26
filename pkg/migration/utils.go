@@ -3,6 +3,7 @@ package migration
 import (
 	"time"
 
+	"github.com/gsbingo17/mongodb-migration/pkg/config"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -48,14 +49,45 @@ func ExtractEventTimeFromRaw(raw bson.Raw) time.Time {
 //
 // Two trailing characters (256 slots in hex ObjectIDs, 1024 slots in Crockford Base32 ULIDs) provide more than
 // enough entropy to guarantee a perfectly balanced partition workload distribution!
-func BuildPartitionPipeline(streamIndex, totalStreams int) mongo.Pipeline {
-	// If totalStreams is 1 (or less), partition filtering is redundant, so return an empty pipeline.
-	if totalStreams <= 1 {
-		return mongo.Pipeline{}
+func BuildPartitionPipeline(streamIndex, totalStreams int, sourceDB string, collections []config.CollectionConfig) mongo.Pipeline {
+	var pipeline mongo.Pipeline
+
+	// 1. Namespace filtering stage (Database & Collections)
+	if sourceDB != "" {
+		matchFilter := bson.D{{Key: "ns.db", Value: sourceDB}}
+		if len(collections) > 0 {
+			var collNames bson.A
+			for _, coll := range collections {
+				collNames = append(collNames, coll.SourceCollection)
+			}
+			matchFilter = append(matchFilter, bson.E{
+				Key:   "ns.coll",
+				Value: bson.D{{Key: "$in", Value: collNames}},
+			})
+		}
+		pipeline = append(pipeline, bson.D{{Key: "$match", Value: matchFilter}})
+	} else if len(collections) > 0 {
+		var collNames bson.A
+		for _, coll := range collections {
+			collNames = append(collNames, coll.SourceCollection)
+		}
+		matchFilter := bson.D{{
+			Key:   "ns.coll",
+			Value: bson.D{{Key: "$in", Value: collNames}},
+		}}
+		pipeline = append(pipeline, bson.D{{Key: "$match", Value: matchFilter}})
 	}
 
-	// Printable ASCII lookup string starting at space (0x20/32) up to tilde (0x7e/126).
-	// ULIDs (Crockford Base32), ObjectIDs (hex), and standard strings are parsed to their exact ASCII byte values.
+	// 2. ID Partitioning stage (FNV-1a 32-bit hash)
+	if totalStreams > 1 {
+		pipeline = append(pipeline, buildPartitionHashStage(streamIndex, totalStreams))
+	}
+
+	return pipeline
+}
+
+// buildPartitionHashStage builds the zero-JavaScript, loopless FNV-1a 32-bit hash match stage
+func buildPartitionHashStage(streamIndex, totalStreams int) bson.D {
 	const asciiString = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
 
 	// Get length of the BSON stringified ID
@@ -142,22 +174,20 @@ func BuildPartitionPipeline(streamIndex, totalStreams int) mongo.Pipeline {
 	}
 
 	// Match Stage: checks if (stringHash % totalStreams) == streamIndex
-	return mongo.Pipeline{
-		bson.D{
-			bson.E{Key: "$match", Value: bson.D{
-				bson.E{Key: "$expr", Value: bson.D{
-					bson.E{Key: "$eq", Value: bson.A{
-						bson.D{
-							bson.E{Key: "$mod", Value: bson.A{
-								stringHash,
-								totalStreams,
-							}},
-						},
-						streamIndex,
-					}},
+	return bson.D{
+		bson.E{Key: "$match", Value: bson.D{
+			bson.E{Key: "$expr", Value: bson.D{
+				bson.E{Key: "$eq", Value: bson.A{
+					bson.D{
+						bson.E{Key: "$mod", Value: bson.A{
+							stringHash,
+							totalStreams,
+						}},
+					},
+					streamIndex,
 				}},
 			}},
-		},
+		}},
 	}
 }
 

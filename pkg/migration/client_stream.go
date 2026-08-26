@@ -580,8 +580,8 @@ func (r *ClientLevelReplicator) StartReplication(ctx context.Context, globalResu
 			token = partitionTokens[i]
 		}
 
-		// Build a zero-JS, loopless FNV-inspired BSON aggregation pipeline stage for this partition index
-		pipeline := BuildPartitionPipeline(i, r.config.IncrementalStreamPartitions)
+		// Build a zero-JS, loopless FNV-inspired BSON aggregation pipeline stage with server-side database & collection filtering
+		pipeline := BuildPartitionPipeline(i, r.config.IncrementalStreamPartitions, pair.Source.Database, pair.Target.Collections)
 		r.log.Infof("[Partition %d/%d] Creating client-level change stream (ResumeToken: %v)", i+1, r.config.IncrementalStreamPartitions, token != nil)
 
 		stream, err := r.sourceDB.CreateClientLevelChangeStream(
