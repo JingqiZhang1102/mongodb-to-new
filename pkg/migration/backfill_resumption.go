@@ -257,6 +257,171 @@ func ExtractGlobalMinSafeIDs(checkpoints []*PartitionCheckpoint) (map[BSONType]a
 	return result, nil
 }
 
+func parseTypeClause(clause bson.D) *TypeRangeBoundary {
+	var idConditions bson.D
+	for _, elem := range clause {
+		if elem.Key == "_id" {
+			if doc, ok := elem.Value.(bson.D); ok {
+				idConditions = doc
+			}
+		}
+	}
+	if len(idConditions) == 0 {
+		return nil
+	}
+
+	var typeName string
+	var startID, endID any
+	for _, elem := range idConditions {
+		switch elem.Key {
+		case "$type":
+			if s, ok := elem.Value.(string); ok {
+				typeName = s
+			}
+		case "$gte":
+			startID = elem.Value
+		case "$lt":
+			endID = elem.Value
+		}
+	}
+
+	bType := ParseBSONType(typeName)
+	if bType == "" {
+		if startID != nil {
+			bType = GetBSONType(startID)
+		} else if endID != nil {
+			bType = GetBSONType(endID)
+		}
+	}
+	if bType == "" {
+		return nil
+	}
+
+	return &TypeRangeBoundary{
+		BSONType:     bType,
+		RangeStartID: startID,
+		RangeEndID:   endID,
+	}
+}
+
+// ExtractTypeRangeBoundariesFromFilter parses a partition query filter and returns the per-type RangeStartID and RangeEndID boundaries.
+func ExtractTypeRangeBoundariesFromFilter(filter bson.D) map[BSONType]*TypeRangeBoundary {
+	result := make(map[BSONType]*TypeRangeBoundary)
+	if len(filter) == 0 {
+		return result
+	}
+
+	for _, elem := range filter {
+		if elem.Key == "$or" {
+			if arr, ok := elem.Value.(bson.A); ok {
+				for _, item := range arr {
+					if d, isD := item.(bson.D); isD {
+						if b := parseTypeClause(d); b != nil {
+							result[b.BSONType] = b
+						}
+					}
+				}
+			} else if slice, ok := elem.Value.([]bson.D); ok {
+				for _, d := range slice {
+					if b := parseTypeClause(d); b != nil {
+						result[b.BSONType] = b
+					}
+				}
+			}
+			return result
+		}
+	}
+
+	if b := parseTypeClause(filter); b != nil {
+		result[b.BSONType] = b
+	}
+	return result
+}
+
+// clampBoundary clamps a TypeRangeBoundary to a global min safe ID.
+// If the boundary is completely below the min safe ID, returns nil.
+func clampBoundary(b *TypeRangeBoundary, minSafeID any) *TypeRangeBoundary {
+	if b == nil {
+		return nil
+	}
+	if minSafeID == nil {
+		return b
+	}
+	if b.BSONType != "" && GetBSONType(minSafeID) != "" && b.BSONType != GetBSONType(minSafeID) {
+		return b
+	}
+	if b.RangeEndID != nil {
+		if cmp, err := CompareBSONValues(b.RangeEndID, minSafeID); err == nil && cmp <= 0 {
+			return nil
+		}
+	}
+	clampedStart := b.RangeStartID
+	if clampedStart == nil {
+		clampedStart = minSafeID
+	} else if cmp, err := CompareBSONValues(clampedStart, minSafeID); err == nil && cmp < 0 {
+		clampedStart = minSafeID
+	}
+	return &TypeRangeBoundary{
+		BSONType:     b.BSONType,
+		RangeStartID: clampedStart,
+		RangeEndID:   b.RangeEndID,
+	}
+}
+
+// clampPartition clamps a partition filter to global min safe IDs.
+func clampPartition(filter bson.D, globalMinSafeIDs map[BSONType]any) bson.D {
+	boundaries := ExtractTypeRangeBoundariesFromFilter(filter)
+	if len(boundaries) == 0 && len(filter) == 0 {
+		for t, minID := range globalMinSafeIDs {
+			if minID != nil {
+				boundaries[t] = &TypeRangeBoundary{BSONType: t, RangeStartID: minID}
+			}
+		}
+	}
+
+	active := make(map[BSONType]*TypeRangeBoundary)
+	for t, b := range boundaries {
+		if clamped := clampBoundary(b, globalMinSafeIDs[t]); clamped != nil {
+			active[t] = clamped
+		}
+	}
+	if len(active) == 0 {
+		return bson.D{{Key: "_id", Value: bson.D{{Key: "$exists", Value: false}}}}
+	}
+	res, _ := BuildPartitionFilterFromCheckpoint(&PartitionCheckpoint{TypeProgress: active})
+	return res
+}
+
+// ClampPartitionsWithGlobalMinSafeIDs clamps each partition's lower bound to globalMinSafeIDs,
+// and skips already-completed partitions/types entirely.
+func ClampPartitionsWithGlobalMinSafeIDs(partitions []bson.D, globalMinSafeIDs map[BSONType]any) []bson.D {
+	if len(partitions) == 0 || len(globalMinSafeIDs) == 0 {
+		return partitions
+	}
+
+	clamped := make([]bson.D, len(partitions))
+	for i, p := range partitions {
+		clamped[i] = clampPartition(p, globalMinSafeIDs)
+	}
+	return clamped
+}
+
+// IsFilterSkipped checks if a partition filter is configured to match no documents ({_id: {$exists: false}}).
+func IsFilterSkipped(filter bson.D) bool {
+	for _, elem := range filter {
+		if elem.Key == "_id" {
+			if doc, ok := elem.Value.(bson.D); ok {
+				for _, sub := range doc {
+					if sub.Key == "$exists" && sub.Value == false {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
 // DetermineBackfillResumptionPlan determines the resumption plan by inspecting checkpoint files on disk.
 // If checkpoints are missing, unreadable, or corrupted, it falls back to ResumptionModeFresh.
 func DetermineBackfillResumptionPlan(dir, db, collection string, expectedPartitions int) (*BackfillResumptionPlan, error) {
