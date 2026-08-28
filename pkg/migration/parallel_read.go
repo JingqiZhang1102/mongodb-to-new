@@ -679,37 +679,17 @@ func (p *CollectionPartitioner) createPartitionsGroupedByType(ctx context.Contex
 	return mergeTypeSlices(slicesPerType, partitionCount), nil
 }
 
-// discoverPresentBSONTypes aggregates document counts per BSON type of the _id field using index-covered CountDocuments.
+// discoverPresentBSONTypes aggregates document counts per BSON type of the _id field using DiscoverPresentBSONTypeCounts.
 func (p *CollectionPartitioner) discoverPresentBSONTypes(ctx context.Context) (map[string]int64, error) {
-	candidateTypes := []string{
-		"objectId",
-		"string",
-		"number",
-		"date",
-		"binData",
-		"object",
-		"bool",
-		"timestamp",
+	counts, err := DiscoverPresentBSONTypeCounts(ctx, p.sourceCollection, 2000)
+	if err != nil {
+		return nil, err
 	}
-
-	typeCounts := make(map[string]int64)
-	countOpts := options.Count().SetLimit(2000)
-
-	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	for _, tName := range candidateTypes {
-		filter := bson.D{{Key: "_id", Value: bson.D{{Key: "$type", Value: tName}}}}
-		cnt, err := p.sourceCollection.CountDocuments(probeCtx, filter, countOpts)
-		if err != nil {
-			return nil, fmt.Errorf("failed index probe for BSON type '%s': %w", tName, err)
-		}
-		if cnt > 0 {
-			typeCounts[tName] = cnt
-			p.log.Infof("Discovered present BSON type '%s' (sample count capped at 2000: %d)", tName, cnt)
-		}
+	typeCounts := make(map[string]int64, len(counts))
+	for bType, cnt := range counts {
+		typeCounts[string(bType)] = cnt
+		p.log.Infof("Discovered present BSON type '%s' (sample count capped at 2000: %d)", bType, cnt)
 	}
-
 	return typeCounts, nil
 }
 

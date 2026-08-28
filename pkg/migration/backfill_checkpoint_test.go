@@ -357,6 +357,13 @@ func TestDiscoverPresentBSONTypes_NilCollection(t *testing.T) {
 	}
 }
 
+func TestDiscoverPresentBSONTypeCounts_NilCollection(t *testing.T) {
+	_, err := DiscoverPresentBSONTypeCounts(context.Background(), nil, 2000)
+	if err == nil {
+		t.Fatalf("expected error when discovering BSON type counts on nil collection, got nil")
+	}
+}
+
 func TestParseBSONType(t *testing.T) {
 	tests := []struct {
 		input    string
