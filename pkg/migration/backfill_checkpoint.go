@@ -13,6 +13,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // BSONType represents a canonical MongoDB BSON type name used for _id partitioning and filtering.
@@ -226,41 +227,47 @@ func GetBSONType(val any) BSONType {
 	}
 }
 
-// DiscoverPresentBSONTypes returns the unique canonical BSONTypes of the _id field present in the collection.
+// DiscoverPresentBSONTypes returns the unique canonical BSONTypes of the _id field present in the collection using index-covered CountDocuments.
 func DiscoverPresentBSONTypes(ctx context.Context, collection *mongo.Collection) ([]BSONType, error) {
 	if collection == nil {
 		return nil, fmt.Errorf("collection cannot be nil")
 	}
 
-	pipeline := mongo.Pipeline{
-		bson.D{{Key: "$group", Value: bson.D{
-			{Key: "_id", Value: bson.D{{Key: "$type", Value: "$_id"}}},
-		}}},
+	candidates := []string{
+		"objectId",
+		"string",
+		"number",
+		"date",
+		"binData",
+		"object",
+		"bool",
+		"timestamp",
 	}
 
-	discoverCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	countOpts := options.Count().SetLimit(1)
+	discoverCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-
-	cursor, err := collection.Aggregate(discoverCtx, pipeline)
-	if err != nil {
-		return nil, fmt.Errorf("failed to discover BSON types: %w", err)
-	}
-	defer cursor.Close(discoverCtx)
 
 	seen := make(map[BSONType]bool)
 	var types []BSONType
-	for cursor.Next(discoverCtx) {
-		var res struct {
-			Type string `bson:"_id"`
+
+	for _, tName := range candidates {
+		filter := bson.D{{Key: "_id", Value: bson.D{{Key: "$type", Value: tName}}}}
+		cnt, err := collection.CountDocuments(discoverCtx, filter, countOpts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to probe BSON type '%s': %w", tName, err)
 		}
-		if err := cursor.Decode(&res); err != nil {
-			return nil, fmt.Errorf("failed to decode BSON type: %w", err)
-		}
-		if bType := ParseBSONType(res.Type); !seen[bType] {
-			seen[bType] = true
-			types = append(types, bType)
+		if cnt > 0 {
+			bType := ParseBSONType(tName)
+			if !seen[bType] {
+				seen[bType] = true
+				types = append(types, bType)
+			}
 		}
 	}
 
-	return types, cursor.Err()
+	sort.Slice(types, func(i, j int) bool {
+		return types[i] < types[j]
+	})
+	return types, nil
 }

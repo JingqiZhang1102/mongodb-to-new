@@ -679,44 +679,35 @@ func (p *CollectionPartitioner) createPartitionsGroupedByType(ctx context.Contex
 	return mergeTypeSlices(slicesPerType, partitionCount), nil
 }
 
-// discoverPresentBSONTypes aggregates document counts per BSON type of the _id field.
+// discoverPresentBSONTypes aggregates document counts per BSON type of the _id field using index-covered CountDocuments.
 func (p *CollectionPartitioner) discoverPresentBSONTypes(ctx context.Context) (map[string]int64, error) {
-	pipeline := mongo.Pipeline{
-		bson.D{{Key: "$group", Value: bson.D{
-			{Key: "_id", Value: bson.D{{Key: "$type", Value: "$_id"}}},
-			{Key: "count", Value: bson.D{{Key: "$sum", Value: 1}}},
-		}}},
+	candidateTypes := []string{
+		"objectId",
+		"string",
+		"number",
+		"date",
+		"binData",
+		"object",
+		"bool",
+		"timestamp",
 	}
-
-	discoverCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
-	defer cancel()
-
-	cursor, err := p.sourceCollection.Aggregate(discoverCtx, pipeline)
-	if err != nil {
-		return nil, fmt.Errorf("failed to aggregate BSON types: %w", err)
-	}
-	defer cursor.Close(discoverCtx)
 
 	typeCounts := make(map[string]int64)
-	for cursor.Next(discoverCtx) {
-		var res struct {
-			Type  string `bson:"_id"`
-			Count int64  `bson:"count"`
-		}
-		if err := cursor.Decode(&res); err != nil {
-			return nil, fmt.Errorf("failed to decode type discovery group: %w", err)
-		}
+	countOpts := options.Count().SetLimit(2000)
 
-		typeName := res.Type
-		switch typeName {
-		case "int", "long", "double", "decimal":
-			typeName = "number"
-		}
-		typeCounts[typeName] += res.Count
-	}
+	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 
-	if err := cursor.Err(); err != nil {
-		return nil, fmt.Errorf("cursor error during type discovery: %w", err)
+	for _, tName := range candidateTypes {
+		filter := bson.D{{Key: "_id", Value: bson.D{{Key: "$type", Value: tName}}}}
+		cnt, err := p.sourceCollection.CountDocuments(probeCtx, filter, countOpts)
+		if err != nil {
+			return nil, fmt.Errorf("failed index probe for BSON type '%s': %w", tName, err)
+		}
+		if cnt > 0 {
+			typeCounts[tName] = cnt
+			p.log.Infof("Discovered present BSON type '%s' (sample count capped at 2000: %d)", tName, cnt)
+		}
 	}
 
 	return typeCounts, nil
