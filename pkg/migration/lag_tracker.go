@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"math"
 	"time"
 )
 
@@ -15,25 +16,33 @@ type LagFlushResult struct {
 }
 
 // metricAccumulator unifies duration sum and event count for simple averaging
+// without signed 64-bit integer overflow under high-throughput conditions.
 type metricAccumulator struct {
-	total time.Duration
-	count int64
+	totalNs float64
+	count   int64
 }
 
 func (m *metricAccumulator) Add(d time.Duration) {
-	m.total += d
+	m.totalNs += float64(d.Nanoseconds())
 	m.count++
 }
 
 func (m *metricAccumulator) Average() time.Duration {
 	if m.count > 0 {
-		return m.total / time.Duration(m.count)
+		avgNs := m.totalNs / float64(m.count)
+		if avgNs >= float64(math.MaxInt64) {
+			return time.Duration(math.MaxInt64)
+		}
+		if avgNs <= float64(math.MinInt64) {
+			return time.Duration(math.MinInt64)
+		}
+		return time.Duration(avgNs)
 	}
 	return 0
 }
 
 func (m *metricAccumulator) Reset() {
-	m.total = 0
+	m.totalNs = 0
 	m.count = 0
 }
 
