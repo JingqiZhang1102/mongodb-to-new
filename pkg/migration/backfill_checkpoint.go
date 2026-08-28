@@ -234,7 +234,6 @@ var CandidateBSONTypes = []BSONType{
 	BSONTypeNumber,
 	BSONTypeDate,
 	BSONTypeBinary,
-	BSONType("object"),
 	BSONTypeBool,
 	BSONTypeTimestamp,
 }
